@@ -159,6 +159,15 @@ static void vram_params_update_if_dirty()
     if (prev_hd_size != hd_size) vram_params_dirty = 1;
     prev_hd_size = hd_size;
     #endif
+
+    #ifdef R_LV_ON_EVF
+    // EOS R: Panel (1024x682) and EVF (1280x720) use different LV buffer sizes;
+    // recompute geometry when the active output changes.
+    static int prev_on_evf = -1;
+    int on_evf = R_LV_ON_EVF();
+    if (on_evf != prev_on_evf) vram_params_dirty = 1;
+    prev_on_evf = on_evf;
+    #endif
     
     if (vram_params_dirty)
     {
@@ -320,8 +329,17 @@ void _update_vram_params()
     os.off_1610 = 0;
 #elif defined(CONFIG_R)
     // false, depends on Panel, HDMI, EVF and if HDMI is clean or not.
-    vram_lv.width = 1024;
-    vram_lv.height = 682;
+    // HDMI not handled yet; EVF vs Panel picked at runtime (see consts.h).
+    if (R_LV_ON_EVF())
+    {
+        vram_lv.width = 1280;
+        vram_lv.height = 720;
+    }
+    else
+    {
+        vram_lv.width = 1024;
+        vram_lv.height = 682;
+    }
     vram_lv.pitch = vram_lv.width * 2;
     os.x0 = 0;
     os.y0 = 0;

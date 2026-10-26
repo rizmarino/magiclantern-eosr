@@ -27,6 +27,20 @@
 #define FEATURE_GLOBAL_DRAW
 #define FEATURE_CROPMARKS
 
+// EXPERIMENTAL (riz/eosr-experimental): LiveView analysis overlays.
+// These only READ the LV YUV422 buffer (YUV422_LV_BUFFER_*, DispVram struct,
+// see consts.h) and draw into ML's own bitmap layer, so the failure mode is a
+// wrong / garbled overlay or a crash, not a settings change.
+// UNTESTED ON HARDWARE.
+#define FEATURE_ZEBRA
+#undef  FEATURE_ZEBRA_FAST          // D45 palette trick, not valid on RGBA compositor
+#define FEATURE_FOCUS_PEAK
+#define FEATURE_FALSE_COLOR
+#define FEATURE_HISTOGRAM
+#define FEATURE_WAVEFORM
+#define FEATURE_SPOTMETER
+#define FEATURE_VECTORSCOPE         // also required: zebra.c histogram path references vectorscope_draw
+
 // enable for testing gui structure changes
 #define CONFIG_RESTORE_AFTER_FORMAT
 

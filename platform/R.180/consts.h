@@ -142,7 +142,11 @@
 /* Hardcoded to Panel for now. It would be easier if we can replace this with a
  * function call that would be put into functon_overrides.c. Then we could just
  * define full structs there instead of playing with pointers */
-#define YUV422_LV_BUFFER_DISPLAY_ADDR DV_VRAM_PANEL
+// riz/eosr-experimental: fall back to the EVF buffer when the Panel pointer is
+// unset (eye at the viewfinder). Based on kitor's VramState dump above, where the
+// inactive output's pointers read 0. UNVERIFIED on hardware.
+#define R_LV_ON_EVF()                 (DV_VRAM_PANEL == 0 && DV_VRAM_EVF != 0)
+#define YUV422_LV_BUFFER_DISPLAY_ADDR (R_LV_ON_EVF() ? DV_VRAM_EVF : DV_VRAM_PANEL)
 #define YUV422_LV_PITCH               1024       // depends on display type
 
 #define YUV422_HD_BUFFER_DMA_ADDR 0x0 // it expects this to be shamem_read(some_DMA_ADDR)
