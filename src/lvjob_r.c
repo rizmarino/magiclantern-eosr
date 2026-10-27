@@ -307,7 +307,7 @@ static MENU_SELECT_FUNC(lvs_select)
  * LV memory survey 2: reads the MMU registers and the effective L1 table
  * (+ up to 64 L2 tables) to ML/LVMMUnn.BIN, then surveys only the 1 MB
  * sections the table maps as Normal memory with a physical address in the
- * second GB (PA 0x40000000-0x7FFFFFFF), each PA once (prefers a
+ * second GB (PA 0x80000000-0xBFFFFFFF), each PA once (prefers a
  * non-cacheable alias). Same 3-pass change map as v5 -> ML/LVM2nn.BIN, then
  * dumps up to 3 of the largest changing regions (first 8 MB) -> ML/LVR2nn_k.BIN.
  * LV DAF region dump: copies 0x25880000-0x264C0000 (12.25 MB, uncached) ->
@@ -331,11 +331,17 @@ static uint32_t lvm_table(const struct lvm_regs *m, uint32_t va)
     return m->ttbr0 & ~((1u << (14 - n)) - 1);
 }
 
+/* Canon keeps its MMU tables in ROM (R 1.8.0: TTBR0 0xE0004800, main L1 at 0xE0000000) */
+static int lvm_tab_ok(uint32_t t)
+{
+    return (t >= 0x1000 && t < 0x40000000) || (t >= 0xE0000000 && t < 0xE2000000);
+}
+
 static int lvm_desc(const struct lvm_regs *m, uint32_t va, uint32_t *d)
 {
     uint32_t t = lvm_table(m, va);
     *d = 0;
-    if (t < 0x1000 || t >= 0x40000000) return 0;
+    if (!lvm_tab_ok(t)) return 0;
     *d = MEM(t + ((va >> 20) << 2));
     return 1;
 }
@@ -361,7 +367,7 @@ static int lvm_class(const struct lvm_regs *m, uint32_t d, uint32_t va, uint32_t
     return 4;
 }
 
-#define LV2_PA0   0x40000000
+#define LV2_PA0   0x80000000   /* 2nd GB; 0x40000000-0x7FFFFFFF is the uncached view of the 1st */
 #define LV2_NSEC  1024
 
 static void lvs2_pass(uint8_t *map, const uint32_t *pick, int pass)
@@ -441,7 +447,7 @@ static void lvs2_task(void *unused)
     if (!buf) { chunk = 0x10000; buf = malloc(chunk); }
     if (!pick || !pcls || !map || !buf) { NotifyBox(4000, "LV survey 2: no memory"); goto out; }
     uint32_t t0tab = lvm_table(&m, 0);
-    if (t0tab < 0x1000 || t0tab >= 0x40000000) { NotifyBox(4000, "LV survey 2: TTBR0 %x unexpected", m.ttbr0); goto out; }
+    if (!lvm_tab_ok(t0tab) || !lvm_tab_ok(lvm_table(&m, 0x80000000))) { NotifyBox(4000, "LV survey 2: TTBR %x/%x/%x unexpected", m.ttbr0, m.ttbr1, m.ttbcr); goto out; }
 
     /* 1. MMU registers + effective L1 table + L2 tables, saved before any wide reads */
     snprintf(name, sizeof(name), "ML/LVMMU%02d.BIN", lvj_runs);
@@ -459,7 +465,7 @@ static void lvs2_task(void *unused)
         lvm_desc(&m, s << 20, &d);
         if ((d & 3) != 1) continue;
         uint32_t l2 = d & ~0x3FF;
-        if (l2 < 0x1000 || l2 >= 0x40000000) continue;
+        if (!lvm_tab_ok(l2)) continue;
         b32[0] = s << 20; b32[1] = l2;
         memcpy(buf + 8, (void *)l2, 1024);
         FIO_WriteFile(f, buf, 8 + 1024);
@@ -478,7 +484,7 @@ static void lvs2_task(void *unused)
         int cls = lvm_class(&m, d, s << 20, &pa);
         if (cls == 1) nl2all++;
         if (cls < 3) continue;
-        if (pa >= 0x80000000) { nbeyond++; continue; }
+        if (pa >= 0xC0000000) { nbeyond++; continue; }
         if (pa < LV2_PA0) continue;
         uint32_t i = (pa - LV2_PA0) >> 20;
         if (!pick[i]) npick++;
