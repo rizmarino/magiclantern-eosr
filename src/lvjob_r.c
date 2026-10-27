@@ -155,6 +155,154 @@ static MENU_SELECT_FUNC(lvb_select)
     task_create("lvb_task", 0x1e, 0x1000, lvb_task, 0);
 }
 
+/* LV memory survey (v5). Samples 4 x 64 bytes of every 128 KB block of the low
+ * 1 GB, three times (0, 150, 600 ms), and records per block: hash, change bits,
+ * zero bytes, odd bytes < 0x40 (hint for unpacked 14-bit LE), sum |byte diff|.
+ * Blocks below 0x30000000 are read through the uncached alias (+0x40000000, as
+ * Canon does for LV buffers); 0x30000000-0x3FFFFFFF cached (ML treats
+ * 0x7xxxxxxx as unsafe). The map goes to ML/LVMAPnn.BIN. Then dumps, to
+ * ML/LVRGnn_k.BIN, the fixed raw2yuv side windows 0x25500000 (+4 MB) and up to
+ * 3 of the largest changing regions (>= 4 MB, first 8 MB each) outside the 4
+ * known YUV buffers 0x20000000-0x254FFFFF. Read-only apart from the files. */
+#define LVS_BLK     0x20000
+#define LVS_NBLK    (0x40000000 / LVS_BLK)
+#define LVS_REC     16
+#define LVS_DUMPMAX 0x800000
+
+static uint32_t lvs_addr(uint32_t a)
+{
+    return a < 0x30000000 ? (a | 0x40000000) : a;
+}
+
+static void lvs_pass(uint8_t *map, int pass)
+{
+    static const uint32_t offs[4] = { 0x0, 0x8000, 0x10000, 0x18000 };
+    for (int b = 0; b < LVS_NBLK; b++)
+    {
+        uint32_t h = 0x811C9DC5, zeros = 0, lt40 = 0, sad = 0;
+        for (int k = 0; k < 4; k++)
+        {
+            uint32_t a = b * LVS_BLK + offs[k];
+            if (a < 0x1000) a = 0x1000;
+            const volatile uint8_t *p = (const volatile uint8_t *)lvs_addr(a);
+            uint8_t prev = p[0];
+            for (int i = 0; i < 64; i++)
+            {
+                uint8_t v = p[i];
+                h = (h ^ v) * 0x01000193;
+                if (pass == 0)
+                {
+                    zeros += (v == 0);
+                    if (i & 1) lt40 += (v < 0x40);
+                    sad += (v > prev) ? v - prev : prev - v;
+                    prev = v;
+                }
+            }
+        }
+        uint32_t *r = (uint32_t *)(map + b * LVS_REC);
+        if (pass == 0)
+        {
+            r[0] = h; r[1] = 0; r[2] = zeros | (lt40 << 16); r[3] = sad;
+        }
+        else
+        {
+            /* r[1]: bit0 = changed 0->150 ms, bit1 = changed 150->600 ms,
+             * bits 8-31 = low 24 bits of the previous pass's hash */
+            uint32_t prev24 = pass == 1 ? (r[0] & 0xFFFFFF) : (r[1] >> 8);
+            if ((h & 0xFFFFFF) != prev24) r[1] |= (1 << (pass - 1));
+            r[1] = (r[1] & 0xFF) | ((h & 0xFFFFFF) << 8);
+        }
+    }
+}
+
+static void lvs_dump(const char *name, uint32_t addr, uint32_t len, uint8_t *buf, uint32_t chunk)
+{
+    FILE *f = FIO_CreateFile(name);
+    if (!f) return;
+    uint32_t hdr[4] = { 0x4752564C /* "LVRG" */, get_ms_clock(), addr, len };
+    FIO_WriteFile(f, hdr, sizeof(hdr));
+    for (uint32_t off = 0; off < len; off += chunk)
+    {
+        memcpy(buf, (void *)lvs_addr(addr + off), chunk);
+        FIO_WriteFile(f, buf, chunk);
+    }
+    FIO_CloseFile(f);
+}
+
+static void lvs_task(void *unused)
+{
+    char name[32];
+    uint8_t *map = malloc(LVS_NBLK * LVS_REC);
+    uint32_t chunk = LVB_CHUNK;
+    uint8_t *buf = malloc(chunk);
+    if (!buf) { chunk = 0x10000; buf = malloc(chunk); }
+    if (!map || !buf) { NotifyBox(4000, "LV survey: no memory"); goto out; }
+
+    uint32_t t0 = get_ms_clock();
+    lvs_pass(map, 0);
+    msleep(150);
+    lvs_pass(map, 1);
+    msleep(450);
+    lvs_pass(map, 2);
+    uint32_t t1 = get_ms_clock();
+
+    snprintf(name, sizeof(name), "ML/LVMAP%02d.BIN", lvj_runs);
+    FILE *f = FIO_CreateFile(name);
+    if (!f) { NotifyBox(4000, "LV survey: no file"); goto out; }
+    uint32_t hdr[5] = { 0x50414D4C /* "LMAP" */, lvj_runs, t0, t1 - t0, LVS_BLK };
+    FIO_WriteFile(f, hdr, sizeof(hdr));
+    FIO_WriteFile(f, map, LVS_NBLK * LVS_REC);
+    FIO_CloseFile(f);
+
+    /* largest runs of blocks that changed in both intervals (1-block gaps allowed) */
+    uint32_t best_s[3] = {0}, best_n[3] = {0};
+    int s = -1, gap = 0;
+    for (int b = 0; b <= LVS_NBLK; b++)
+    {
+        uint32_t a = b * LVS_BLK;
+        int known = a >= 0x20000000 && a < 0x25500000;
+        int ch = b < LVS_NBLK && !known && (((uint32_t *)(map + b * LVS_REC))[1] & 3) == 3;
+        if (ch) { if (s < 0) s = b; gap = 0; continue; }
+        if (s >= 0 && b < LVS_NBLK && !known && gap == 0) { gap = 1; continue; }
+        if (s >= 0)
+        {
+            uint32_t n = b - gap - s;
+            for (int k = 0; k < 3; k++)
+                if (n > best_n[k])
+                {
+                    for (int j = 2; j > k; j--) { best_n[j] = best_n[j - 1]; best_s[j] = best_s[j - 1]; }
+                    best_n[k] = n; best_s[k] = s;
+                    break;
+                }
+        }
+        s = -1; gap = 0;
+    }
+
+    snprintf(name, sizeof(name), "ML/LVRG%02d_W.BIN", lvj_runs);
+    lvs_dump(name, 0x25500000, 0x400000, buf, chunk);
+    for (int k = 0; k < 3; k++)
+    {
+        if (best_n[k] * LVS_BLK < 0x400000) break;
+        uint32_t len = best_n[k] * LVS_BLK;
+        if (len > LVS_DUMPMAX) len = LVS_DUMPMAX;
+        snprintf(name, sizeof(name), "ML/LVRG%02d_%d.BIN", lvj_runs, k);
+        lvs_dump(name, best_s[k] * LVS_BLK, len, buf, chunk);
+    }
+    lvj_runs++;
+    beep();
+out:
+    if (map) free(map);
+    if (buf) free(buf);
+    lvj_busy = 0;
+}
+
+static MENU_SELECT_FUNC(lvs_select)
+{
+    if (lvj_busy) return;
+    lvj_busy = 1;
+    task_create("lvs_task", 0x1e, 0x1000, lvs_task, 0);
+}
+
 static MENU_UPDATE_FUNC(lvj_update)
 {
     MENU_SET_VALUE(lvj_busy ? "sampling..." : "%d runs saved", lvj_runs);
@@ -172,8 +320,15 @@ static struct menu_entry lvj_menu[] = {
         .name   = "LV buffer dump",
         .select = lvb_select,
         .update = lvj_update,
-        .help   = "Read-only: copies the current raw2yuv input buffer (21 MB) -> ML/LVBUFnn.BIN",
+        .help   = "Read-only: copies the current LV YUV frame buffer (21 MB) -> ML/LVBUFnn.BIN",
         .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~5-15 s).",
+    },
+    {
+        .name   = "LV memory survey",
+        .select = lvs_select,
+        .update = lvj_update,
+        .help   = "Read-only: maps changing RAM, dumps side windows + biggest changing areas",
+        .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~10-20 s).",
     },
 };
 
