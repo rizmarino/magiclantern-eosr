@@ -99,6 +99,62 @@ static MENU_SELECT_FUNC(lvj_select)
     task_create("lvj_task", 0x1e, 0x1000, lvj_task, 0);
 }
 
+/* LV buffer dump: copies the raw2yuv input buffer currently referenced by the
+ * stage object (+0x20; must be one of the 4 MEMNAVI buffers seen in v3) to
+ * ML/LVBUFnn.BIN. Header: "LVBF" u32 run, ms, addr, len, then R2YS (0x80),
+ * MEMF (0x180), R2YA (0x40) snapshots, then the buffer. Read-only apart from
+ * the file. The buffer keeps being rewritten while we copy (3-4 frame ring),
+ * so expect tearing between chunks; aim at a static scene. */
+#define LVB_SIZE  0x1540000
+#define LVB_CHUNK 0x40000
+static const uint32_t lvb_known[] = { 0x20000000, 0x21540000, 0x22A80000, 0x23FC0000 };
+
+static void lvb_task(void *unused)
+{
+    char name[32];
+    uint32_t stage = MEM(0x83E0), cur = 0;
+    if (lvj_ram_ok(stage, 0x80)) cur = MEM(stage + 0x20) & ~0x40000000;
+    int ok = 0;
+    for (int i = 0; i < COUNT(lvb_known); i++) ok |= (cur == lvb_known[i]);
+    if (!ok) { NotifyBox(4000, "LV buffer dump: unexpected buffer %x", cur); goto out; }
+
+    uint32_t chunk = LVB_CHUNK;
+    lvj_buf = malloc(chunk);
+    if (!lvj_buf) { chunk = 0x10000; lvj_buf = malloc(chunk); }
+    snprintf(name, sizeof(name), "ML/LVBUF%02d.BIN", lvj_runs);
+    FILE *f = lvj_buf ? FIO_CreateFile(name) : 0;
+    if (!f) { NotifyBox(4000, "LV buffer dump: no file/memory"); goto out; }
+
+    lvj_len = 0;
+    uint32_t hdr[5] = { 0x4642564C /* "LVBF" */, lvj_runs, get_ms_clock(), cur, LVB_SIZE };
+    lvj_put(hdr, sizeof(hdr));
+    lvj_put((void *)stage, 0x80);
+    lvj_put((void *)0x742A8, 0x180);
+    lvj_put((void *)0x3BFB4, 0x40);
+    FIO_WriteFile(f, lvj_buf, lvj_len);
+
+    uint32_t src = cur | 0x40000000;            /* uncached alias, as Canon uses */
+    for (uint32_t off = 0; off < LVB_SIZE; off += chunk)
+    {
+        memcpy(lvj_buf, (void *)(src + off), chunk);
+        FIO_WriteFile(f, lvj_buf, chunk);
+    }
+    FIO_CloseFile(f);
+    lvj_runs++;
+    beep();
+out:
+    if (lvj_buf) free(lvj_buf);
+    lvj_buf = 0;
+    lvj_busy = 0;
+}
+
+static MENU_SELECT_FUNC(lvb_select)
+{
+    if (lvj_busy) return;
+    lvj_busy = 1;
+    task_create("lvb_task", 0x1e, 0x1000, lvb_task, 0);
+}
+
 static MENU_UPDATE_FUNC(lvj_update)
 {
     MENU_SET_VALUE(lvj_busy ? "sampling..." : "%d runs saved", lvj_runs);
@@ -111,6 +167,13 @@ static struct menu_entry lvj_menu[] = {
         .update = lvj_update,
         .help   = "Read-only: 8 snapshots of Canon's LV frame-job structs -> ML/LVJOB.BIN",
         .help2  = "SET, close the menu, keep live view running until the beep (~2 s).",
+    },
+    {
+        .name   = "LV buffer dump",
+        .select = lvb_select,
+        .update = lvj_update,
+        .help   = "Read-only: copies the current raw2yuv input buffer (21 MB) -> ML/LVBUFnn.BIN",
+        .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~5-15 s).",
     },
 };
 
