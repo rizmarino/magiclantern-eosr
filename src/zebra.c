@@ -803,7 +803,7 @@ static void FAST draw_zebras_raw_lv()
 {
     if (!raw_update_params()) return;
 
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = bmp_vram_overlay();
     if (!bvram) return;
     uint8_t * const bvram_mirror = get_bvram_mirror();
     if (!bvram_mirror) return;
@@ -1163,7 +1163,7 @@ static int zebra_digic_dirty = 0;
 
 static void draw_zebras( int Z )
 {
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = bmp_vram_overlay();
     int zd = Z && zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
     if (zd)
     {
@@ -1709,7 +1709,7 @@ draw_zebra_and_focus( int Z, int F )
 {
     if (unlikely(!get_global_draw())) return 0;
 
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = bmp_vram_overlay();
     if (unlikely(!bvram)) return 0;
     if (unlikely(!bvram_mirror)) return 0;
     
@@ -4070,8 +4070,7 @@ static void zdiag_tick(void)
     zdiag_next_ms = now + 1000;
 
     extern struct dialog *LiveViewApp_dialog;
-    uint8_t *bvram = bmp_vram_real();
-    uint8_t *bv = bmp_vram();
+    uint8_t *bvram = bmp_vram_overlay();
     struct vram_info *lvi = get_yuv422_vram();
     uint8_t *lvram = lvi ? lvi->vram : 0;
 
@@ -4091,10 +4090,10 @@ static void zdiag_tick(void)
        -1,
 #endif
        EXT_MONITOR_CONNECTED, dirty_pixels_num);
-    ZD(" bvram_real=%x bmp_vram=%x mirror=%x lvram=%x lvdisp=%x panel=%x evf=%x w=%d h=%d pitch=%d\n",
-       (int)bvram, (int)bv, (int)bvram_mirror, (int)lvram,
-       (int)YUV422_LV_BUFFER_DISPLAY_ADDR, (int)DV_VRAM_PANEL, (int)DV_VRAM_EVF,
-       vram_lv.width, vram_lv.height, vram_lv.pitch);
+    ZD(" bvram_ovl=%x bvram_real=%x mirror=%x lvram=%x lvdisp=%x panel=%x evf=%x line=%x w=%d h=%d pitch=%d lvovl=%d dtype=%x\n",
+       (int)bvram, (int)bmp_vram_real(), (int)bvram_mirror, (int)lvram,
+       (int)YUV422_LV_BUFFER_DISPLAY_ADDR, (int)DV_VRAM_PANEL, (int)DV_VRAM_EVF, (int)DV_VRAM_LINE,
+       vram_lv.width, vram_lv.height, vram_lv.pitch, (int)LV_OVERLAYS_MODE, (int)DV_DISP_TYPE);
     ZD(" os x0=%d y0=%d xmax=%d ymax=%d xex=%d yex=%d off=%d bm2lv tx=%d ty=%d sx=%d sy=%d\n",
        os.x0, os.y0, os.x_max, os.y_max, os.x_ex, os.y_ex,
        get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy);
@@ -4715,7 +4714,7 @@ static void show_overlay()
     }
 
     get_yuv422_vram();
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = bmp_vram_overlay();
     if (!bvram) return;
     
     clrscr();

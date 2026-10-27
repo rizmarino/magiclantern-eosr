@@ -53,7 +53,7 @@ void draw_false_downsampled( void )
     }
 
     //~ bvram_mirror_init();
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = bmp_vram_overlay();
     if (!bvram) return;
     uint8_t * const bvram_mirror = get_bvram_mirror();
     if (!bvram_mirror) return;

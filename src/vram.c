@@ -466,6 +466,12 @@ void _update_vram_params()
     bm2lv.ty = hdmi_code >= 5 ? (video_mode_resolution>0 ? 30 : 60) : 0;
     bm2lv.sx = hdmi_code >= 5 ? 2048 : EXT_MONITOR_RCA ? 768 : 1024;
     bm2lv.sy = 1024 * vram_lv.height / (hdmi_code >= 5 ? 540 : 480); // no black bars at top or bottom
+    #if defined(CONFIG_R)
+    // EOS R LV buffer is 1024 (panel) or 1280 (EVF) wide, not 720: scale X like Y.
+    // On-camera ZEBDIAG showed sx=1024 / sy=1454, i.e. overlays only covered the left 70%.
+    if (hdmi_code < 5 && !EXT_MONITOR_RCA)
+        bm2lv.sx = 1024 * vram_lv.width / 720;
+    #endif
 #endif
     
     //~ lv_ratio_num = hdmi_code >= 5 ? 16 : 3;

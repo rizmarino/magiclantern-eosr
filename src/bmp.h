@@ -74,6 +74,17 @@ inline uint8_t *rgb_vram_preinit()
     return rgb_vram_info ? rgb_vram_info->bitmap_data : NULL;
 }
 
+/** Returns a pointer to the BMP buffer that overlays (zebras, peaking,
+ * false colour) should draw into. On FEATURE_VRAM_RGBA cams that is ML's
+ * indexed buffer (bmp_vram()), which redraw_task converts to RGBA.
+ * bmp_vram_real() there points at a Canon buffer that ML never displays
+ * (EOS R ZEBDIAG: real=0x49a5c5f8 vs indexed=0xf378c4). */
+#ifdef FEATURE_VRAM_RGBA
+#define bmp_vram_overlay() bmp_vram()
+#else
+#define bmp_vram_overlay() bmp_vram_real()
+#endif
+
 void refresh_yuv_from_rgb(void);
 void refresh_yuv_from_rgb_task(void *);
 uint32_t indexed2rgb(uint8_t color);
