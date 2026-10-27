@@ -153,14 +153,14 @@ static uint32_t hd_size = 0;
 #ifdef CONFIG_R
 /* riz/eosr-experimental: where the LV image sits inside ML's overlay
  * coordinates when the EVF is active. Defaults calibrated by eye on an EOS R
- * 1.8.0 (focus peaking on top/bottom edges): x0=0, y0=-40, 720x485, i.e. the
- * EVF image starts 40 overlay rows above the usual 720x480 area (rows above
+ * 1.8.0 (focus peaking on edges at top/middle/bottom): x0=0, y0=-80, 720x495,
+ * i.e. the EVF image starts 80 overlay rows above the usual 720x480 area (rows above
  * BMP_H_MINUS=-30 can't be drawn). User-tunable from Overlay -> EVF overlay
  * align; values persist in ML settings. */
 static CONFIG_INT("r.evf.ovl.x0", r_evf_x0, 0);
-static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, -40);
+static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, -80);
 static CONFIG_INT("r.evf.ovl.w",  r_evf_w,  720);
-static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  485);
+static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  495);
 static int r_img_x0 = 0, r_img_y0 = 0, r_img_w = 720, r_img_h = 480;
 #endif
 
@@ -924,7 +924,7 @@ static struct menu_entry r_evf_menus[] = {
             { .name = "Width",    .priv = &r_evf_w,  .min = 400, .max = 960, .unit = UNIT_DEC,
               .help = "Image width in overlay pixels (720 = full)." },
             { .name = "Height",   .priv = &r_evf_h,  .min = 300, .max = 600, .unit = UNIT_DEC,
-              .help = "Image height in overlay pixels (calibrated default 485)." },
+              .help = "Image height in overlay pixels (calibrated default 495)." },
             MENU_EOL,
         },
     },
