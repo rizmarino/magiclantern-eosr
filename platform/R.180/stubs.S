@@ -67,6 +67,7 @@ DATA_PTR(    0xFDFC,  bmp_vram_info)                        /* first YUV VRAM bu
 
 /** Debug messages **/
 THUMB_FN(0xE0563314,  DryosDebugMsg)                        /* lots of debug messages; format string is third argument */
+THUMB_FN(0xE0563720,  dm_set_store_level)                   /* DbgMgr.c: (class, level), class 0xFF = all; called by "dmstore" */
 
 /** Dumper **/
 THUMB_FN(0xe00bd69e,  dump_file)                            // shouldn't be used, gone from newer models
