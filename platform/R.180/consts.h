@@ -142,12 +142,13 @@
 /* Hardcoded to Panel for now. It would be easier if we can replace this with a
  * function call that would be put into functon_overrides.c. Then we could just
  * define full structs there instead of playing with pointers */
-// riz/eosr-experimental: fall back to the EVF buffer when the Panel pointer is
-// unset (eye at the viewfinder). On-camera ZEBDIAG (panel active) showed the
-// inactive EVF pointer reads 0x01000000 (D7/D8 "uninitialised" marker), not 0,
-// so treat both 0 and 0x01000000 as invalid. EVF case still UNVERIFIED.
+// riz/eosr-experimental: select Panel vs EVF LV buffer by DispVram display type.
+// On-camera ZEBDIAG: Panel active -> dtype=0x1, EVF pointer=0x01000000 (uninit);
+// EVF active -> dtype=0x10, EVF pointer alternates 9f230000/9f624800 while the
+// Panel pointer stays frozen on its last frame. 0 / 0x01000000 = invalid.
 #define R_LV_PTR_OK(p)                ((p) != 0 && (p) != 0x01000000)
-#define R_LV_ON_EVF()                 (!R_LV_PTR_OK(DV_VRAM_PANEL) && R_LV_PTR_OK(DV_VRAM_EVF))
+#define R_DISP_IS_EVF()               ((DV_DISP_TYPE & 0x10) != 0)
+#define R_LV_ON_EVF()                 (R_DISP_IS_EVF() && R_LV_PTR_OK(DV_VRAM_EVF))
 #define YUV422_LV_BUFFER_DISPLAY_ADDR (R_LV_ON_EVF() ? DV_VRAM_EVF : DV_VRAM_PANEL)
 #define YUV422_LV_PITCH               1024       // depends on display type
 

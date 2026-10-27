@@ -421,6 +421,13 @@ int get_global_draw() // menu setting, or off if
          * for clean overlays.
          */
         lv_disp_mode = LV_OVERLAYS_MODE != 3;
+        #ifdef R_DISP_IS_EVF
+        /* EOS R: LV_OVERLAYS_MODE only tracks the rear panel's INFO mode; with
+         * the EVF active it reads 0 regardless of INFO presses (ZEBDIAG), which
+         * would disable Global Draw permanently in the viewfinder. Don't gate
+         * on it there (ML overlays may overlap Canon's EVF info). */
+        if (R_DISP_IS_EVF()) lv_disp_mode = 0;
+        #endif
     #endif
 
     extern int ml_started;
@@ -4099,9 +4106,11 @@ static void zdiag_tick(void)
        get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy);
     {
         extern uint32_t r_refresh_us_last, r_refresh_us_max, r_refresh_count, r_refresh_words_last;
-        ZD(" refresh n=%d last_us=%d max_us=%d words_changed=%d\n",
-           r_refresh_count, r_refresh_us_last, r_refresh_us_max, r_refresh_words_last);
-        r_refresh_us_max = 0;
+        extern uint32_t r_conv_us_max, r_ximr_us_max, r_full_count;
+        ZD(" refresh n=%d full=%d last_us=%d max_us=%d conv_max_us=%d ximr_max_us=%d words_changed=%d\n",
+           r_refresh_count, r_full_count, r_refresh_us_last, r_refresh_us_max,
+           r_conv_us_max, r_ximr_us_max, r_refresh_words_last);
+        r_refresh_us_max = r_conv_us_max = r_ximr_us_max = 0;
     }
 
     /* replicate draw_zebras() skip tests over the overlay area */

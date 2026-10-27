@@ -200,11 +200,13 @@ extern struct semaphore *winsys_sem;
  * words. Our dedicated compositor layer is written only by ML, so skipping
  * unchanged pixels is safe; a full redraw every R_FULL_EVERY refreshes (and
  * whenever the RGBA buffer pointer changes) guards against anything else. */
-#define R_FULL_EVERY 20
+#define R_FULL_EVERY 100 /* ~1 full redraw per 15-20 s; also forced on pointer/output change */
 static uint32_t *r_shadow = NULL;
 static uint32_t *r_shadow_rgb = NULL;
 static int r_full_countdown = 0;
 uint32_t r_refresh_us_last = 0, r_refresh_us_max = 0, r_refresh_count = 0, r_refresh_words_last = 0;
+uint32_t r_conv_us_max = 0, r_ximr_us_max = 0, r_full_count = 0;
+static int r_prev_evf = -1;
 
 static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
 {
@@ -214,9 +216,12 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
         if (!r_shadow) return 0; /* fall back to full conversion */
         r_full_countdown = 0;
     }
-    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb);
+    int evf = R_DISP_IS_EVF();
+    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb) || (evf != r_prev_evf);
+    r_prev_evf = evf;
     if (full)
     {
+        r_full_count++;
         r_full_countdown = R_FULL_EVERY;
         r_shadow_rgb = rgb;
     }
@@ -243,6 +248,9 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
 
 void refresh_yuv_from_rgb(void)
 {
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    uint64_t r_t0 = get_us_clock();
+#endif
     // get our indexed buffer, convert into our real rgb buffer
     uint8_t *b = bmp_vram_indexed;
     uint32_t *rgb_data = NULL;
@@ -318,6 +326,10 @@ void refresh_yuv_from_rgb(void)
     }
 #endif
 
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    uint64_t r_t1 = get_us_clock();
+    { uint32_t c = (uint32_t)(r_t1 - r_t0); if (c > r_conv_us_max) r_conv_us_max = c; }
+#endif
     // trigger Ximr to render to OSD from RGB buffer
 #ifdef CONFIG_DIGIC_VI
     XimrExe((void *)XIMR_CONTEXT);
@@ -325,6 +337,9 @@ void refresh_yuv_from_rgb(void)
     take_semaphore(winsys_sem, 0);
     XimrExe((void *)XIMR_CONTEXT);
     give_semaphore(winsys_sem);
+#endif
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    { uint32_t x = (uint32_t)(get_us_clock() - r_t1); if (x > r_ximr_us_max) r_ximr_us_max = x; }
 #endif
     ml_refresh_display_needed = 0;
 }
