@@ -4041,6 +4041,114 @@ void update_lv_fps() // to be called every 10 seconds
 // Items which need a high FPS
 // Magic Zoom, Focus Peaking, zebra*, spotmeter*, false color*
 // * = not really high FPS, but still fluent
+#ifdef CONFIG_R
+/* riz/eosr-experimental: on-camera diagnostics for zebras / focus peaking /
+ * false colour. Triggered from Debug -> "Don't click me"; samples once per
+ * second inside the LV hi-priority task (the context that draws these
+ * overlays) and writes ML/ZEBDIAG.TXT. Read-only apart from the file. */
+static volatile int zdiag_samples_left = 0;
+static int zdiag_next_ms = 0;
+static char zdiag_buf[8192];
+static int zdiag_len = 0;
+
+void zebra_diag_start(void)
+{
+    zdiag_len = 0;
+    zdiag_next_ms = get_ms_clock() + 5000; /* time to close the menu */
+    zdiag_samples_left = 12;
+    NotifyBox(4000, "ZEBDIAG: close menu, aim at bright area");
+}
+
+#define ZD(...) do { if (zdiag_len < (int)sizeof(zdiag_buf) - 200) \
+    zdiag_len += snprintf(zdiag_buf + zdiag_len, sizeof(zdiag_buf) - zdiag_len, __VA_ARGS__); } while (0)
+
+static void zdiag_tick(void)
+{
+    if (!zdiag_samples_left) return;
+    int now = get_ms_clock();
+    if (now < zdiag_next_ms) return;
+    zdiag_next_ms = now + 1000;
+
+    extern struct dialog *LiveViewApp_dialog;
+    uint8_t *bvram = bmp_vram_real();
+    uint8_t *bv = bmp_vram();
+    struct vram_info *lvi = get_yuv422_vram();
+    uint8_t *lvram = lvi ? lvi->vram : 0;
+
+    ZD("t=%d lv=%d gui_state=%d gmode=0x%x disp_on=%d lv_np=%d jsr=%d menu=%d mirror_dn=%d lvapp=%x\n",
+       now, lv, gui_state, CURRENT_GUI_MODE, DISPLAY_IS_ON, LV_NON_PAUSED,
+       job_state_ready_to_take_pic(), menu_active_and_not_hidden(), mirror_down,
+       (int)LiveViewApp_dialog);
+    ZD(" idle=%d zsr=%d gdraw=%d luma_ok=%d expsim=%d dgain=%d movie=%d\n",
+       liveview_display_idle(), zebra_should_run(), get_global_draw(),
+       lv_luma_is_accurate(), get_expsim(), get_digic_iso_gain_photo(), is_movie_mode());
+    ZD(" zebra_draw=%d zcs=%d zhi=%d zlo=%d zrec=%d fp=%d fp_disp=%d fp_thr=%d fc=%d ext=%d dirty=%d\n",
+       zebra_draw, zebra_colorspace, zebra_level_hi, zebra_level_lo, zebra_rec,
+       focus_peaking, focus_peaking_disp, focus_peaking_pthr,
+#ifdef FEATURE_FALSE_COLOR
+       falsecolor_draw,
+#else
+       -1,
+#endif
+       EXT_MONITOR_CONNECTED, dirty_pixels_num);
+    ZD(" bvram_real=%x bmp_vram=%x mirror=%x lvram=%x lvdisp=%x panel=%x evf=%x w=%d h=%d pitch=%d\n",
+       (int)bvram, (int)bv, (int)bvram_mirror, (int)lvram,
+       (int)YUV422_LV_BUFFER_DISPLAY_ADDR, (int)DV_VRAM_PANEL, (int)DV_VRAM_EVF,
+       vram_lv.width, vram_lv.height, vram_lv.pitch);
+    ZD(" os x0=%d y0=%d xmax=%d ymax=%d xex=%d yex=%d off=%d bm2lv tx=%d ty=%d sx=%d sy=%d\n",
+       os.x0, os.y0, os.x_max, os.y_max, os.x_ex, os.y_ex,
+       get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy);
+
+    /* replicate draw_zebras() skip tests over the overlay area */
+    if (bvram && bvram_mirror && lvram)
+    {
+        int words = 0, skip_canon = 0, skip_mirror = 0, bp_nonzero = 0;
+        int ysum = 0, ycnt = 0, ymax = 0, over = 0;
+        int zlh = zebra_level_hi * 255 / 100 - 1;
+        for (int y = os.y0; y < os.y_max; y += 8)
+        {
+            uint32_t *b_row = (uint32_t *)(bvram + BM_R(y));
+            uint32_t *m_row = (uint32_t *)(bvram_mirror + BM_R(y));
+            uint32_t *v_row = (uint32_t *)(lvram + BM2LV_R(y));
+            for (int x = os.x0; x < os.x_max; x += 8)
+            {
+                uint32_t BP = b_row[x >> 2], MP = m_row[x >> 2];
+                words++;
+                if (BP) bp_nonzero++;
+                if (BP != 0 && BP != MP) skip_canon++;
+                else if (MP & 0x80808080) skip_mirror++;
+                uint32_t uyvy = v_row[BM2LV_X(x) >> 1];
+                int Y = (uyvy >> 8) & 0xFF;
+                ysum += Y; ycnt++; if (Y > ymax) ymax = Y; if (Y > zlh) over++;
+            }
+        }
+        ZD(" scan words=%d bp_nonzero=%d skip_canon=%d skip_mirror=%d Yavg=%d Ymax=%d Y>zhi=%d sample_bp=%08x sample_lv=%08x\n",
+           words, bp_nonzero, skip_canon, skip_mirror, ycnt ? ysum / ycnt : -1, ymax, over,
+           *(uint32_t *)(bvram + BM_R(240) + 360), *(uint32_t *)(lvram + BM2LV(360, 240)));
+    }
+    else
+    {
+        ZD(" scan skipped (null buffer)\n");
+    }
+
+    if (--zdiag_samples_left == 0)
+    {
+        FILE *f = FIO_CreateFile("ML/ZEBDIAG.TXT");
+        if (f)
+        {
+            FIO_WriteFile(f, zdiag_buf, zdiag_len);
+            FIO_CloseFile(f);
+            NotifyBox(4000, "ZEBDIAG.TXT saved (%d bytes)", zdiag_len);
+        }
+        else
+        {
+            NotifyBox(4000, "ZEBDIAG: could not create file");
+        }
+    }
+}
+#undef ZD
+#endif /* CONFIG_R */
+
 static void
 livev_hipriority_task( void* unused )
 {
@@ -4058,6 +4166,9 @@ livev_hipriority_task( void* unused )
     {
         //~ vsync(&YUV422_LV_BUFFER_DISPLAY_ADDR);
         fps_ticks++;
+        #ifdef CONFIG_R
+        zdiag_tick();
+        #endif
 
         while (is_mvr_buffer_almost_full())
         {
@@ -4088,6 +4199,9 @@ livev_hipriority_task( void* unused )
                 while (!zebra_should_run()) 
                 {
                     msleep(100);
+                    #ifdef CONFIG_R
+                    zdiag_tick();
+                    #endif
                 }
                 vram_params_set_dirty();
                 zoom_overlay_triggered_by_focus_ring_countdown = 0;

@@ -355,6 +355,12 @@ static void run_test()
     // since dm_store is more permissive than dm_print.
     call("dumpf");
 
+#if defined(CONFIG_R)
+    // riz/eosr-experimental: overlay diagnostics -> ML/ZEBDIAG.TXT
+    extern void zebra_diag_start(void);
+    zebra_diag_start();
+#endif
+
 #if 0 && defined(CONFIG_200D)
     // Want to run a quick test?  You can hack it in here,
     // after modifying the above guards.  The guards allow
