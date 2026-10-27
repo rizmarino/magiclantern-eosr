@@ -160,6 +160,7 @@ static CONFIG_INT("r.evf.ovl.x0", r_evf_x0, 0);
 static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, 0);
 static CONFIG_INT("r.evf.ovl.w",  r_evf_w,  720);
 static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  426);
+static int r_img_x0 = 0, r_img_y0 = 0, r_img_w = 720, r_img_h = 480;
 #endif
 
 static void vram_params_update_if_dirty()
@@ -350,12 +351,16 @@ void _update_vram_params()
     {
         vram_lv.width = 1280;
         vram_lv.height = 720;
-        // clamp the user alignment to the visible 720x480 overlay area
-        int x0 = COERCE(r_evf_x0, 0, 200), y0 = COERCE(r_evf_y0, 0, 200);
-        os.x0 = x0;
-        os.y0 = y0;
-        os.x_ex = COERCE(r_evf_w, 400, 720 - x0);
-        os.y_ex = COERCE(r_evf_h, 300, 480 - y0);
+        // user alignment = full image rect in overlay coords (may extend past
+        // the layer); os = its intersection with the drawable layer area.
+        r_img_x0 = COERCE(r_evf_x0, -200, 200);
+        r_img_y0 = COERCE(r_evf_y0, -200, 200);
+        r_img_w  = COERCE(r_evf_w, 400, 960);
+        r_img_h  = COERCE(r_evf_h, 300, 600);
+        os.x0 = MAX(r_img_x0, BMP_W_MINUS);
+        os.y0 = MAX(r_img_y0, BMP_H_MINUS);
+        os.x_ex = MIN(r_img_x0 + r_img_w, BMP_W_PLUS) - os.x0;
+        os.y_ex = MIN(r_img_y0 + r_img_h, BMP_H_PLUS) - os.y0;
     }
     else
     {
@@ -365,6 +370,7 @@ void _update_vram_params()
         os.y0 = 0;
         os.x_ex = 720;
         os.y_ex = 480;
+        r_img_x0 = 0; r_img_y0 = 0; r_img_w = 720; r_img_h = 480;
     }
     vram_lv.pitch = vram_lv.width * 2;
     os.x_max = os.x0 + os.x_ex;
@@ -494,10 +500,11 @@ void _update_vram_params()
     if (hdmi_code < 5 && !EXT_MONITOR_RCA)
     {
         // map overlay rect os.(x0,y0)-(x_max,y_max) onto the whole LV buffer
-        bm2lv.sx = 1024 * vram_lv.width / os.x_ex;
-        bm2lv.sy = 1024 * vram_lv.height / os.y_ex;
-        bm2lv.tx = -((os.x0 * bm2lv.sx) >> 10);
-        bm2lv.ty = -((os.y0 * bm2lv.sy) >> 10);
+        // map the full (unclipped) image rect onto the whole LV buffer
+        bm2lv.sx = 1024 * vram_lv.width / r_img_w;
+        bm2lv.sy = 1024 * vram_lv.height / r_img_h;
+        bm2lv.tx = -((r_img_x0 * bm2lv.sx) >> 10);
+        bm2lv.ty = -((r_img_y0 * bm2lv.sy) >> 10);
     }
     #endif
 #endif
@@ -909,13 +916,13 @@ static struct menu_entry r_evf_menus[] = {
         .help   = "Align ML overlays with the image in the viewfinder.",
         .help2  = "Use focus peaking on a sharp edge; adjust until it lines up.",
         .children = (struct menu_entry[]) {
-            { .name = "X offset", .priv = &r_evf_x0, .min = 0,   .max = 200, .unit = UNIT_DEC,
-              .help = "Left edge of the image in overlay pixels." },
-            { .name = "Y offset", .priv = &r_evf_y0, .min = 0,   .max = 200, .unit = UNIT_DEC,
-              .help = "Top edge of the image in overlay pixels." },
-            { .name = "Width",    .priv = &r_evf_w,  .min = 400, .max = 720, .unit = UNIT_DEC,
+            { .name = "X offset", .priv = &r_evf_x0, .min = -200, .max = 200, .unit = UNIT_DEC,
+              .help = "Left edge of the image in overlay pixels (negative = left of the usual area)." },
+            { .name = "Y offset", .priv = &r_evf_y0, .min = -200, .max = 200, .unit = UNIT_DEC,
+              .help = "Top edge of the image in overlay pixels (negative = moves overlays up)." },
+            { .name = "Width",    .priv = &r_evf_w,  .min = 400, .max = 960, .unit = UNIT_DEC,
               .help = "Image width in overlay pixels (720 = full)." },
-            { .name = "Height",   .priv = &r_evf_h,  .min = 300, .max = 480, .unit = UNIT_DEC,
+            { .name = "Height",   .priv = &r_evf_h,  .min = 300, .max = 600, .unit = UNIT_DEC,
               .help = "Image height in overlay pixels (480 = full, 426 = 3:2 on 4:3 EVF)." },
             MENU_EOL,
         },
