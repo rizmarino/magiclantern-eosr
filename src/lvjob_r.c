@@ -575,9 +575,54 @@ out:
 
 static MENU_SELECT_FUNC(lvs2_select)
 {
+    /* v8: disabled, reading parts of 0x80000000-0xBFFFFFFF froze the camera */
+    NotifyBox(3000, "Survey 2 disabled: run LV 2nd-GB probe");
+}
+static void __attribute__((unused)) *lvs2_keep = lvs2_task;
+
+/* v8 LV 2nd-GB probe: finds how much of 0x80000000-0xBFFFFFFF is actually
+ * backed (survey 2 froze the camera there). For each 16 MB group it appends
+ * "G <addr>" to ML/LVPROBE.TXT and closes the file *before* reading one word
+ * per MB, then appends "ok <addr> <words>". After a freeze, the last "G" line
+ * without an "ok" is the group that hangs. Starts with the known-good panel
+ * VRAM (0x9F230000) as a control. Read-only apart from the file. */
+static void lvp_line(const char *fmt, uint32_t a, const uint32_t *w, int n)
+{
+    char line[200];
+    int len = snprintf(line, sizeof(line), fmt, a);
+    for (int i = 0; i < n && len < (int)sizeof(line) - 12; i++)
+        len += snprintf(line + len, sizeof(line) - len, " %08x", w[i]);
+    if (len < (int)sizeof(line) - 2) { line[len++] = '\n'; line[len] = 0; }
+    FILE *f = FIO_CreateFileOrAppend("ML/LVPROBE.TXT");
+    if (!f) return;
+    FIO_WriteFile(f, line, len);
+    FIO_CloseFile(f);
+}
+
+static void lvp_task(void *unused)
+{
+    uint32_t w[16];
+    lvp_line("start run %d", lvj_runs, 0, 0);
+    lvp_line("G %08x (control: panel VRAM)", 0x9F230000, 0, 0);
+    w[0] = MEM(0x9F230000);
+    lvp_line("ok %08x", 0x9F230000, w, 1);
+    for (uint32_t g = 0x80000000; g < 0xC0000000; g += 0x1000000)
+    {
+        lvp_line("G %08x", g, 0, 0);
+        for (int i = 0; i < 16; i++) w[i] = MEM(g + i * 0x100000);
+        lvp_line("ok %08x", g, w, 16);
+    }
+    lvp_line("done %08x", 0xC0000000, 0, 0);
+    lvj_runs++;
+    beep();
+    lvj_busy = 0;
+}
+
+static MENU_SELECT_FUNC(lvp_select)
+{
     if (lvj_busy) return;
     lvj_busy = 1;
-    task_create("lvs2_task", 0x1e, 0x1000, lvs2_task, 0);
+    task_create("lvp_task", 0x1e, 0x1000, lvp_task, 0);
 }
 
 static MENU_SELECT_FUNC(lvd_select)
@@ -618,8 +663,16 @@ static struct menu_entry lvj_menu[] = {
         .name   = "LV memory survey 2",
         .select = lvs2_select,
         .update = lvj_update,
-        .help   = "Read-only: saves the MMU table, surveys mapped 2nd-GB RAM, dumps changing areas",
-        .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~10-30 s).",
+        .help   = "DISABLED in v8 (froze the camera). Run LV 2nd-GB probe instead.",
+        .help2  = "Re-enabled once the probe shows which 2nd-GB range is safe.",
+        .shidden = 1,
+    },
+    {
+        .name   = "LV 2nd-GB probe",
+        .select = lvp_select,
+        .update = lvj_update,
+        .help   = "Reads 1 word/MB of 0x80000000-0xBFFFFFFF, logging each 16 MB step first",
+        .help2  = "WILL likely freeze: pull battery, then copy ML/LVPROBE.TXT. Not recording.",
     },
     {
         .name   = "LV DAF region dump",
