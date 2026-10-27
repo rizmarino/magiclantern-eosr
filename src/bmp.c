@@ -191,6 +191,56 @@ void bmp_idle_copy(int direction, int fullsize)
 // but this struct is not yet determined for 200D
 extern int XimrExe(void *);
 extern struct semaphore *winsys_sem;
+
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+/* riz/eosr-experimental: incremental indexed->RGBA refresh.
+ * The full conversion writes 960*540*4 = ~2 MB to the OSD layer on every
+ * refresh (up to 20/s) while overlays run; most of it is unchanged.
+ * Keep a shadow of the last indexed frame and only convert changed 4-pixel
+ * words. Our dedicated compositor layer is written only by ML, so skipping
+ * unchanged pixels is safe; a full redraw every R_FULL_EVERY refreshes (and
+ * whenever the RGBA buffer pointer changes) guards against anything else. */
+#define R_FULL_EVERY 20
+static uint32_t *r_shadow = NULL;
+static uint32_t *r_shadow_rgb = NULL;
+static int r_full_countdown = 0;
+uint32_t r_refresh_us_last = 0, r_refresh_us_max = 0, r_refresh_count = 0, r_refresh_words_last = 0;
+
+static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
+{
+    if (!r_shadow)
+    {
+        r_shadow = malloc(BMP_VRAM_SIZE);
+        if (!r_shadow) return 0; /* fall back to full conversion */
+        r_full_countdown = 0;
+    }
+    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb);
+    if (full)
+    {
+        r_full_countdown = R_FULL_EVERY;
+        r_shadow_rgb = rgb;
+    }
+
+    const uint32_t *b4 = (const uint32_t *)b;
+    uint32_t *s4 = r_shadow;
+    uint32_t changed = 0;
+    for (size_t w = 0; w < BMP_VRAM_SIZE / 4; w++)
+    {
+        uint32_t v = b4[w];
+        if (!full && v == s4[w]) continue;
+        s4[w] = v;
+        changed++;
+        uint32_t *d = rgb + w * 4;
+        d[0] = indexed2rgb(v & 0xFF);
+        d[1] = indexed2rgb((v >> 8) & 0xFF);
+        d[2] = indexed2rgb((v >> 16) & 0xFF);
+        d[3] = indexed2rgb(v >> 24);
+    }
+    r_refresh_words_last = changed;
+    return 1;
+}
+#endif
+
 void refresh_yuv_from_rgb(void)
 {
     // get our indexed buffer, convert into our real rgb buffer
@@ -209,13 +259,23 @@ void refresh_yuv_from_rgb(void)
 
 #if !defined(CONFIG_INSTALLER)
     if(zebra_should_run()){
+#ifdef CONFIG_R
+        // riz/eosr-experimental: only convert pixels whose index changed
+        // (full redraw every ~20 refreshes as a safety net).
+        if (!r_refresh_diff(b, rgb_data))
+#endif
+        {
         // always draw our stuff, including full alpha
         for (size_t n = 0; n < BMP_VRAM_SIZE; n++){
             *rgb_data++ = indexed2rgb(*b);
             b++;
         }
+        }
     }
     else{
+#ifdef CONFIG_R
+        r_full_countdown = 0; // shadow is stale once the other path has drawn
+#endif
 #endif
 #if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
         // kitor FIXME this is the loop altered to work with 2048x1080 layers.
@@ -293,7 +353,16 @@ void refresh_yuv_from_rgb_task(void *unused)
     {
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
         {
+            #if defined(CONFIG_R)
+            uint64_t t0 = get_us_clock();
             refresh_yuv_from_rgb();
+            uint32_t dt = (uint32_t)(get_us_clock() - t0);
+            r_refresh_us_last = dt;
+            if (dt > r_refresh_us_max) r_refresh_us_max = dt;
+            r_refresh_count++;
+            #else
+            refresh_yuv_from_rgb();
+            #endif
         }
         msleep(50); // max 20 fps refresh
     }

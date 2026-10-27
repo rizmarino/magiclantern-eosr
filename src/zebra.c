@@ -4097,6 +4097,12 @@ static void zdiag_tick(void)
     ZD(" os x0=%d y0=%d xmax=%d ymax=%d xex=%d yex=%d off=%d bm2lv tx=%d ty=%d sx=%d sy=%d\n",
        os.x0, os.y0, os.x_max, os.y_max, os.x_ex, os.y_ex,
        get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy);
+    {
+        extern uint32_t r_refresh_us_last, r_refresh_us_max, r_refresh_count, r_refresh_words_last;
+        ZD(" refresh n=%d last_us=%d max_us=%d words_changed=%d\n",
+           r_refresh_count, r_refresh_us_last, r_refresh_us_max, r_refresh_words_last);
+        r_refresh_us_max = 0;
+    }
 
     /* replicate draw_zebras() skip tests over the overlay area */
     if (bvram && bvram_mirror && lvram)
@@ -4132,12 +4138,16 @@ static void zdiag_tick(void)
 
     if (--zdiag_samples_left == 0)
     {
-        FILE *f = FIO_CreateFile("ML/ZEBDIAG.TXT");
+        static int zdiag_run = 0;
+        char hdr[48];
+        int hl = snprintf(hdr, sizeof(hdr), "=== ZEBDIAG run %d ===\n", ++zdiag_run);
+        FILE *f = FIO_CreateFileOrAppend("ML/ZEBDIAG.TXT");
         if (f)
         {
+            FIO_WriteFile(f, hdr, hl);
             FIO_WriteFile(f, zdiag_buf, zdiag_len);
             FIO_CloseFile(f);
-            NotifyBox(4000, "ZEBDIAG.TXT saved (%d bytes)", zdiag_len);
+            NotifyBox(4000, "ZEBDIAG run %d appended", zdiag_run);
         }
         else
         {
