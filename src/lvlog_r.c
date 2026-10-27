@@ -1,9 +1,15 @@
 /* riz/eosr-dmlog: capture Canon's own debug log for the live-view classes.
  *
- * Debug -> LV log capture. Uses only Canon's DbgMgr (store levels, dmstart,
- * dmstop, dumpf); nothing in ROM is patched. For N seconds, every message from
- * the live-view classes is stored (all other classes muted), then Canon's dumpf
- * writes the log to the card root as LOGnnn.LOG and the camera beeps.
+ * Debug -> LV log capture. Uses only Canon's DbgMgr store levels and dumpf;
+ * nothing in ROM is patched. Mutes all classes except the live-view ones,
+ * waits for a live-view change (LV on/off, photo/movie, recording, panel/EVF,
+ * zoom), keeps logging 1.5 s after it, then freezes Canon's log buffer by
+ * muting everything and saves it with dumpf (LOGnnn.LOG on the card root).
+ *
+ * v1 findings (2026-10-27): Canon's log buffer holds ~350 KB, ~3.7 s of these
+ * classes at 60 fps, so captures must be triggered; dmstop stops storage for
+ * good (dmstart doesn't resume it), and storage is already on at boot, so
+ * neither is used here.
  * Class IDs come from DryosDebugMsg call sites in the 1.8.0 ROM
  * (~/ml/ghidra/notes/lv-survey.md). Personal diagnostic build, not for upstream.
  */
@@ -12,44 +18,75 @@
 #include "beep.h"
 #include "propvalues.h"
 #include "config.h"
+#include "consts.h"
+#include "timer.h"
 
 extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S, 0xE0563720 */
 
 static const uint8_t lv_classes[] = {
-    0xC9,   /* raw2yuv, LvDev*Controller (movie dev paths) */
-    0x9C,   /* LvBufferController, LvComTim, LvMovieLog */
-    0x9D,   /* MvRawProPath, Path.c */
-    0x9E,   /* SensorDrive */
-    0xCA,   /* DevPathExec, DeliverStage */
-    0x93,   /* VramSubStage, CompositeHdrStage */
-    0x8C,   /* ImageSequence / ImageController */
-    0xB7,   /* EvfCommand, Vram */
+    0xC9,   /* EPPVRM: raw2yuv, LvDev*Controller (movie dev paths) */
+    0x9C,   /* LVCOM:  LvBufferController, LvComTim, LvMovieLog */
+    0x9D,   /* LVCPTH: MvRawProPath, Path.c */
+    0x9E,   /* LVSDV:  SensorDrive */
+    0xCA,   /* EPPDEL: DevPathExec, DeliverStage */
+    0x93,   /* LVEPP:  VramSubStage, CompositeHdrStage */
+    0x8C,   /* CAPD:   ImageSequence / ImageController */
+    0xB7,   /* LVEVFD: EvfCommand, Vram */
 };
 
-static CONFIG_INT("r.lvlog.secs", lvlog_secs_idx, 1);
-static const int lvlog_secs[] = { 3, 10, 30 };
+#define LVLOG_AFTER_MS 1500
+
+static CONFIG_INT("r.lvlog.wait", lvlog_wait_idx, 1);
+static const int lvlog_wait_s[] = { 10, 30, 60 };
 static volatile int lvlog_busy = 0;
 static int lvlog_runs = 0;
+static int lvlog_last_trig = 0;
+
+static int lvlog_sig(void)
+{
+    return (lv ? 1 : 0) | (is_movie_mode() ? 2 : 0) | (RECORDING ? 4 : 0)
+         | (R_LV_ON_EVF() ? 8 : 0) | (lv_dispsize << 8);
+}
 
 static void lvlog_task(void *unused)
 {
-    int secs = lvlog_secs[lvlog_secs_idx];
+    int wait_ms = lvlog_wait_s[lvlog_wait_idx] * 1000;
 
     dm_set_store_level(0xFF, 15);               /* mute everything (level 15 only) */
     for (int i = 0; i < COUNT(lv_classes); i++)
         dm_set_store_level(lv_classes[i], 0);   /* keep every level of the LV classes */
 
-    call("dmstart");
-    DryosDebugMsg(0, 15, "=== riz lvlog start run %d: %ds lv=%d movie=%d dispsize=%d",
-                  lvlog_runs, secs, lv, is_movie_mode(), lv_dispsize);
-    msleep(secs * 1000);
-    DryosDebugMsg(0, 15, "=== riz lvlog stop run %d: lv=%d movie=%d dispsize=%d",
-                  lvlog_runs, lv, is_movie_mode(), lv_dispsize);
-    call("dmstop");
+    int sig0 = lvlog_sig();
+    DryosDebugMsg(0, 15, "=== riz lvlog v2 run %d armed: sig=%x lv=%d movie=%d rec=%d evf=%d dispsize=%d",
+                  lvlog_runs, sig0, lv, is_movie_mode(), RECORDING, R_LV_ON_EVF(), lv_dispsize);
+
+    int t0 = get_ms_clock(), trig = 0, sig1 = sig0;
+    while (1)
+    {
+        msleep(20);
+        int now = get_ms_clock();
+        if (!trig && (sig1 = lvlog_sig()) != sig0)
+        {
+            trig = now;
+            DryosDebugMsg(0, 15, "=== riz lvlog v2 run %d TRIGGER: sig %x -> %x after %d ms",
+                          lvlog_runs, sig0, sig1, now - t0);
+        }
+        if (trig && now - trig >= LVLOG_AFTER_MS)
+            break;
+        if (!trig && now - t0 >= wait_ms)
+            break;
+    }
+
+    DryosDebugMsg(0, 15, "=== riz lvlog v2 run %d freeze: %s sig=%x",
+                  lvlog_runs, trig ? "triggered" : "timeout", lvlog_sig());
+    dm_set_store_level(0xFF, 15);               /* freeze Canon's log buffer */
+    msleep(200);
     call("dumpf");
 
+    lvlog_last_trig = trig ? 1 : 0;
     lvlog_runs++;
     beep();
+    if (!trig) { msleep(300); beep(); }         /* double beep = timed out, no change seen */
     lvlog_busy = 0;
 }
 
@@ -64,9 +101,11 @@ static MENU_SELECT_FUNC(lvlog_select)
 static MENU_UPDATE_FUNC(lvlog_update)
 {
     if (lvlog_busy)
-        MENU_SET_VALUE("recording...");
+        MENU_SET_VALUE("waiting for change...");
+    else if (lvlog_runs)
+        MENU_SET_VALUE("%d saved, last %s", lvlog_runs, lvlog_last_trig ? "triggered" : "timed out");
     else
-        MENU_SET_VALUE("%ds, %d saved", lvlog_secs[lvlog_secs_idx], lvlog_runs);
+        MENU_SET_VALUE("wait %ds", lvlog_wait_s[lvlog_wait_idx]);
 }
 
 static struct menu_entry lvlog_menu[] = {
@@ -74,15 +113,15 @@ static struct menu_entry lvlog_menu[] = {
         .name   = "LV log capture",
         .select = lvlog_select,
         .update = lvlog_update,
-        .help   = "Stores Canon's live-view log for N s, then saves LOGnnn.LOG.",
-        .help2  = "Press SET, close the menu, do ONE live-view action, wait for beep.",
+        .help   = "Saves Canon's LV log around the next LV change (mode, rec, EVF).",
+        .help2  = "SET, close menu, make ONE change, wait for beep (2 beeps = no change).",
         .children = (struct menu_entry[]) {
             {
-                .name    = "Duration",
-                .priv    = &lvlog_secs_idx,
+                .name    = "Max wait",
+                .priv    = &lvlog_wait_idx,
                 .max     = 2,
-                .choices = CHOICES("3 s", "10 s", "30 s"),
-                .help    = "Short captures avoid wrapping Canon's log buffer.",
+                .choices = CHOICES("10 s", "30 s", "60 s"),
+                .help    = "How long to wait for a change before saving anyway.",
             },
             MENU_EOL
         },
