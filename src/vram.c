@@ -11,6 +11,7 @@
 #include "shoot.h"
 #include "zebra.h"
 #include "raw.h"
+#include "config.h"
 
 //~ #define CONFIG_DEBUGMSG 1
 
@@ -149,6 +150,18 @@ void vram_params_set_dirty()
 
 static uint32_t hd_size = 0;
 
+#ifdef CONFIG_R
+/* riz/eosr-experimental: where the LV image sits inside ML's 720x480 overlay
+ * area when the EVF is active. The R EVF is 4:3 (1280x960); Canon shows the
+ * 3:2 image full-width at the top with its info strip below, so by default the
+ * image spans overlay rows 0..426 (853/960*480). User-tunable from
+ * Overlay -> EVF overlay align; values persist in ML settings. */
+static CONFIG_INT("r.evf.ovl.x0", r_evf_x0, 0);
+static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, 0);
+static CONFIG_INT("r.evf.ovl.w",  r_evf_w,  720);
+static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  426);
+#endif
+
 static void vram_params_update_if_dirty()
 {
     #ifdef REG_EDMAC_WRITE_LV_ADDR
@@ -162,11 +175,14 @@ static void vram_params_update_if_dirty()
 
     #ifdef R_LV_ON_EVF
     // EOS R: Panel (1024x682) and EVF (1280x720) use different LV buffer sizes;
-    // recompute geometry when the active output changes.
+    // recompute geometry when the active output or the EVF alignment changes.
     static int prev_on_evf = -1;
+    static int prev_cal[4] = { -1, -1, -1, -1 };
     int on_evf = R_LV_ON_EVF();
-    if (on_evf != prev_on_evf) vram_params_dirty = 1;
+    int cal[4] = { r_evf_x0, r_evf_y0, r_evf_w, r_evf_h };
+    if (on_evf != prev_on_evf || memcmp(cal, prev_cal, sizeof(cal)) != 0) vram_params_dirty = 1;
     prev_on_evf = on_evf;
+    memcpy(prev_cal, cal, sizeof(cal));
     #endif
     
     if (vram_params_dirty)
@@ -334,17 +350,23 @@ void _update_vram_params()
     {
         vram_lv.width = 1280;
         vram_lv.height = 720;
+        // clamp the user alignment to the visible 720x480 overlay area
+        int x0 = COERCE(r_evf_x0, 0, 200), y0 = COERCE(r_evf_y0, 0, 200);
+        os.x0 = x0;
+        os.y0 = y0;
+        os.x_ex = COERCE(r_evf_w, 400, 720 - x0);
+        os.y_ex = COERCE(r_evf_h, 300, 480 - y0);
     }
     else
     {
         vram_lv.width = 1024;
         vram_lv.height = 682;
+        os.x0 = 0;
+        os.y0 = 0;
+        os.x_ex = 720;
+        os.y_ex = 480;
     }
     vram_lv.pitch = vram_lv.width * 2;
-    os.x0 = 0;
-    os.y0 = 0;
-    os.x_ex = 720;
-    os.y_ex = 480;
     os.x_max = os.x0 + os.x_ex;
     os.y_max = os.y0 + os.y_ex;
     os.off_43 = 0;
@@ -470,7 +492,13 @@ void _update_vram_params()
     // EOS R LV buffer is 1024 (panel) or 1280 (EVF) wide, not 720: scale X like Y.
     // On-camera ZEBDIAG showed sx=1024 / sy=1454, i.e. overlays only covered the left 70%.
     if (hdmi_code < 5 && !EXT_MONITOR_RCA)
-        bm2lv.sx = 1024 * vram_lv.width / 720;
+    {
+        // map overlay rect os.(x0,y0)-(x_max,y_max) onto the whole LV buffer
+        bm2lv.sx = 1024 * vram_lv.width / os.x_ex;
+        bm2lv.sy = 1024 * vram_lv.height / os.y_ex;
+        bm2lv.tx = -((os.x0 * bm2lv.sx) >> 10);
+        bm2lv.ty = -((os.y0 * bm2lv.sy) >> 10);
+    }
     #endif
 #endif
     
@@ -863,4 +891,40 @@ void vram_init()
 }
 
 INIT_FUNC(__FILE__, vram_init);
+#endif
+
+#ifdef CONFIG_R
+static MENU_UPDATE_FUNC(r_evf_align_update)
+{
+    MENU_SET_VALUE("%d,%d %dx%d", r_evf_x0, r_evf_y0, r_evf_w, r_evf_h);
+    if (!R_LV_ON_EVF())
+        MENU_SET_WARNING(MENU_WARN_INFO, "Applies only with the viewfinder (EVF) active.");
+}
+
+static struct menu_entry r_evf_menus[] = {
+    {
+        .name   = "EVF overlay align",
+        .update = r_evf_align_update,
+        .select = menu_open_submenu,
+        .help   = "Align ML overlays with the image in the viewfinder.",
+        .help2  = "Use focus peaking on a sharp edge; adjust until it lines up.",
+        .children = (struct menu_entry[]) {
+            { .name = "X offset", .priv = &r_evf_x0, .min = 0,   .max = 200, .unit = UNIT_DEC,
+              .help = "Left edge of the image in overlay pixels." },
+            { .name = "Y offset", .priv = &r_evf_y0, .min = 0,   .max = 200, .unit = UNIT_DEC,
+              .help = "Top edge of the image in overlay pixels." },
+            { .name = "Width",    .priv = &r_evf_w,  .min = 400, .max = 720, .unit = UNIT_DEC,
+              .help = "Image width in overlay pixels (720 = full)." },
+            { .name = "Height",   .priv = &r_evf_h,  .min = 300, .max = 480, .unit = UNIT_DEC,
+              .help = "Image height in overlay pixels (480 = full, 426 = 3:2 on 4:3 EVF)." },
+            MENU_EOL,
+        },
+    },
+};
+
+static void r_evf_menu_init()
+{
+    menu_add("Overlay", r_evf_menus, COUNT(r_evf_menus));
+}
+INIT_FUNC("r_evf_align", r_evf_menu_init);
 #endif
