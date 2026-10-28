@@ -990,8 +990,11 @@ static struct menu_entry rt_menu[] = {
 
 /* ---- export for USB: over PTP the R shows only files in DCIM/100EOS_R with
  * image-like names (v13.2 probe: RTPB0002.JPG visible; .TXT files, MISC and the
- * DCIM root hidden). So copy the small result files there as RTxx00nn.JPG
- * (nn = run). Canon playback shows them as unreadable images; harmless. ---- */
+ * DCIM root hidden). v13.3 test: a file is listed only if its 4-digit number
+ * is 0001-9999 AND unique in the folder (two names sharing a number: both
+ * hidden). So each run's exports get their own numbers: run r -> RTLG(3r+1),
+ * RTIX(3r+2), RTSY(3r+3) .JPG (runs 0..99 -> 0001..0300); status RTST0999.JPG.
+ * Canon playback shows them as unreadable images; harmless. ---- */
 #define RT_EXPORT_DIR "DCIM/100EOS_R/"
 
 static void rt_copy_file(const char *src, const char *dst)
@@ -1007,9 +1010,10 @@ static void rt_copy_file(const char *src, const char *dst)
 static void rt_export(int run)
 {
     char s[32], d[48];
-    snprintf(d, sizeof(d), RT_EXPORT_DIR "RTLG%04d.JPG", run); rt_copy_file("ML/RECTEST.TXT", d);
-    snprintf(s, sizeof(s), "ML/RT%02d.IDX", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTIX%04d.JPG", run); rt_copy_file(s, d);
-    snprintf(s, sizeof(s), "ML/RT%02d.SYN", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTSY%04d.JPG", run); rt_copy_file(s, d);
+    int n = 3 * run + 1;
+    snprintf(d, sizeof(d), RT_EXPORT_DIR "RTLG%04d.JPG", n); rt_copy_file("ML/RECTEST.TXT", d);
+    snprintf(s, sizeof(s), "ML/RT%02d.IDX", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTIX%04d.JPG", n + 1); rt_copy_file(s, d);
+    snprintf(s, sizeof(s), "ML/RT%02d.SYN", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTSY%04d.JPG", n + 2); rt_copy_file(s, d);
 }
 
 /* status for USB: which plan ran, and what's left */
@@ -1023,7 +1027,7 @@ static void rt_status(const char *fmt, ...)
     if (n < 0) return;
     n = MIN(n, (int)sizeof(t) - 2);
     t[n++] = '\n';
-    FILE *f = FIO_CreateFile(RT_EXPORT_DIR "RTST0000.JPG");
+    FILE *f = FIO_CreateFile(RT_EXPORT_DIR "RTST0999.JPG");
     if (f) { FIO_WriteFile(f, t, n); FIO_CloseFile(f); }
 }
 
