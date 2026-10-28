@@ -632,6 +632,130 @@ static MENU_SELECT_FUNC(lvd_select)
     task_create("lvd_task", 0x1e, 0x1000, lvd_task, 0);
 }
 
+/* v9 LV MEM1 raw test. Uses Canon's own debug eventprocs (static analysis,
+ * notes/lv-survey.md "stage 2"): lv_save_raw(1) makes evfdevUpdateParam pass
+ * the MEMNAVI 0x10007 buffer to Mem1Path, which programs EDMAC logical ch 3
+ * (regs 0xD0420200) to write a 14-bit packed LV raw frame there each frame.
+ * Logs every step to ML/LVMEM1.TXT (append + close per line, so a freeze
+ * leaves a trail), copies the frame to ML/LVMEM1.BIN, asks Canon to write its
+ * own dump (lv_raw_dump -> %08lx.mmr), then lv_save_raw(0). No ROM writes;
+ * the only state change is Canon's own debug switch, which is reset at the end. */
+#define M1_FLAGS   0x1311C
+#define M1_PATH    0x133CC
+#define M1_BUF     0x28EEA940
+#define M1_BUFLEN  0xFB9D90
+#define M1_EDMAC   0xD0420200
+
+static void m1_log(const char *s)
+{
+    FILE *f = FIO_CreateFileOrAppend("ML/LVMEM1.TXT");
+    if (!f) return;
+    FIO_WriteFile(f, s, strlen(s));
+    FIO_CloseFile(f);
+}
+
+static void m1_words(const char *tag, uint32_t addr, int n)
+{
+    char line[160];
+    for (int i = 0; i < n; i += 8)
+    {
+        int len = snprintf(line, sizeof(line), "%s %08x:", tag, addr + i * 4);
+        for (int k = i; k < n && k < i + 8; k++)
+            len += snprintf(line + len, sizeof(line) - len, " %08x", MEM(addr + k * 4));
+        snprintf(line + len, sizeof(line) - len, "\n");
+        m1_log(line);
+    }
+}
+
+static uint32_t m1_hash(uint32_t addr, uint32_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for (uint32_t o = 0; o < len; o += 4) h = (h ^ MEM(addr + o)) * 0x01000193;
+    return h;
+}
+
+static void m1_snap(const char *when)
+{
+    char line[160];
+    snprintf(line, sizeof(line), "== %s t=%d\n", when, get_ms_clock());
+    m1_log(line);
+    m1_words("FLAGS", M1_FLAGS, 12);
+    m1_words("M1P", M1_PATH, 28);
+    m1_words("EDMAC3", M1_EDMAC + 0x40, 24);       /* +0x40..+0x9C incl. size regs */
+    m1_words("EDMAC3", M1_EDMAC + 0xA0, 8);        /* +0xA0 address .. +0xBC */
+    uint32_t ub = M1_BUF | 0x40000000;
+    snprintf(line, sizeof(line), "BUFHASH %08x %08x %08x %08x\n",
+             m1_hash(ub, 0x1000), m1_hash(ub + 0x400000, 0x1000),
+             m1_hash(ub + 0x800000, 0x1000), m1_hash(ub + 0xF00000, 0x1000));
+    m1_log(line);
+    m1_words("BUF", ub, 8);
+}
+
+static void m1_task(void *unused)
+{
+    char line[160];
+    snprintf(line, sizeof(line), "start v9 run %d\n", lvj_runs);
+    m1_log(line);
+    m1_snap("before");
+
+    m1_log("call lv_save_raw 1\n");
+    call("lv_save_raw", 1);
+    m1_log("returned\n");
+    msleep(500);
+    m1_snap("on+500ms");
+    msleep(200);
+    m1_snap("on+700ms");
+
+    uint32_t w = MEM(M1_PATH + 0x10), h = MEM(M1_PATH + 0x14);
+    uint32_t a = MEM(M1_PATH + 0x58);
+    uint32_t len = (w * h * 14) >> 3;
+    snprintf(line, sizeof(line), "M1 w=%d h=%d addr=%08x len=%08x\n", w, h, a, len);
+    m1_log(line);
+    if (len && len <= M1_BUFLEN && (a & ~0x40000000) == M1_BUF)
+    {
+        uint32_t chunk = LVB_CHUNK;
+        uint8_t *buf = malloc(chunk);
+        if (!buf) { chunk = 0x10000; buf = malloc(chunk); }
+        FILE *f = buf ? FIO_CreateFile("ML/LVMEM1.BIN") : 0;
+        if (f)
+        {
+            uint32_t hdr[8] = { 0x314D564C /* "LVM1" */, get_ms_clock(), M1_BUF, len, w, h, MEM(M1_PATH + 0x0C), MEM(M1_PATH) };
+            FIO_WriteFile(f, hdr, sizeof(hdr));
+            FIO_WriteFile(f, (void *)M1_PATH, 0x80);
+            for (uint32_t o = 0; o < len; o += chunk)
+            {
+                uint32_t n = len - o < chunk ? len - o : chunk;
+                memcpy(buf, (void *)((M1_BUF | 0x40000000) + o), n);
+                FIO_WriteFile(f, buf, n);
+            }
+            FIO_CloseFile(f);
+            m1_log("own dump written ML/LVMEM1.BIN\n");
+        }
+        if (buf) free(buf);
+        m1_log("call lv_raw_dump\n");
+        call("lv_raw_dump");
+        m1_log("returned\n");
+    }
+    else m1_log("skip dumps (MEM1 not active or size unexpected)\n");
+
+    m1_log("call lv_save_raw 0\n");
+    call("lv_save_raw", 0);
+    m1_log("returned\n");
+    msleep(300);
+    m1_snap("off+300ms");
+    m1_log("done\n");
+    lvj_runs++;
+    beep();
+    lvj_busy = 0;
+}
+
+static MENU_SELECT_FUNC(m1_select)
+{
+    if (lvj_busy) return;
+    lvj_busy = 1;
+    task_create("m1_task", 0x1e, 0x2000, m1_task, 0);
+}
+
 static MENU_UPDATE_FUNC(lvj_update)
 {
     MENU_SET_VALUE(lvj_busy ? "sampling..." : "%d runs saved", lvj_runs);
@@ -680,6 +804,13 @@ static struct menu_entry lvj_menu[] = {
         .update = lvj_update,
         .help   = "Read-only: copies 12 MB at 0x25880000 (2-copy mono image) -> ML/LVDAFnn.BIN",
         .help2  = "Movie mode, NOT recording. Run once in focus, once with focus way off.",
+    },
+    {
+        .name   = "LV MEM1 raw test",
+        .select = m1_select,
+        .update = lvj_update,
+        .help   = "Canon lv_save_raw 1 -> log + dump LV raw (ML/LVMEM1.*, *.MMR) -> lv_save_raw 0",
+        .help2  = "NOT recording. Small freeze risk (enables Canon debug DMA): pull battery.",
     },
 };
 
