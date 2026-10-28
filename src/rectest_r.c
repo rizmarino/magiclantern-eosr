@@ -513,6 +513,8 @@ static void rt_survey(void)
 #define RT_VIDF_PRE  256
 #define RT_BLACK14   2043               /* left OB of the movie-LV dump */
 #define RT_WHITE14   16300              /* clip pile-up at 16382 */
+#define RT_OB_LEFT   48                 /* FHD movie MEM1 2304x1290: optical-black columns (left) */
+#define RT_OB_TOP    22                 /* ... and rows (top) */
 #define RT_HDR_INFO  (52 + 180 + 84 + 44)
 #define RT_HDR_BYTES 4096               /* header + NULL padding: keeps every chunk write 4 KiB-aligned in the file.
                                          * v15/v16 wrote 360-byte headers and the card ran at 98-99 MiB/s instead of
@@ -604,8 +606,17 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     ri[0] = 1; ri[2] = c_ch; ri[3] = c_cw; ri[4] = c_rb; ri[5] = frame_bytes; ri[6] = c_bpp;
     int lsh = 14 - c_bpp;                                        /* hardware drops low bits: 12-bit ~ /4, 10-bit ~ /16 */
     ri[7] = (RT_BLACK14 + (lsh ? 1 << (lsh - 1) : 0)) >> lsh; ri[8] = RT_WHITE14 >> lsh;
-    ri[11] = c_cw; ri[12] = c_ch;                                /* jpeg crop: 0, 0, w, h */
-    ri[15] = c_ch; ri[16] = c_cw;                                /* active area: 0, 0, h, w */
+    /* v16.7: optical-black borders of the FHD movie MEM1 frame (2304x1290, measured on v16.6 full-frame runs:
+     * 48 columns left, 22 rows top, black 127.5 at 10-bit). Mark them outside the active area so raw
+     * converters crop them (DNG ActiveArea); the data stays in the file for black-level checks. */
+    uint32_t ax = 0, ay = 0;
+    if (m1_w == 2304 && m1_h == 1290)
+    {
+        if (c_x0 < RT_OB_LEFT) ax = RT_OB_LEFT - c_x0;
+        if (c_y0 < RT_OB_TOP) ay = RT_OB_TOP - c_y0;
+    }
+    ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = c_ch - ay; /* jpeg crop, relative to the active area */
+    ri[13] = ay; ri[14] = ax; ri[15] = c_ch; ri[16] = c_cw;       /* active area: y1, x1, y2, x2 */
     ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
     for (int i = 0; i < 9; i++) { ri[21 + 2 * i] = cm[i]; ri[22 + 2 * i] = 10000; }
     ri[39] = 1100;
