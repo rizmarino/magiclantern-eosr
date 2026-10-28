@@ -98,13 +98,16 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define F_DUP    32                     /* same bottom row as the last saved frame: skipped */
 
 enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
-static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* 1920x1080, 1920x960, 1920x800, v16.6: 3 = full MEM1 frame */
+static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* index into rt_crop_wh; v16.6: 3 = full MEM1 frame */
 static int rt_dur_sel = 1;              /* 10, 20, 40 s */
 static int rt_sync_sel = SYNC_AUTO;
 static CONFIG_INT("r.rawrec.fmt", rt_fmt_sel, 0);              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit, v16.6: 3 = MLV 10-bit */
 static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit", "MLV 10-bit" };
 static const int rt_fmt_bpp[] = { 14, 14, 12, 10 };
-static const int rt_crop_h[] = { 1080, 960, 800, 4094 };         /* 4094/4096 = clamp to the MEM1 frame (full) */
+/* v17: crops as width x height; 0 x 0 = the whole MEM1 frame (FHD movie 2304x1290, 4K movie 4256x2214).
+ * The 2560 crops need Canon's 4K movie size (MEM1 4256 px wide, 1:1); in FHD they clamp to 2304. */
+static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920, 800 }, { 0, 0 }, { 2560, 1080 }, { 2560, 1440 } };
+#define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
 
@@ -536,6 +539,36 @@ static uint64_t mlv_guid;
 static uint32_t pk_orig[5], pk_w0;
 static uint8_t *mlv_hdr;                /* RT_HDR_BYTES, malloc'd per MLV run */
 
+/* v17: EDMAC copy self-test with the run's exact geometry: source pitch, crop byte offset, bytes per row and
+ * address alignment (chunk bases are 4 KiB-aligned like MEM1 at 0x...A940 mod 64 = 0). In 4K movie mode the
+ * 4256-px rows are only 8-byte aligned at 10/14-bit; every camera-verified copy before had 16-byte aligned rows.
+ * Copies a 64-row pattern from chunk 0 to chunk 1 and compares every word. 0 = exact, -1 = mismatch, -2 = DMA timeout. */
+static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes)
+{
+    uint32_t rows = 64, sb = ch[0].base, db = ch[1].base;
+    rows = MIN(rows, MIN(chunk_bytes / pitch, chunk_bytes / c_rb));
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t i = 0; i < pitch / 4; i++) MEM(sb + r * pitch + 4 * i) = 0xA5000000u ^ (r << 16) ^ i;
+    for (uint32_t i = 0; i < rows * c_rb / 4; i++) MEM(db + 4 * i) = 0xEEEEEEEEu;
+    uint32_t us = 0;
+    if (rt_copy(sb + xoff, pitch, db, c_rb, rows, &us)) { rt_printf("!! copy self-test: DMA timed out\n"); return -2; }
+    int bad = 0;
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t j = 0; j < c_rb / 4; j++)
+        {
+            uint32_t got = MEM(db + r * c_rb + 4 * j), want = MEM(sb + r * pitch + xoff + 4 * j);
+            if (got != want)
+            {
+                if (!bad) rt_printf("!! copy self-test: row %d byte %d: got %08x, want %08x\n", r, 4 * j, got, want);
+                bad++;
+                break;                      /* count rows */
+            }
+        }
+    rt_printf("copy self-test: %d rows, pitch %d, offset %d, %d bytes/row, row starts mod 16 = %d/%d: %s (%d bad rows), dma %d us\n",
+              rows, pitch, xoff, c_rb, xoff % 16, (xoff + pitch) % 16, bad ? "MISMATCH" : "exact", bad, us);
+    return bad ? -1 : 0;
+}
+
 static int rt_pack_apply(int bpp, int ml_order)
 {
     for (int i = 0; i < 5; i++) pk_orig[i] = MEM(RT_PATH + 0x64 + 4 * i);
@@ -938,7 +971,9 @@ static void rt_task(void *unused)
     if (!rt_fsem) rt_fsem = create_named_semaphore("rt_frm", SEM_CREATE_LOCKED);
     if (!rt_csem) rt_csem = create_named_semaphore("rt_cap", SEM_CREATE_LOCKED);
 
-    uint32_t crop_w = rt_crop_sel == 3 ? 4096 : 1920, crop_h = rt_crop_h[rt_crop_sel];
+    if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
+    int full = rt_crop_sel == RT_CROP_FULL;
+    uint32_t crop_w = rt_crop_wh[rt_crop_sel][0], crop_h = rt_crop_wh[rt_crop_sel][1];   /* full: set from MEM1 below */
     int dur_s = rr_active ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
@@ -951,8 +986,8 @@ static void rt_task(void *unused)
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
     if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
-    rt_printf("start v16 record test run %d: crop %dx%d%s, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
-              crop_w, crop_h, rt_crop_sel == 3 ? " (full frame)" : "", dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
+    rt_printf("start v17 record test run %d: crop %dx%d%s, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, full ? " (full frame)" : "", dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
               rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
 
@@ -977,6 +1012,11 @@ static void rt_task(void *unused)
     lv_raw = 1;
     msleep(500);
     m1_w = MEM(RT_PATH + 0x10); m1_h = MEM(RT_PATH + 0x14);
+    /* v17: Mem1Path layout fields, logged before any pack change (4K-mode survey: rt_pack_apply only runs
+     * with mode < 0x14 and width source == width, as tested in FHD) */
+    rt_printf("M1 path: mode %d, alt %d, width src %dx%d, w/h %dx%d, pack cfg {%d,%d,%d,%d,%d}\n", MEM(RT_PATH),
+              MEM(RT_PATH + 0x28), MEM(RT_PATH + 0x18), MEM(RT_PATH + 0x1c), m1_w, m1_h, MEM(RT_PATH + 0x64),
+              MEM(RT_PATH + 0x68), MEM(RT_PATH + 0x6C), MEM(RT_PATH + 0x70), MEM(RT_PATH + 0x74));
     if (c_mlv && m1_w && m1_h)
     {
         if (rt_pack_apply(c_bpp, 1))
@@ -989,8 +1029,8 @@ static void rt_task(void *unused)
     if (!m1_w || !m1_h || pitch * m1_h > RT_BUFLEN || (a & ~RT_UNC) != RT_BUF || m1_h < 64)
     { rt_printf("MEM1 not active or size unexpected, abort\n"); NotifyBox(6000, "Record test: no LV raw"); goto done; }
 
-    crop_w = MIN(crop_w, m1_w) & ~63;
-    crop_h = MIN(crop_h, m1_h) & ~1;
+    if (full) { crop_w = m1_w; crop_h = m1_h & ~1; }   /* v17: the whole width (v16.6 capped it at 4096: 4K mode is 4256) */
+    else { crop_w = MIN(crop_w, m1_w) & ~63; crop_h = MIN(crop_h, m1_h) & ~1; }
     uint32_t x0 = ((m1_w - crop_w) / 2) & ~63, y0 = ((m1_h - crop_h) / 2) & ~1;
     c_rb = crop_w * c_bpp / 8;
     c_ch = crop_h; c_cw = crop_w; c_x0 = x0; c_y0 = y0;
@@ -999,8 +1039,10 @@ static void rt_task(void *unused)
     /* v16.6: the frame-end IRQ comes ~1 ms after the 1080 crop's bottom row (1183 of 1290); a probe on the
      * frame's last rows changes too close to (or after) the IRQ for the 1 ms survey and the per-frame checks.
      * Keep the bottom probe >= 106 rows above the frame end (= the proven 1080 crop row); the offline tear
-     * check (mlv_check) still covers every row. */
-    if (m1_h > 107 && r_bot > m1_h - 107) r_bot = MAX(r_top, m1_h - 107);
+     * check (mlv_check) still covers every row. v17: margin scaled with the frame height (4K mode: 183 rows),
+     * since the row time there is unmeasured. */
+    uint32_t pm = MAX(107, m1_h * 107 / 1290);
+    if (m1_h > pm && r_bot > m1_h - pm) r_bot = MAX(r_top, m1_h - pm);
     if (r_bot != y0 + crop_h - 1) rt_printf("probe rows: top %d, bottom %d (crop bottom %d too close to the frame end)\n",
                                             r_top, r_bot, y0 + crop_h - 1);
     frame_bytes = c_rb * crop_h;
@@ -1038,6 +1080,11 @@ static void rt_task(void *unused)
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
 
     rt_begin();
+    {
+        int s = rt_copy_selftest(c_x0 * c_bpp / 8, kslots * slot_bytes);
+        if (s == -2) { rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout (self-test)"); goto done; }
+        if (s) { snprintf(rt_last, sizeof(rt_last), "RT%02d: copy self-test failed", rt_run_id); NotifyBox(6000, "Record test: %s", rt_last); goto done; }
+    }
     {
         uint32_t us;
         if (rt_copy(c_src, pitch, ch[0].base + slot_pre, c_rb, c_ch, &us))
@@ -1467,9 +1514,10 @@ static struct menu_entry rt_menu[] = {
             {
                 .name    = "Crop",
                 .priv    = &rt_crop_sel,
-                .max     = 3,
-                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame"),
-                .help    = "Full frame: the whole LV raw frame (2304x1290 in FHD movie mode, incl. black borders)",
+                .max     = 5,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440"),
+                .help    = "Full frame: whole LV raw frame (FHD movie 2304x1290, 4K movie 4256x2214, incl. black borders)",
+                .help2   = "2560 crops need Canon movie size 4K (1:1 pixels); in FHD they clamp to 2304 wide",
             },
             {
                 .name    = "Duration",
@@ -1579,7 +1627,7 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
     int n = 0, i = 0;
     while (i < len && n < max)
     {
-        int v[5] = { -1, -1, -1, 0, 0 }, k = 0;
+        int v[5] = { -1, -1, -1, 0, 0 }, k = 0, vw = 0;
         while (i < len && t[i] != '\n')
         {
             char c = t[i];
@@ -1588,6 +1636,11 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
             {
                 int x = 0;
                 while (i < len && t[i] >= '0' && t[i] <= '9') x = x * 10 + (t[i++] - '0');
+                if (k == 0 && i + 1 < len && (t[i] == 'x' || t[i] == 'X') && t[i + 1] >= '0' && t[i + 1] <= '9')
+                {                       /* v17: "WxH" crop, e.g. 2560x1440 */
+                    vw = x; x = 0; i++;
+                    while (i < len && t[i] >= '0' && t[i] <= '9') x = x * 10 + (t[i++] - '0');
+                }
                 v[k++] = x;
                 continue;
             }
@@ -1635,7 +1688,9 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
         i++;
         if (k == 0) continue;           /* blank or comment line */
         if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = runs[n][3] = runs[n][4] = 0; n++; continue; }
-        int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : v[0] == 9999 ? 3 : -1;
+        int cs = v[0] == 9999 && !vw ? RT_CROP_FULL : -1;
+        for (int q = 0; q < COUNT(rt_crop_wh) && cs < 0 && v[0] > 0; q++)   /* "1080" = 1920x1080; v17: "WxH" */
+            if (q != RT_CROP_FULL && rt_crop_wh[q][0] == (vw ? vw : 1920) && rt_crop_wh[q][1] == v[0]) cs = q;
         int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
         if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
         runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2]; runs[n][3] = v[3]; runs[n][4] = v[4];
