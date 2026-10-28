@@ -112,6 +112,7 @@ static volatile int rt_busy = 0;
  * (no fixed duration; stops on the next REC press, rr_stop); rr_t0/rr_frames feed the on-screen status. */
 static CONFIG_INT("r.rawrec.rec", rr_on, 0);
 static volatile int rr_active, rr_stop;
+static volatile int rt_osd_run;         /* auto-run "osd": show the REC status during a timed run (A/B cost test) */
 static volatile uint32_t rr_t0_ms;
 static int rt_runs = 0;
 static int rt_run_id;
@@ -932,8 +933,9 @@ static void rt_task(void *unused)
     c_mlv = rt_fmt_sel != 0;
     c_bpp = rt_fmt_sel == 2 ? 12 : 14;
     pk_applied = 0;
-    rt_printf("start v16 record test run %d: crop %dx%d, %d s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
-              crop_w, crop_h, dur_s, rr_active ? " (REC button, until stopped)" : "", rt_sync_name[rt_sync_sel],
+    if (!rr_active) rr_t0_ms = 0;
+    rt_printf("start v16 record test run %d: crop %dx%d, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
               rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
 
@@ -1047,7 +1049,7 @@ static void rt_task(void *unused)
     uint32_t irq0 = irq_n;
     rt_drain(rt_csem);
     rr_t0_ms = get_ms_clock();
-    task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);
+    task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);   /* (rr_t0_ms: on-screen timer) */
     if (dur_s > 0)
     {
         take_semaphore(rt_csem, (dur_s + 10) * 1000);
@@ -1168,21 +1170,27 @@ static void rr_key_flush(void);
 
 static void rr_status_task(void *unused)
 {
-    /* on-screen status while a REC-button run is active */
+    /* on-screen status while a REC-button run is active. v16 redrew every 250 ms and that run wrote
+     * 93 MiB/s against 110 for a run without it (DMA copies slower too): redraw only when the text
+     * changes, at most once a second. */
     int shown = 0, tick = 0;
+    char last[40] = "";
     for (;;)
     {
         msleep(250);
-        if (++tick % 4 == 0 && !rr_active) rr_key_flush();   /* no card writes of ours during a recording */
-        if (!rr_active) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 420, 30); shown = 0; } continue; }
-        if (gui_menu_shown()) continue;
-        uint32_t s_rec = c_done || !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
-        int used = 0;
-        for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
-        if (rr_stop) bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_RED), 8, 8, " stopping...                  ");
-        else if (!rr_t0_ms) bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK), 8, 8, " raw: starting...             ");
-        else bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_RED), 8, 8, " REC %02d:%02d %s  buf %d/%d   ",
-                        s_rec / 60, s_rec % 60, c_bpp == 12 ? "12b" : "14b", used, nch * kslots);
+        if (++tick % 4 == 0 && !rr_active && !rt_osd_run) rr_key_flush();   /* no card writes of ours during a recording */
+        int on = rr_active || rt_osd_run;
+        if (!on) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 300, 30); shown = 0; last[0] = 0; } continue; }
+        if (gui_menu_shown() || tick % 4) continue;
+        char t[40];
+        uint32_t s_rec = !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
+        if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
+        else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
+        else snprintf(t, sizeof(t), " REC %02d:%02d ", s_rec / 60, s_rec % 60);
+        if (shown && !strcmp(t, last)) continue;
+        if (shown && strlen(t) != strlen(last)) bmp_fill(COLOR_EMPTY, 8, 8, 300, 30);
+        bmp_printf(FONT(FONT_MED, COLOR_WHITE, rr_t0_ms && !rr_stop ? COLOR_RED : COLOR_BLACK), 8, 8, "%s", t);
+        snprintf(last, sizeof(last), "%s", t);
         shown = 1;
     }
 }
@@ -1536,12 +1544,12 @@ static void rt_status(const char *fmt, ...)
 #define RT_AUTO_DON "ML/RTAUTO.DON"
 
 static int rt_auto_skipped;
-static int rt_auto_parse(const char *t, int len, int (*runs)[4], int max)
+static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
 {
     int n = 0, i = 0;
     while (i < len && n < max)
     {
-        int v[4] = { -1, -1, -1, 0 }, k = 0;
+        int v[5] = { -1, -1, -1, 0, 0 }, k = 0;
         while (i < len && t[i] != '\n')
         {
             char c = t[i];
@@ -1558,6 +1566,13 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[4], int max)
                 k = 9;
                 while (i < len && t[i] != '\n') i++;
                 break;
+            }
+            if (k >= 2 && (c == 'o' || c == 'O'))   /* "osd": REC status on screen during this run */
+            {
+                v[4] = 1;
+                while (i < len && t[i] != '\n' && t[i] != ' ' && t[i] != '\t' && t[i] != '\r') i++;
+                if (k < 4) k = 4;
+                continue;
             }
             if ((k == 2 || k == 3) && (c == 'b' || c == 'B' || c == 'm' || c == 'M'))   /* format: bin, mlv14, mlv12 */
             {
@@ -1582,11 +1597,11 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[4], int max)
         }
         i++;
         if (k == 0) continue;           /* blank or comment line */
-        if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = runs[n][3] = 0; n++; continue; }
+        if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = runs[n][3] = runs[n][4] = 0; n++; continue; }
         int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : -1;
         int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
         if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
-        runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2]; runs[n][3] = v[3];
+        runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2]; runs[n][3] = v[3]; runs[n][4] = v[4];
         n++;
     }
     return n;
@@ -1640,7 +1655,7 @@ static void rt_auto_task(void *unused)
     if (!t) return;
     int pos = rt_read_int(RT_AUTO_POS, 0), ps, pl;
     int np = rt_auto_plan(t, len, pos, &ps, &pl);
-    int runs[6][4];
+    int runs[6][5];
     rt_auto_skipped = 0;
     int n = pos < np ? rt_auto_parse(t + ps, pl, runs, 6) : 0;
     fio_free(t);
@@ -1677,7 +1692,9 @@ static void rt_auto_task(void *unused)
         rt_last[0] = 0;
         if (runs[i][0] < 0) { rt_pack_task(0); continue; }   /* synchronous; clears rt_busy */
         rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2]; rt_fmt_sel = runs[i][3];
+        rt_osd_run = runs[i][4];
         rt_task(0);                     /* synchronous; clears rt_busy */
+        rt_osd_run = 0;
         if (first_run < 0) first_run = rt_run_id;
         msleep(3000);
     }
