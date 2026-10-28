@@ -934,6 +934,7 @@ static void rt_task(void *unused)
     c_bpp = rt_fmt_sel == 2 ? 12 : 14;
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
+    if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
     rt_printf("start v16 record test run %d: crop %dx%d, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
               crop_w, crop_h, dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
               rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
@@ -1110,7 +1111,8 @@ static void rt_task(void *unused)
               "topchg %d, botchg(torn) %d; IRQs during capture %d, IRQ timeouts %d; writer err %d\n",
               frames ? dsum / frames : 0, dmax, l50 / 10, l50 % 10, l90 / 10, l90 % 10, lmax / 10, lmax % 10,
               late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
-    rt_printf("files: %s (last part %d), %d MB total, format %s\n", w_name, w_part, (uint32_t)(wb >> 20), rt_fmt_name[rt_fmt_sel]);
+    rt_printf("files: %s (last part %d), %d MB total, format %s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
+              rt_fmt_name[rt_fmt_sel], RECORDING ? 1 : 0);
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
     rt_flush();
@@ -1155,7 +1157,11 @@ out:
  * Called from handle_common_events_by_feature (gui-common.c) before the module keys.
  * Only when the menu switch is on, in movie-mode live view, with the ML menu closed; the
  * press and release are swallowed so Canon doesn't start H.264 recording. */
-#define RR_KEY_REC_PRESS   0x21
+/* v16.2/v16.3 camera key logs: each REC press gives 0x20 at once (with 0x85), then 0x21 ~1-1.3 s later.
+ * Passing 0x20 let Canon record H.264 alongside (MP4s in DCIM matching both REC runs; card shared, 88-93
+ * MiB/s, dropped frames). So 0x20 is the press; 0x21 looks like Canon's record start/stop notification. */
+#define RR_KEY_REC_PRESS   0x20
+#define RR_KEY_REC_NOTIFY  0x21
 #define RR_KEY_REC_UNPRESS 0x22
 static void rr_task(void *unused)
 {
@@ -1198,7 +1204,7 @@ static void rr_status_task(void *unused)
 /* v16.1 key log: v16 on the camera let REC through to Canon. is_movie_mode() looks wrong on the R
  * (shooting_mode == 0x14; v10 logged movie=0 in movie mode), so the movie check is gone; and every
  * button event (not Canon's 0x9D info events) is logged with the state, flushed to ML/RRKEYS.TXT. */
-struct rr_key { uint32_t t_ms; int16_t param; uint8_t lv, menu, movie, taken; uint16_t smode; };
+struct rr_key { uint32_t t_ms; int16_t param; uint8_t lv, menu, movie, taken; uint16_t smode; uint8_t rec; };
 #define RR_NKEY 64
 static struct rr_key rr_keys[RR_NKEY];
 static volatile uint32_t rr_nkey;       /* total logged; ring index = n % RR_NKEY */
@@ -1209,7 +1215,7 @@ static int rr_key_log(int param, int taken)
     uint32_t n = rr_nkey;
     struct rr_key *k = &rr_keys[n % RR_NKEY];
     k->t_ms = get_ms_clock(); k->param = param; k->lv = lv ? 1 : 0; k->menu = gui_menu_shown() ? 1 : 0;
-    k->movie = is_movie_mode() ? 1 : 0; k->taken = taken; k->smode = shooting_mode;
+    k->movie = is_movie_mode() ? 1 : 0; k->taken = taken; k->smode = shooting_mode; k->rec = RECORDING ? 1 : 0;
     rr_nkey = n + 1;
     return taken ? 0 : 1;
 }
@@ -1226,8 +1232,8 @@ static void rr_key_flush(void)
     for (; rr_nkey_flushed < n && len < cap - 128; rr_nkey_flushed++)
     {
         struct rr_key *k = &rr_keys[rr_nkey_flushed % RR_NKEY];
-        int w = snprintf(b + len, cap - len, "t=%d ev=%02x lv=%d menu=%d movie=%d shooting_mode=%d rec_switch=%d -> %s\n",
-                         k->t_ms, k->param & 0xFFFF, k->lv, k->menu, k->movie, k->smode, rr_on, k->taken ? "TAKEN" : "passed");
+        int w = snprintf(b + len, cap - len, "t=%d ev=%02x lv=%d menu=%d movie=%d shooting_mode=%d canon_rec=%d rec_switch=%d -> %s\n",
+                         k->t_ms, k->param & 0xFFFF, k->lv, k->menu, k->movie, k->smode, k->rec, rr_on, k->taken ? "TAKEN" : "passed");
         if (w > 0) len += MIN(w, cap - len - 1);
     }
     FILE *f = FIO_CreateFileOrAppend("ML/RRKEYS.TXT");
@@ -1240,9 +1246,9 @@ int handle_rawrec_keys(struct event *event)
     if (!rr_on) return 1;
     int p = event->param;
     if (p == 0x9D) return 1;            /* GMT_OLC_INFO_CHANGED: Canon-internal, frequent */
-    if (p != RR_KEY_REC_PRESS && p != RR_KEY_REC_UNPRESS) return rr_key_log(p, 0);
+    if (p != RR_KEY_REC_PRESS && p != RR_KEY_REC_NOTIFY && p != RR_KEY_REC_UNPRESS) return rr_key_log(p, 0);
     if (!lv || gui_menu_shown()) return rr_key_log(p, 0);
-    if (p == RR_KEY_REC_UNPRESS) return rr_key_log(p, 1);
+    if (p != RR_KEY_REC_PRESS) return rr_key_log(p, RECORDING ? 0 : 1);  /* if Canon records anyway, let its notices through */
     if (rr_active) { rr_stop = 1; return rr_key_log(p, 1); }
     if (rt_busy) return rr_key_log(p, 1);   /* a test run is going: ignore, but don't start Canon recording either */
     rt_busy = 1;
