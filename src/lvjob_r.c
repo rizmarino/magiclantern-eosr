@@ -23,6 +23,14 @@
 #define LVJ_BUF       0x4000
 
 static volatile int lvj_busy = 0;
+
+/* The R build has no CONFIG_BEEP (beep() is an empty stub), so signal
+ * completion on screen and with the card LED instead. */
+static void lvj_done(const char *what)
+{
+    NotifyBox(6000, "%s: DONE", what);
+    info_led_blink(3, 100, 100);
+}
 static int lvj_runs = 0;
 static uint8_t *lvj_buf;
 static int lvj_len;
@@ -85,7 +93,7 @@ static void lvj_task(void *unused)
     }
     FIO_CloseFile(f);
     lvj_runs++;
-    beep();
+    lvj_done("LV job dump");
 out:
     if (lvj_buf) free(lvj_buf);
     lvj_buf = 0;
@@ -141,7 +149,7 @@ static void lvb_task(void *unused)
     }
     FIO_CloseFile(f);
     lvj_runs++;
-    beep();
+    lvj_done("LV buffer dump");
 out:
     if (lvj_buf) free(lvj_buf);
     lvj_buf = 0;
@@ -289,7 +297,7 @@ static void lvs_task(void *unused)
         lvs_dump(name, best_s[k] * LVS_BLK, len, buf, chunk);
     }
     lvj_runs++;
-    beep();
+    lvj_done("LV memory survey");
 out:
     if (map) free(map);
     if (buf) free(buf);
@@ -548,7 +556,7 @@ static void lvs2_task(void *unused)
     }
     NotifyBox(4000, "survey 2: %d MB mapped, %d L2, %d >2GB", npick, nl2all, nbeyond);
     lvj_runs++;
-    beep();
+    lvj_done("LV survey 2");
 out:
     if (pick) free(pick);
     if (pcls) free(pcls);
@@ -567,7 +575,7 @@ static void lvd_task(void *unused)
     snprintf(name, sizeof(name), "ML/LVDAF%02d.BIN", lvj_runs);
     lvs_dump(name, 0x25880000, 0xC40000, buf, chunk);
     lvj_runs++;
-    beep();
+    lvj_done("LV DAF dump");
 out:
     if (buf) free(buf);
     lvj_busy = 0;
@@ -614,7 +622,7 @@ static void lvp_task(void *unused)
     }
     lvp_line("done %08x", 0xC0000000, 0, 0);
     lvj_runs++;
-    beep();
+    lvj_done("LV 2nd-GB probe");
     lvj_busy = 0;
 }
 
@@ -745,7 +753,7 @@ static void m1_task(void *unused)
     m1_snap("off+300ms");
     m1_log("done\n");
     lvj_runs++;
-    beep();
+    lvj_done("LV MEM1 test");
     lvj_busy = 0;
 }
 
@@ -767,21 +775,21 @@ static struct menu_entry lvj_menu[] = {
         .select = lvj_select,
         .update = lvj_update,
         .help   = "Read-only: 8 snapshots of Canon's LV frame-job structs -> ML/LVJOB.BIN",
-        .help2  = "SET, close the menu, keep live view running until the beep (~2 s).",
+        .help2  = "SET, close the menu, keep live view running until DONE shows (~2 s).",
     },
     {
         .name   = "LV buffer dump",
         .select = lvb_select,
         .update = lvj_update,
         .help   = "Read-only: copies the current LV YUV frame buffer (21 MB) -> ML/LVBUFnn.BIN",
-        .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~5-15 s).",
+        .help2  = "Static scene, NOT recording. SET, close menu, wait for DONE (~5-15 s).",
     },
     {
         .name   = "LV memory survey",
         .select = lvs_select,
         .update = lvj_update,
         .help   = "Read-only: maps changing RAM, dumps side windows + biggest changing areas",
-        .help2  = "Static scene, NOT recording. SET, close menu, wait for beep (~10-20 s).",
+        .help2  = "Static scene, NOT recording. SET, close menu, wait for DONE (~10-20 s).",
     },
     {
         .name   = "LV memory survey 2",

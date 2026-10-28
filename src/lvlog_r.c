@@ -85,8 +85,9 @@ static void lvlog_task(void *unused)
 
     lvlog_last_trig = trig ? 1 : 0;
     lvlog_runs++;
-    beep();
-    if (!trig) { msleep(300); beep(); }         /* double beep = timed out, no change seen */
+    /* no CONFIG_BEEP on the R: show the result on screen instead */
+    NotifyBox(6000, trig ? "LV log: DONE (change caught)" : "LV log: DONE (timed out, no change)");
+    info_led_blink(trig ? 1 : 3, 100, 100);
     lvlog_busy = 0;
 }
 
@@ -114,7 +115,7 @@ static struct menu_entry lvlog_menu[] = {
         .select = lvlog_select,
         .update = lvlog_update,
         .help   = "Saves Canon's LV log around the next LV change (mode, rec, EVF).",
-        .help2  = "SET, close menu, make ONE change, wait for beep (2 beeps = no change).",
+        .help2  = "SET, close menu, make ONE change, wait for DONE message.",
         .children = (struct menu_entry[]) {
             {
                 .name    = "Max wait",
