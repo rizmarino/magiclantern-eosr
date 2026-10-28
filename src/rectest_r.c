@@ -106,7 +106,8 @@ static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit", "
 static const int rt_fmt_bpp[] = { 14, 14, 12, 10 };
 /* v17: crops as width x height; 0 x 0 = the whole MEM1 frame (FHD movie 2304x1290, 4K movie 4256x2214).
  * The 2560 crops need Canon's 4K movie size (MEM1 4256 px wide, 1:1); in FHD they clamp to 2304. */
-static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920, 800 }, { 0, 0 }, { 2560, 1080 }, { 2560, 1440 } };
+static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920, 800 }, { 0, 0 }, { 2560, 1080 }, { 2560, 1440 },
+                                          { 2880, 1216 } };     /* v17.2: 2.37:1, 10-bit 23.98p needs 100.1 MiB/s */
 #define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -1527,10 +1528,10 @@ static struct menu_entry rt_menu[] = {
             {
                 .name    = "Crop",
                 .priv    = &rt_crop_sel,
-                .max     = 5,
-                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440"),
+                .max     = 6,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216"),
                 .help    = "Full frame: whole LV raw frame (FHD movie 2304x1290, 4K movie 4256x2214, incl. black borders)",
-                .help2   = "2560 crops need Canon movie size 4K (1:1 pixels); in FHD they clamp to 2304 wide",
+                .help2   = "2560/2880 crops need Canon movie size 4K (1:1 pixels); 2880x1216: 10-bit 23.98p only",
             },
             {
                 .name    = "Duration",
