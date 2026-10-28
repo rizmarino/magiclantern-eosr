@@ -473,7 +473,14 @@ static void rt_survey(void)
     sv_irq_to_top = median_u32(tmp, k);
     /* the IRQ must mark a frame that has just completed: the bottom crop row
      * changed within the last 8 ms, and the next frame hasn't reached the top
-     * crop row yet (no top change within 1 ms after the IRQ) */
+     * crop row yet (no top change within 1 ms after the IRQ).
+     * v17.1: 8 ms was tuned with the probe row ~107 rows above the frame end (FHD 1080 crop). A probe row
+     * higher up (4K mode 2560x1080: 568 rows above the end, IRQ ~7.8 ms after it, rejected on 6-8 of 31 IRQs)
+     * gets the measured time of the extra rows added: rows to the standard probe row x (readout / probe span). */
+    uint32_t pm = MAX(107, m1_h * 107 / 1290), lim = 8000;
+    if (sv_readout && r_bot > r_top + 64 && m1_h > pm && r_bot < m1_h - pm)
+        lim += (uint32_t)((uint64_t)(m1_h - pm - r_bot) * sv_readout / (r_bot - r_top));
+    lim = MIN(lim, 20000);
     if (nb)
         for (int i = 0; i < ni; i++)
         {
@@ -482,14 +489,14 @@ static void rt_survey(void)
             for (int j = 0; j < nt; j++) { uint32_t d = d20(tt[j], irq_log[i].t); if (d < nt_) nt_ = d; }
             if (ab > 500000) continue;      /* no sample coverage around this IRQ */
             sv_irq_chk++;
-            if (ab < 8000 && nt_ > 1000) sv_irq_settled++;
+            if (ab < lim && nt_ > 1000) sv_irq_settled++;
         }
     rt_printf("survey: %d bottom-row changes, period %d us; readout (top->bottom crop row) %d us\n", nb, sv_est, sv_readout);
     rt_printf("survey: IRQ period %d us, %d of %d IRQ intervals had a new bottom row; IRQ %d us after the bottom-row "
               "change; next top-row change %d us after the IRQ\n", sv_irq_med, sv_irq_new, ni > 1 ? ni - 1 : 0,
               sv_irq_after_bot, sv_irq_to_top);
-    rt_printf("survey: IRQ right after a completed frame (bottom row changed < 8 ms before, top row not yet) "
-              "in %d of %d checked IRQs\n", sv_irq_settled, sv_irq_chk);
+    rt_printf("survey: IRQ right after a completed frame (bottom row changed < %d.%d ms before, top row not yet) "
+              "in %d of %d checked IRQs\n", lim / 1000, lim / 100 % 10, sv_irq_settled, sv_irq_chk);
 
     char n[32]; snprintf(n, sizeof(n), "ML/RT%02d.SYN", rt_run_id);
     FILE *f = FIO_CreateFile(n);
@@ -642,12 +649,11 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     /* v16.7: optical-black borders of the FHD movie MEM1 frame (2304x1290, measured on v16.6 full-frame runs:
      * 48 columns left, 22 rows top, black 127.5 at 10-bit). Mark them outside the active area so raw
      * converters crop them (DNG ActiveArea); the data stays in the file for black-level checks. */
-    uint32_t ax = 0, ay = 0;
-    if (m1_w == 2304 && m1_h == 1290)
-    {
-        if (c_x0 < RT_OB_LEFT) ax = RT_OB_LEFT - c_x0;
-        if (c_y0 < RT_OB_TOP) ay = RT_OB_TOP - c_y0;
-    }
+    uint32_t ax = 0, ay = 0, obl = 0, obt = 0;
+    if (m1_w == 2304 && m1_h == 1290) { obl = RT_OB_LEFT; obt = RT_OB_TOP; }
+    if (m1_w == 4256 && m1_h == 2214) { obl = 144; obt = 46; }   /* v17.1: 4K movie MEM1, measured on v17 RT00 (black 2049 @14-bit) */
+    if (c_x0 < obl) ax = obl - c_x0;
+    if (c_y0 < obt) ay = obt - c_y0;
     ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = c_ch - ay; /* jpeg crop, relative to the active area */
     ri[13] = ay; ri[14] = ax; ri[15] = c_ch; ri[16] = c_cw;       /* active area: y1, x1, y2, x2 */
     ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
@@ -1153,6 +1159,13 @@ static void rt_task(void *unused)
     uint32_t wmax = w_us_max, wmin = w_n ? w_us_min : 0;
     uint64_t wb = w_bytes;
     uint32_t est = mode == SYNC_IRQ ? sv_irq_med : c_est;
+    /* v17.1: data rate from the nominal frame rate when the measured period is near one (timer mode's adaptive
+     * estimate drifted on 4K runs: "needed 111.6" for 1080 14-bit at 29.97p, really 103.7) */
+    {
+        uint32_t fn, fd;
+        rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &fn, &fd);
+        if (fd != 1000 || fn % 1000 == 0) est = (uint32_t)(1000000ULL * fd / fn);
+    }
     uint32_t need10 = est ? (uint32_t)((uint64_t)frame_bytes * 10000000ULL / est / (1024 * 1024)) : 0;
     uint32_t card10 = wus ? (uint32_t)(wb * 10000000ULL / wus / (1024 * 1024)) : 0;
     uint32_t wall10 = dur_us ? (uint32_t)(wb * 10000000ULL / ((uint64_t)dur_us + drain_ms * 1000) / (1024 * 1024)) : 0;
