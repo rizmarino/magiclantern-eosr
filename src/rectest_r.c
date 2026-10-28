@@ -98,12 +98,13 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define F_DUP    32                     /* same bottom row as the last saved frame: skipped */
 
 enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
-static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* 1920x1080, 1920x960, 1920x800 */
+static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* 1920x1080, 1920x960, 1920x800, v16.6: 3 = full MEM1 frame */
 static int rt_dur_sel = 1;              /* 10, 20, 40 s */
 static int rt_sync_sel = SYNC_AUTO;
-static CONFIG_INT("r.rawrec.fmt", rt_fmt_sel, 0);              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit */
-static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit" };
-static const int rt_crop_h[] = { 1080, 960, 800 };
+static CONFIG_INT("r.rawrec.fmt", rt_fmt_sel, 0);              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit, v16.6: 3 = MLV 10-bit */
+static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit", "MLV 10-bit" };
+static const int rt_fmt_bpp[] = { 14, 14, 12, 10 };
+static const int rt_crop_h[] = { 1080, 960, 800, 4094 };         /* 4094/4096 = clamp to the MEM1 frame (full) */
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
 
@@ -542,21 +543,21 @@ static int rt_pack_apply(int bpp, int ml_order)
     { rt_printf("pack cfg {%d,%d,%d,%d,%d} is not Canon's default: not touching it\n", pk_orig[0], pk_orig[1], pk_orig[2], pk_orig[3], pk_orig[4]); return -1; }
     if (md >= 0x14 || (MEM(RT_PATH + 0x28) && (md == 0xb || md == 0xf || md == 9)) || pk_w0 != MEM(RT_PATH + 0x10))
     { rt_printf("Mem1Path mode %d / width source %d vs %d: not the layout tested in v14.1\n", md, pk_w0, MEM(RT_PATH + 0x10)); return -1; }
-    uint32_t wset = pk_w0;
-    if (bpp == 12)
+    uint32_t wset = pk_w0, f2 = bpp == 14 ? 2 : bpp == 12 ? 1 : 0;   /* v14.1: f2 2/1/0 = 14/12/10-bit */
+    if (bpp != 14)
     {
-        uint32_t lb = pk_w0 * 12 / 8;
-        wset = (lb * 8 + 13) / 14;
-        if (((wset * 14) >> 3) != lb || (pk_w0 * 12) % 8) { rt_printf("no width field gives %d bytes per line\n", lb); return -1; }
+        uint32_t lb = pk_w0 * bpp / 8;
+        wset = (lb * 8 + 13) / 14;                  /* Canon sets port-3 xsize = (width * 14) >> 3 */
+        if (((wset * 14) >> 3) != lb || (pk_w0 * bpp) % 8) { rt_printf("no width field gives %d bytes per line\n", lb); return -1; }
     }
     uint32_t old = cli();
     MEM(RT_PATH + 0x18) = wset;
-    MEM(RT_PATH + 0x64 + 8) = bpp == 12 ? 1 : 2;
+    MEM(RT_PATH + 0x64 + 8) = f2;
     MEM(RT_PATH + 0x64 + 12) = ml_order ? 0 : 1;
     sei(old);
     pk_applied = 1;
     msleep(300);
-    rt_printf("pack cfg: f2=%d f3=%d, width field %d -> %d (port-3 line %d bytes); unit reg %08x\n", bpp == 12 ? 1 : 2,
+    rt_printf("pack cfg: f2=%d f3=%d, width field %d -> %d (port-3 line %d bytes); unit reg %08x\n", f2,
               ml_order ? 0 : 1, pk_w0, wset, (wset * 14) >> 3, MEM(0xD0422224u));
     return 0;
 }
@@ -601,7 +602,8 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     int32_t *ri = (int32_t *)(p + 20);                           /* raw_info, 40 words */
     static const int32_t cm[9] = { 6446, -366, -864, -4436, 12204, 2513, -952, 2496, 6348 };  /* Adobe EOS R D65 */
     ri[0] = 1; ri[2] = c_ch; ri[3] = c_cw; ri[4] = c_rb; ri[5] = frame_bytes; ri[6] = c_bpp;
-    ri[7] = c_bpp == 12 ? (RT_BLACK14 + 2) / 4 : RT_BLACK14; ri[8] = c_bpp == 12 ? RT_WHITE14 / 4 : RT_WHITE14;
+    int lsh = 14 - c_bpp;                                        /* hardware drops low bits: 12-bit ~ /4, 10-bit ~ /16 */
+    ri[7] = (RT_BLACK14 + (lsh ? 1 << (lsh - 1) : 0)) >> lsh; ri[8] = RT_WHITE14 >> lsh;
     ri[11] = c_cw; ri[12] = c_ch;                                /* jpeg crop: 0, 0, w, h */
     ri[15] = c_ch; ri[16] = c_cw;                                /* active area: 0, 0, h, w */
     ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
@@ -925,7 +927,7 @@ static void rt_task(void *unused)
     if (!rt_fsem) rt_fsem = create_named_semaphore("rt_frm", SEM_CREATE_LOCKED);
     if (!rt_csem) rt_csem = create_named_semaphore("rt_cap", SEM_CREATE_LOCKED);
 
-    uint32_t crop_w = 1920, crop_h = rt_crop_h[rt_crop_sel];
+    uint32_t crop_w = rt_crop_sel == 3 ? 4096 : 1920, crop_h = rt_crop_h[rt_crop_sel];
     int dur_s = rr_active ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
@@ -934,12 +936,12 @@ static void rt_task(void *unused)
         if (!is_file(n) && !is_file(m)) break;
     }
     c_mlv = rt_fmt_sel != 0;
-    c_bpp = rt_fmt_sel == 2 ? 12 : 14;
+    c_bpp = rt_fmt_bpp[rt_fmt_sel];
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
     if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
-    rt_printf("start v16 record test run %d: crop %dx%d, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
-              crop_w, crop_h, dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
+    rt_printf("start v16 record test run %d: crop %dx%d%s, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, rt_crop_sel == 3 ? " (full frame)" : "", dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
               rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
 
@@ -983,6 +985,13 @@ static void rt_task(void *unused)
     c_ch = crop_h; c_cw = crop_w; c_x0 = x0; c_y0 = y0;
     c_src = ubuf + y0 * pitch + x0 * c_bpp / 8;
     r_top = y0; r_bot = y0 + crop_h - 1;
+    /* v16.6: the frame-end IRQ comes ~1 ms after the 1080 crop's bottom row (1183 of 1290); a probe on the
+     * frame's last rows changes too close to (or after) the IRQ for the 1 ms survey and the per-frame checks.
+     * Keep the bottom probe >= 106 rows above the frame end (= the proven 1080 crop row); the offline tear
+     * check (mlv_check) still covers every row. */
+    if (m1_h > 107 && r_bot > m1_h - 107) r_bot = MAX(r_top, m1_h - 107);
+    if (r_bot != y0 + crop_h - 1) rt_printf("probe rows: top %d, bottom %d (crop bottom %d too close to the frame end)\n",
+                                            r_top, r_bot, y0 + crop_h - 1);
     frame_bytes = c_rb * crop_h;
     slot_pre = c_mlv ? RT_VIDF_PRE : 0;
     slot_bytes = (frame_bytes + slot_pre + 4095) & ~4095;
@@ -1116,7 +1125,7 @@ static void rt_task(void *unused)
               late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
     rt_printf("files: %s (last part %d), %d MB total, format %s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
               rt_fmt_name[rt_fmt_sel], RECORDING ? 1 : 0);
-    snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
+    snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
     rt_flush();
     for (int i = 0; i < ntl; i++)
@@ -1447,8 +1456,9 @@ static struct menu_entry rt_menu[] = {
             {
                 .name    = "Crop",
                 .priv    = &rt_crop_sel,
-                .max     = 2,
-                .choices = CHOICES("1920x1080", "1920x960", "1920x800"),
+                .max     = 3,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame"),
+                .help    = "Full frame: the whole LV raw frame (2304x1290 in FHD movie mode, incl. black borders)",
             },
             {
                 .name    = "Duration",
@@ -1459,8 +1469,8 @@ static struct menu_entry rt_menu[] = {
             {
                 .name    = "Format",
                 .priv    = &rt_fmt_sel,
-                .max     = 2,
-                .choices = CHOICES("BIN 14-bit", "MLV 14-bit", "MLV 12-bit"),
+                .max     = 3,
+                .choices = CHOICES("BIN 14-bit", "MLV 14-bit", "MLV 12-bit", "MLV 10-bit"),
                 .help    = "BIN: Canon's bit order (PC converter). MLV: camera writes .MLV (pack unit set to ML order).",
             },
             {
@@ -1542,7 +1552,7 @@ static void rt_status(const char *fmt, ...)
 /* ---- auto-run: ML/RTAUTO.TXT, unattended runs ----
  * Read 10 s after boot. Plans are separated by lines starting with "---";
  * each boot runs the next plan (ML/RTAUTO.POS holds its number). A plan has up
- * to 6 lines "<crop height> <seconds> [auto|irq|timer] [bin|mlv14|mlv12]", e.g. "1080 20 auto mlv12",
+ * to 6 lines "<crop height|full> <seconds> [auto|irq|timer] [bin|mlv14|mlv12|mlv10]", e.g. "1080 20 auto mlv12",
  * or "pack" (v14 pack test);
  * '#' starts a comment. Waits up to 30 s for live view; without it (e.g. USB
  * cable in: PC-connection screen) nothing is used up. RTAUTO.POS is advanced
@@ -1570,6 +1580,12 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
                 v[k++] = x;
                 continue;
             }
+            if (k == 0 && (c == 'f' || c == 'F'))  /* "full": whole MEM1 frame */
+            {
+                v[k++] = 9999;
+                while (i < len && t[i] != '\n' && t[i] != ' ' && t[i] != '\t' && t[i] != '\r') i++;
+                continue;
+            }
             if (k == 0 && (c == 'p' || c == 'P'))  /* "pack": pack test */
             {
                 k = 9;
@@ -1585,13 +1601,14 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
             }
             if ((k == 2 || k == 3) && (c == 'b' || c == 'B' || c == 'm' || c == 'M'))   /* format: bin, mlv14, mlv12 */
             {
-                int twelve = 0;
+                int twelve = 0, ten = 0;
                 while (i < len && t[i] != '\n' && t[i] != ' ' && t[i] != '\t' && t[i] != '\r')
                 {
                     if (t[i] == '1' && i + 1 < len && t[i + 1] == '2') twelve = 1;
+                    if (t[i] == '1' && i + 1 < len && t[i + 1] == '0') ten = 1;
                     i++;
                 }
-                v[3] = (c == 'b' || c == 'B') ? 0 : twelve ? 2 : 1;
+                v[3] = (c == 'b' || c == 'B') ? 0 : ten ? 3 : twelve ? 2 : 1;
                 k = 4;
                 continue;
             }
@@ -1607,7 +1624,7 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[5], int max)
         i++;
         if (k == 0) continue;           /* blank or comment line */
         if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = runs[n][3] = runs[n][4] = 0; n++; continue; }
-        int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : -1;
+        int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : v[0] == 9999 ? 3 : -1;
         int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
         if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
         runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2]; runs[n][3] = v[3]; runs[n][4] = v[4];
