@@ -730,6 +730,7 @@ static void rt_capture_task(void *unused)
 }
 
 static void rt_export(int run);
+static void rt_copy_file(const char *src, const char *dst);
 
 static void rt_task(void *unused)
 {
@@ -936,6 +937,135 @@ out:
     rt_busy = 0;
 }
 
+/* ---- v14 pack test: does Mem1Path's EDMAC pack-unit config select the bit order? ----
+ * Static RE (notes lv-survey.md, "Pixel packing control"): port 3 (MEM1) has pack
+ * unit 2 (mmio 0xD0422200); its config word at +0x24 is composed by 0xE0537416
+ * from 5 fields kept in the Mem1Path struct at +0x64 (initial {0, 1, 2, 1, 0}):
+ * reg = f1<<20 | f4<<16 | f0<<8 | f2<<4 | f3. Hypotheses: f2 = bit depth (2 = 14),
+ * f1 (only 1 in Mem1Path) = bit order, f4 = swap mode. For f1 x f4, set the struct
+ * fields (Canon re-applies them per frame, if FUN_e0638b7a runs per frame) and the
+ * register itself, wait, copy a 16-row band of MEM1, log the register before/after.
+ * 14-bit only, so the port-3 sizes stay right. Everything is restored at the end.
+ * Output: ML/PACKTEST.BIN (header + band per config), analysed on the PC. */
+#define PK_CFG      (RT_PATH + 0x64)    /* 5 words */
+#define PK_REG      0xD0422224u         /* pack unit 2 config */
+#define PK_MASK     0x00130131u
+#define PK_ROWS     16
+#define PK_FILE     "ML/PACKTEST.BIN"
+
+static uint32_t pk_compose(const uint32_t *f)
+{
+    return (f[1] & 1) << 20 | (f[4] & 3) << 16 | (f[0] & 1) << 8 | (f[2] & 3) << 4 | (f[3] & 1);
+}
+
+struct pk_hdr
+{
+    char magic[4];                      /* "PKT1" */
+    uint32_t idx, f1, f4, reg_before, reg_set, reg_after, w, h, pitch, row0, rows, t_ms;
+};
+
+static void rt_pack_task(void *unused)
+{
+    static const uint8_t combos[][2] = {    /* {f1, f4}; first = Canon's default, last = after restore */
+        { 1, 0 }, { 0, 0 }, { 1, 1 }, { 0, 1 }, { 1, 2 }, { 0, 2 }, { 1, 3 }, { 0, 3 },
+    };
+    rt_logbuf = malloc(RT_LOGLEN);
+    rt_loglen = 0;
+    uint8_t *band = 0;
+    FILE *f = 0;
+    int lv_raw = 0, changed = 0, nb = 0;
+    uint32_t orig[5], reg0 = 0;
+    if (!rt_logbuf) { NotifyBox(6000, "Pack test: out of memory"); goto out; }
+    rt_printf("start v14 pack test: t=%d lv=%d\n", get_ms_clock(), lv ? 1 : 0);
+    if (!lv) { rt_printf("no live view, abort\n"); snprintf(rt_last, sizeof(rt_last), "pack: no LV"); goto done; }
+
+    call("lv_save_raw", 1);
+    lv_raw = 1;
+    msleep(500);
+    m1_w = MEM(RT_PATH + 0x10); m1_h = MEM(RT_PATH + 0x14);
+    uint32_t a = MEM(RT_PATH + 0x58);
+    pitch = m1_w * 14 / 8;
+    ubuf = RT_BUF | RT_UNC;
+    rt_printf("M1 w=%d h=%d addr=%08x pitch=%d\n", m1_w, m1_h, a, pitch);
+    if (!m1_w || !m1_h || pitch * m1_h > RT_BUFLEN || (a & ~RT_UNC) != RT_BUF || m1_h < 64)
+    { rt_printf("MEM1 not active or size unexpected, abort\n"); snprintf(rt_last, sizeof(rt_last), "pack: no LV raw"); goto done; }
+
+    for (int i = 0; i < 5; i++) orig[i] = MEM(PK_CFG + 4 * i);
+    reg0 = MEM(PK_REG);
+    rt_printf("pack cfg {%d,%d,%d,%d,%d} -> composed %08x; unit reg %08x (masked %08x)\n", orig[0], orig[1], orig[2],
+              orig[3], orig[4], pk_compose(orig), reg0, reg0 & PK_MASK);
+    if (orig[0] != 0 || orig[1] != 1 || orig[2] != 2 || orig[3] != 1 || orig[4] != 0)
+    { rt_printf("cfg is not Canon's default {0,1,2,1,0}: not touching it, abort\n"); snprintf(rt_last, sizeof(rt_last), "pack: cfg unexpected"); goto done; }
+    rt_printf("unit reg %s the struct\n", (reg0 & PK_MASK) == pk_compose(orig) ? "matches" : "does NOT match");
+
+    band = malloc(PK_ROWS * pitch);
+    f = FIO_CreateFile(PK_FILE);
+    if (!band || !f) { rt_printf("no buffer/file, abort\n"); snprintf(rt_last, sizeof(rt_last), "pack: no buffer"); goto done; }
+    uint32_t row0 = (m1_h / 2) & ~1;
+    rt_flush();
+
+    for (int c = 0; c <= COUNT(combos); c++)
+    {
+        int restore = c == COUNT(combos);
+        uint32_t cfg[5] = { orig[0], orig[1], orig[2], orig[3], orig[4] };
+        if (!restore) { cfg[1] = combos[c][0]; cfg[4] = combos[c][1]; }
+        uint32_t rb = MEM(PK_REG);
+        MEM(PK_CFG + 4) = cfg[1];
+        MEM(PK_CFG + 16) = cfg[4];
+        if (!restore) MEM(PK_REG) = (rb & ~PK_MASK) | pk_compose(cfg);
+        changed = 1;
+        uint32_t rs = MEM(PK_REG);
+        msleep(250);                    /* ~7 frames at 29.97p */
+        uint32_t ra = MEM(PK_REG);
+        if (restore)                    /* struct only so far: did Canon re-apply it per frame? */
+        {
+            rt_printf("restore: struct only -> unit reg after 250 ms %08x (%s)\n", ra,
+                      ra == reg0 ? "Canon re-applies the struct every frame" : "NOT re-applied; writing the register");
+            if (ra != reg0) { MEM(PK_REG) = reg0; msleep(250); ra = MEM(PK_REG); }
+        }
+        changed = !restore;
+        memcpy(band, (void *)(ubuf + row0 * pitch), PK_ROWS * pitch);
+        struct pk_hdr h = { { 'P', 'K', 'T', '1' }, c, cfg[1], cfg[4], rb, rs, ra, m1_w, m1_h, pitch, row0, PK_ROWS,
+                            get_ms_clock() };
+        FIO_WriteFile(f, &h, sizeof(h));
+        FIO_WriteFile(f, band, PK_ROWS * pitch);
+        nb++;
+        rt_printf("band %d: f1=%d f4=%d%s reg before %08x set %08x after 250 ms %08x; first bytes %02x%02x%02x%02x\n", c,
+                  cfg[1], cfg[4], restore ? " (restored)" : "", rb, rs, ra, band[pitch / 2], band[pitch / 2 + 1],
+                  band[pitch / 2 + 2], band[pitch / 2 + 3]);
+    }
+    changed = 0;
+    snprintf(rt_last, sizeof(rt_last), "pack: %d bands", nb);
+
+done:
+    if (changed)                        /* aborted mid-way: put Canon's values back */
+    {
+        MEM(PK_CFG + 4) = orig[1]; MEM(PK_CFG + 16) = orig[4]; MEM(PK_REG) = reg0;
+        rt_printf("restored cfg after an abort\n");
+    }
+    if (f) FIO_CloseFile(f);
+    if (band) free(band);
+    if (lv_raw) call("lv_save_raw", 0);
+    rt_printf("pack test done t=%d: %s\n", get_ms_clock(), rt_last);
+    rt_flush();
+    rt_copy_file(PK_FILE, "DCIM/100EOS_R/RTPK0998.JPG");
+    rt_copy_file("ML/RECTEST.TXT", "DCIM/100EOS_R/RTLG0997.JPG");
+    NotifyBox(8000, "Pack test: DONE %s", rt_last);
+out:
+    if (rt_logbuf) free(rt_logbuf);
+    rt_logbuf = 0;
+    info_led_blink(3, 100, 100);
+    rt_busy = 0;
+}
+
+static MENU_SELECT_FUNC(rt_pack_select)
+{
+    if (rt_busy) return;
+    rt_busy = 1;
+    rt_last[0] = 0;
+    task_create("rt_pack", 0x1e, 0x2000, rt_pack_task, 0);
+}
+
 static MENU_SELECT_FUNC(rt_select)
 {
     if (rt_busy) return;
@@ -982,6 +1112,13 @@ static struct menu_entry rt_menu[] = {
                 .update = rt_update,
                 .help   = "NOT recording. SET, close menu, wait for DONE (duration + ~5 s).",
                 .help2  = "Writes ML/RTnn.BIN (~2 GB per 20 s). Freeze: pull battery.",
+            },
+            {
+                .name   = "Pack test",
+                .select = rt_pack_select,
+                .update = rt_update,
+                .help   = "v14: tries EDMAC pack-unit settings on the LV raw, saves bands to ML/PACKTEST.BIN.",
+                .help2  = "~3 s. Restores Canon's values. Freeze: pull battery.",
             },
             MENU_EOL,
         },
@@ -1034,7 +1171,7 @@ static void rt_status(const char *fmt, ...)
 /* ---- auto-run: ML/RTAUTO.TXT, unattended runs ----
  * Read 10 s after boot. Plans are separated by lines starting with "---";
  * each boot runs the next plan (ML/RTAUTO.POS holds its number). A plan has up
- * to 6 lines "<crop height> <seconds> <auto|irq|timer>", e.g. "1080 20 auto";
+ * to 6 lines "<crop height> <seconds> <auto|irq|timer>", e.g. "1080 20 auto", or "pack" (v14 pack test);
  * '#' starts a comment. Waits up to 30 s for live view; without it (e.g. USB
  * cable in: PC-connection screen) nothing is used up. RTAUTO.POS is advanced
  * before the plan runs, so a freeze + battery pull skips that plan instead of
@@ -1061,6 +1198,12 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
                 v[k++] = x;
                 continue;
             }
+            if (k == 0 && (c == 'p' || c == 'P'))  /* "pack": pack test */
+            {
+                k = 9;
+                while (i < len && t[i] != '\n') i++;
+                break;
+            }
             if (k == 2 && (c == 'a' || c == 'i' || c == 'I' || c == 't'))
             {
                 v[2] = c == 'a' ? SYNC_AUTO : c == 't' ? SYNC_TIMER : SYNC_IRQ;
@@ -1072,6 +1215,7 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
         }
         i++;
         if (k == 0) continue;           /* blank or comment line */
+        if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = 0; n++; continue; }
         int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : -1;
         int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
         if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
@@ -1159,12 +1303,13 @@ static void rt_auto_task(void *unused)
     for (int i = 0; i < n; i++)
     {
         while (rt_busy) msleep(500);
-        rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2];
         NotifyBox(3000, "Record test auto: plan %d/%d, run %d of %d", pos + 1, np, i + 1, n);
         rt_status("auto: plan %d of %d, run %d of %d in progress", pos + 1, np, i + 1, n);
         msleep(3000);
         rt_busy = 1;
         rt_last[0] = 0;
+        if (runs[i][0] < 0) { rt_pack_task(0); continue; }   /* synchronous; clears rt_busy */
+        rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2];
         rt_task(0);                     /* synchronous; clears rt_busy */
         if (first_run < 0) first_run = rt_run_id;
         msleep(3000);
