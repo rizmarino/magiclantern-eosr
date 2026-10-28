@@ -729,6 +729,8 @@ static void rt_capture_task(void *unused)
     give_semaphore(rt_csem);
 }
 
+static void rt_export(int run);
+
 static void rt_task(void *unused)
 {
     rt_logbuf = malloc(RT_LOGLEN);
@@ -920,6 +922,7 @@ done:
     rt_unlock();
     rt_printf("done t=%d\n", get_ms_clock());
     rt_flush();
+    rt_export(rt_run_id);
     rt_runs++;
     NotifyBox(8000, "Record test: DONE %s", rt_last);
 out:
@@ -985,9 +988,128 @@ static struct menu_entry rt_menu[] = {
     },
 };
 
+/* ---- export for USB: the R's PTP shows only DCIM/ and MISC/, so copy the
+ * small result files there (test which names/places become visible) ---- */
+static void rt_copy_file(const char *src, const char *dst)
+{
+    int len = 0;
+    uint8_t *b = read_entire_file(src, &len);
+    if (!b) return;
+    FILE *f = FIO_CreateFile(dst);
+    if (f) { FIO_WriteFile(f, b, len); FIO_CloseFile(f); }
+    fio_free(b);
+}
+
+static void rt_export(int run)
+{
+    char s[32], d[40];
+    rt_copy_file("ML/RECTEST.TXT", "DCIM/100EOS_R/RTLG0001.TXT");
+    rt_copy_file("ML/RECTEST.TXT", "MISC/RECTEST.TXT");
+    if (run < 0) return;
+    snprintf(s, sizeof(s), "ML/RT%02d.IDX", run); snprintf(d, sizeof(d), "DCIM/100EOS_R/RTIX%04d.DAT", run); rt_copy_file(s, d);
+    snprintf(s, sizeof(s), "ML/RT%02d.SYN", run); snprintf(d, sizeof(d), "DCIM/100EOS_R/RTSY%04d.DAT", run); rt_copy_file(s, d);
+}
+
+static void rt_probe_files(void)
+{
+    static const char *names[] = { "DCIM/100EOS_R/RTPB0001.TXT", "DCIM/100EOS_R/RTPB0002.JPG", "MISC/RTPROBE.TXT",
+                                    "DCIM/RTPROBE.TXT" };
+    char t[64];
+    int n = snprintf(t, sizeof(t), "rectest probe, boot t=%d\n", get_ms_clock());
+    for (int i = 0; i < COUNT(names); i++)
+    {
+        FILE *f = FIO_CreateFile(names[i]);
+        if (f) { FIO_WriteFile(f, t, n); FIO_CloseFile(f); }
+    }
+}
+
+/* ---- auto-run: ML/RTAUTO.TXT, for unattended runs over USB ----
+ * Read 10 s after boot. Lines: "<crop height> <seconds> <sync>", e.g.
+ * "1080 20 auto", "960 10 timer" (max 6 runs); '#' starts a comment.
+ * Renamed to RTAUTO.RUN before the first run, so a freeze + battery pull can
+ * never re-run it on the next boot; RTAUTO.RUN -> RTAUTO.DON when finished. */
+#define RT_AUTO_CFG "ML/RTAUTO.TXT"
+#define RT_AUTO_RUN "ML/RTAUTO.RUN"
+#define RT_AUTO_DON "ML/RTAUTO.DON"
+
+static int rt_auto_skipped;
+static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
+{
+    int n = 0, i = 0;
+    while (i < len && n < max)
+    {
+        int v[3] = { -1, -1, -1 }, k = 0;
+        while (i < len && t[i] != '\n')
+        {
+            char c = t[i];
+            if (c == '#') { while (i < len && t[i] != '\n') i++; break; }
+            if (c >= '0' && c <= '9' && k < 2)
+            {
+                int x = 0;
+                while (i < len && t[i] >= '0' && t[i] <= '9') x = x * 10 + (t[i++] - '0');
+                v[k++] = x;
+                continue;
+            }
+            if (k == 2 && (c == 'a' || c == 'i' || c == 'I' || c == 't'))
+            {
+                v[2] = c == 'a' ? SYNC_AUTO : c == 't' ? SYNC_TIMER : SYNC_IRQ;
+                k = 3;
+                while (i < len && t[i] != '\n' && t[i] != ' ' && t[i] != '\t' && t[i] != '\r') i++;
+                continue;
+            }
+            i++;
+        }
+        i++;
+        if (k == 0) continue;           /* blank or comment line */
+        int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : -1;
+        int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
+        if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
+        runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2];
+        n++;
+    }
+    return n;
+}
+
+static void rt_auto_task(void *unused)
+{
+    msleep(10000);
+    rt_probe_files();
+    if (!is_file(RT_AUTO_CFG)) return;
+    int len = 0;
+    char *t = (char *)read_entire_file(RT_AUTO_CFG, &len);
+    int runs[6][3];
+    rt_auto_skipped = 0;
+    int n = t ? rt_auto_parse(t, len, runs, 6) : 0;
+    if (t) fio_free(t);
+    FIO_RemoveFile(RT_AUTO_RUN);
+    FIO_RemoveFile(RT_AUTO_DON);
+    if (FIO_RenameFile(RT_AUTO_CFG, RT_AUTO_RUN)) { NotifyBox(6000, "Record test auto: cannot rename cfg, not running"); return; }
+    for (int w = 0; w < 30 && !lv; w++) msleep(1000);
+    if (!lv || !n) { NotifyBox(6000, "Record test auto: %s", !n ? "no valid runs in cfg" : "no live view"); FIO_RenameFile(RT_AUTO_RUN, RT_AUTO_DON); return; }
+    if (rt_auto_skipped)
+    {
+        NotifyBox(5000, "Record test auto: %d invalid line(s) skipped", rt_auto_skipped);
+        msleep(5000);
+    }
+    for (int i = 0; i < n; i++)
+    {
+        while (rt_busy) msleep(500);
+        rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2];
+        NotifyBox(3000, "Record test auto: run %d of %d", i + 1, n);
+        msleep(3000);
+        rt_busy = 1;
+        rt_last[0] = 0;
+        rt_task(0);                     /* synchronous; clears rt_busy */
+        msleep(3000);
+    }
+    FIO_RenameFile(RT_AUTO_RUN, RT_AUTO_DON);
+    NotifyBox(10000, "Record test auto: all %d runs DONE", n);
+}
+
 static void rt_init(void *unused)
 {
     menu_add("Debug", rt_menu, COUNT(rt_menu));
+    task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
 }
 
 INIT_FUNC("rectest", rt_init);
