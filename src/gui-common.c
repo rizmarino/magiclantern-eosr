@@ -449,6 +449,7 @@ static int handle_digital_zoom_shortcut(struct event * event)
 static int null_event_handler(struct event * event) { return 1; }
 int handle_module_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 int handle_flexinfo_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
+int handle_rawrec_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 
 int handle_common_events_by_feature(struct event * event)
 {
@@ -505,6 +506,7 @@ int handle_common_events_by_feature(struct event * event)
     if (handle_zoom_overlay(event) == 0) return 0;
     #endif
 
+    if (handle_rawrec_keys(event) == 0) return 0;     /* EOS R raw recorder test (rectest_r.c) */
     if (handle_module_keys(event) == 0) return 0;
     if (handle_flexinfo_keys(event) == 0) return 0;
 

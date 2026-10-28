@@ -34,6 +34,9 @@
 #include "mem.h"
 #include "exmem.h"
 #include "fio-ml.h"
+#include "config.h"
+#include "bmp.h"
+#include "gui-common.h"
 
 #ifndef RT_HOST
 static void *(*const ErscCreateLockEntry)(uint32_t *ids, int n) = (void *)0xE054761F;
@@ -95,16 +98,21 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define F_DUP    32                     /* same bottom row as the last saved frame: skipped */
 
 enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
-static int rt_crop_sel = 0;             /* 1920x1080, 1920x960, 1920x800 */
+static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* 1920x1080, 1920x960, 1920x800 */
 static int rt_dur_sel = 1;              /* 10, 20, 40 s */
 static int rt_sync_sel = SYNC_AUTO;
-static int rt_fmt_sel = 0;              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit */
+static CONFIG_INT("r.rawrec.fmt", rt_fmt_sel, 0);              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit */
 static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit" };
 static const int rt_crop_h[] = { 1080, 960, 800 };
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
 
 static volatile int rt_busy = 0;
+/* v16: REC-button raw recording. rr_on = menu switch; rr_active = the current run was started by REC
+ * (no fixed duration; stops on the next REC press, rr_stop); rr_t0/rr_frames feed the on-screen status. */
+static CONFIG_INT("r.rawrec.rec", rr_on, 0);
+static volatile int rr_active, rr_stop;
+static volatile uint32_t rr_t0_ms;
 static int rt_runs = 0;
 static int rt_run_id;
 static char rt_last[48] = "";
@@ -788,7 +796,8 @@ static void rt_capture_irq(void)
     for (;;)
     {
         uint32_t now = rt_us();
-        if (first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         rt_timeline(now);
         if (take_semaphore(rt_fsem, 200))
@@ -818,7 +827,8 @@ static void rt_capture_timer(uint32_t est)
     for (;;)
     {
         uint32_t now = rt_us();
-        if (first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         if (now - (t_prev ? t_prev : t0) > 1000000) { rt_printf("no new frame for 1 s, stopping\n"); break; }
         rt_timeline(now);
@@ -906,7 +916,7 @@ static void rt_task(void *unused)
     if (!rt_csem) rt_csem = create_named_semaphore("rt_cap", SEM_CREATE_LOCKED);
 
     uint32_t crop_w = 1920, crop_h = rt_crop_h[rt_crop_sel];
-    int dur_s = rt_dur_s[rt_dur_sel];
+    int dur_s = rr_active ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
         char n[32], m[32];
@@ -916,8 +926,9 @@ static void rt_task(void *unused)
     c_mlv = rt_fmt_sel != 0;
     c_bpp = rt_fmt_sel == 2 ? 12 : 14;
     pk_applied = 0;
-    rt_printf("start v15 record test run %d: crop %dx%d, %d s, sync %s, format %s, t=%d lv=%d, card free %d MB\n", rt_run_id,
-              crop_w, crop_h, dur_s, rt_sync_name[rt_sync_sel], rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0,
+    rt_printf("start v16 record test run %d: crop %dx%d, %d s%s, sync %s, format %s, t=%d lv=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, dur_s, rr_active ? " (REC button, until stopped)" : "", rt_sync_name[rt_sync_sel],
+              rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
 
     /* HPTimer self-check: one 2 ms timer */
@@ -1027,9 +1038,14 @@ static void rt_task(void *unused)
     c_mode = mode; c_dur_s = dur_s; c_est = sv_est; c_done = 0;
     uint32_t irq0 = irq_n;
     rt_drain(rt_csem);
+    rr_t0_ms = get_ms_clock();
     task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);
-    take_semaphore(rt_csem, (dur_s + 10) * 1000);
-    if (!c_done) { rt_printf("capture task did not finish in time\n"); for (int i = 0; i < 500 && !c_done; i++) msleep(10); }
+    if (dur_s > 0)
+    {
+        take_semaphore(rt_csem, (dur_s + 10) * 1000);
+        if (!c_done) { rt_printf("capture task did not finish in time\n"); for (int i = 0; i < 500 && !c_done; i++) msleep(10); }
+    }
+    else while (!c_done) take_semaphore(rt_csem, 1000);       /* REC run: until stopped or an error */
     uint32_t irq_rec = irq_n - irq0;
     uint32_t dur_us = t_last_ev - first_t;
 
@@ -1045,6 +1061,7 @@ static void rt_task(void *unused)
         if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
         else FIO_CloseFile(w_file);
         w_file = 0;
+        if (!w_bytes && !w_part) { FIO_RemoveFile(w_name); rt_printf("no frames written: %s removed\n", w_name); }
     }
     else rt_printf("writer still busy after 30 s; file left open, buffers kept\n");
     if (!c_abort) rt_end();
@@ -1121,6 +1138,56 @@ out:
     rt_logbuf = 0; fl = 0; wl = 0; tl = 0; smp = 0;
     info_led_blink(3, 100, 100);
     rt_busy = 0;
+}
+
+/* ---- v16: REC button starts/stops raw recording ----
+ * RECORD button events on the R (platform/R.180/gui.h note): 0x21 press, 0x22 release.
+ * Called from handle_common_events_by_feature (gui-common.c) before the module keys.
+ * Only when the menu switch is on, in movie-mode live view, with the ML menu closed; the
+ * press and release are swallowed so Canon doesn't start H.264 recording. */
+#define RR_KEY_REC_PRESS   0x21
+#define RR_KEY_REC_UNPRESS 0x22
+static void rr_task(void *unused)
+{
+    rr_t0_ms = 0;
+    rr_active = 1; rr_stop = 0;
+    rt_last[0] = 0;
+    rt_task(0);                         /* synchronous; clears rt_busy */
+    rr_active = 0; rr_stop = 0;
+}
+
+static void rr_status_task(void *unused)
+{
+    /* on-screen status while a REC-button run is active */
+    int shown = 0;
+    for (;;)
+    {
+        msleep(250);
+        if (!rr_active) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 420, 30); shown = 0; } continue; }
+        if (gui_menu_shown()) continue;
+        uint32_t s_rec = c_done || !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
+        int used = 0;
+        for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
+        if (rr_stop) bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_RED), 8, 8, " stopping...                  ");
+        else if (!rr_t0_ms) bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK), 8, 8, " raw: starting...             ");
+        else bmp_printf(FONT(FONT_MED, COLOR_WHITE, COLOR_RED), 8, 8, " REC %02d:%02d %s  buf %d/%d   ",
+                        s_rec / 60, s_rec % 60, c_bpp == 12 ? "12b" : "14b", used, nch * kslots);
+        shown = 1;
+    }
+}
+
+int handle_rawrec_keys(struct event *event)
+{
+    if (!rr_on) return 1;
+    int p = event->param;
+    if (p != RR_KEY_REC_PRESS && p != RR_KEY_REC_UNPRESS) return 1;
+    if (!lv || !is_movie_mode() || gui_menu_shown()) return 1;
+    if (p == RR_KEY_REC_UNPRESS) return 0;
+    if (rr_active) { rr_stop = 1; return 0; }
+    if (rt_busy) return 0;              /* a test run is going: ignore, but don't start Canon recording either */
+    rt_busy = 1;
+    task_create("rr_task", 0x1e, 0x2000, rr_task, 0);
+    return 0;
 }
 
 /* ---- v14 pack test (v14.1 settings) ----
@@ -1326,6 +1393,13 @@ static struct menu_entry rt_menu[] = {
                 .max     = 2,
                 .choices = CHOICES("BIN 14-bit", "MLV 14-bit", "MLV 12-bit"),
                 .help    = "BIN: Canon's bit order (PC converter). MLV: camera writes .MLV (pack unit set to ML order).",
+            },
+            {
+                .name    = "REC button",
+                .priv    = &rr_on,
+                .max     = 1,
+                .help    = "ON: in movie mode the camera's REC button starts/stops raw recording",
+                .help2   = "(Format and Crop above, no time limit) instead of Canon video. ~1.5 s to start.",
             },
             {
                 .name    = "Sync",
@@ -1567,6 +1641,7 @@ static void rt_auto_task(void *unused)
 
 static void rt_init(void *unused)
 {
+    task_create("rr_status", 0x1f, 0x1000, rr_status_task, 0);
     menu_add("Debug", rt_menu, COUNT(rt_menu));
     task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
 }
