@@ -117,11 +117,20 @@ static volatile int rt_busy = 0;
  * (no fixed duration; stops on the next REC press, rr_stop); rr_t0/rr_frames feed the on-screen status. */
 static CONFIG_INT("r.rawrec.rec", rr_on, 0);
 static volatile int rr_active, rr_stop;
+/* v18: personal recorder front end (Movie > RAW video). REC-button clips are named like mlv_lite's
+ * (M<day>-<hhmm>.MLV at the card root). Their test diagnostics (.IDX/.SYN, USB exports, key log, timeline
+ * and write lists in the log) are written only with Debug > LV record test > REC diagnostics ON; timed test
+ * runs (menu Start, auto-run plans) always write them. */
+static CONFIG_INT("r.rawrec.diag", rr_diag, 0);
+static CONFIG_INT("r.rawrec.card10", rr_card10, 1060);       /* card write speed of the last clip, MiB/s x10 */
+static char rr_base[16];                /* clip name without extension */
+static volatile int rr_full;            /* last clip stopped because the card was nearly full */
+static inline int rt_diag(void) { return !rr_active || rr_diag; }
 static volatile int rt_osd_run;         /* auto-run "osd": show the REC status during a timed run (A/B cost test) */
 static volatile uint32_t rr_t0_ms;
 static int rt_runs = 0;
 static int rt_run_id;
-static char rt_last[48] = "";
+static char rt_last[80] = "";
 
 /* ---- log ---- */
 static char *rt_logbuf;
@@ -500,7 +509,7 @@ static void rt_survey(void)
               "in %d of %d checked IRQs\n", lim / 1000, lim / 100 % 10, sv_irq_settled, sv_irq_chk);
 
     char n[32]; snprintf(n, sizeof(n), "ML/RT%02d.SYN", rt_run_id);
-    FILE *f = FIO_CreateFile(n);
+    FILE *f = rt_diag() ? FIO_CreateFile(n) : 0;
     if (f)
     {
         uint32_t hdr[4] = { 0x4E595352, ns, ni, sizeof(struct rt_ev) };   /* "RSYN", samples, IRQs, record size */
@@ -719,9 +728,36 @@ static uint32_t rt_t0;
 
 static void rt_part_name(char *out, int run, int part)
 {
+    if (rr_active && c_mlv)             /* v18: REC-button clip, mlv_lite-style names at the card root */
+    { if (part) snprintf(out, 32, "%s.M%02d", rr_base, part - 1); else snprintf(out, 32, "%s.MLV", rr_base); return; }
     if (c_mlv) { if (part) snprintf(out, 32, "ML/RT%02d.M%02d", run, part - 1); else snprintf(out, 32, "ML/RT%02d.MLV", run); }
     else if (part) snprintf(out, 32, "ML/RT%02d.B%02d", run, part);
     else snprintf(out, 32, "ML/RT%02d.BIN", run);
+}
+
+/* v18: clip name M<day>-<hhmm> (8.3, like mlv_lite); a second clip in the same minute gets A..Z for the dash */
+static void rr_pick_name(void)
+{
+    struct tm now;
+    memset(&now, 0, sizeof(now));
+    LoadCalendarFromRTC(&now);
+    static const char sep[] = "-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (int i = 0; sep[i]; i++)
+    {
+        char n[24];
+        snprintf(rr_base, sizeof(rr_base), "M%02d%c%02d%02d", now.tm_mday, sep[i], now.tm_hour, now.tm_min);
+        snprintf(n, sizeof(n), "%s.MLV", rr_base);
+        if (!is_file(n)) return;
+    }
+}
+
+/* v18: stop before the card is full: free space at the start minus what's written, the buffer still to
+ * be written and 64 MB spare. A write that runs out of space would leave a cut-off block at the file end. */
+static uint64_t c_free0;
+static int rt_card_low(void)
+{
+    uint64_t reserve = (uint64_t)nch * kslots * slot_bytes + (64 << 20) + (uint64_t)(w_part + 2) * RT_HDR_BYTES;
+    return c_free0 && w_bytes + reserve > c_free0;
 }
 
 static void rt_writer(void *unused)
@@ -862,6 +898,7 @@ static void rt_capture_irq(void)
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
+        if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
         rt_timeline(now);
         if (take_semaphore(rt_fsem, 200))
         {
@@ -893,6 +930,7 @@ static void rt_capture_timer(uint32_t est)
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
+        if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
         if (now - (t_prev ? t_prev : t0) > 1000000) { rt_printf("no new frame for 1 s, stopping\n"); break; }
         rt_timeline(now);
 
@@ -984,10 +1022,15 @@ static void rt_task(void *unused)
     int dur_s = rr_active ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
-        char n[32], m[32];
+        char n[32], m[32], x[32];
         snprintf(n, sizeof(n), "ML/RT%02d.BIN", rt_run_id); snprintf(m, sizeof(m), "ML/RT%02d.MLV", rt_run_id);
-        if (!is_file(n) && !is_file(m)) break;
+        snprintf(x, sizeof(x), "ML/RT%02d.IDX", rt_run_id);   /* v18: clips write no RTnn.MLV; keep their .IDX apart */
+        if (!is_file(n) && !is_file(m) && !is_file(x)) break;
     }
+    if (rr_active && rt_fmt_sel == 0) rt_fmt_sel = 1;   /* v18: REC clips are always MLV (BIN = test format) */
+    if (rr_active) rr_pick_name();
+    rr_full = 0;
+    c_free0 = (uint64_t)get_free_space_32k(get_shooting_card()) * 32768;
     c_mlv = rt_fmt_sel != 0;
     c_bpp = rt_fmt_bpp[rt_fmt_sel];
     pk_applied = 0;
@@ -997,6 +1040,7 @@ static void rt_task(void *unused)
               crop_w, crop_h, full ? " (full frame)" : "", dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
               rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
+    if (rr_active) rt_printf("v18 clip %s.MLV, diagnostics %s\n", rr_base, rr_diag ? "on" : "off");
 
     /* HPTimer self-check: one 2 ms timer */
     {
@@ -1085,6 +1129,14 @@ static void rt_task(void *unused)
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
+    w_bytes = 0; w_part = 0;
+    if (rt_card_low())                  /* v18 */
+    {
+        rt_printf("card free %d MB: less than the buffer + 64 MB, not starting\n", (uint32_t)(c_free0 >> 20));
+        snprintf(rt_last, sizeof(rt_last), "card full");
+        rr_full = 1;
+        goto done;
+    }
 
     rt_begin();
     {
@@ -1199,15 +1251,23 @@ static void rt_task(void *unused)
               rt_fmt_name[rt_fmt_sel], RECORDING ? 1 : 0);
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
-    rt_flush();
-    for (int i = 0; i < ntl; i++)
-        rt_printf("TL %6d ms frames %5d drops %5d buffered %3d written %5d MB\n", tl[i].t_ms4 * 4, tl[i].frames,
-                  tl[i].drops, tl[i].used, tl[i].mb_written);
-    rt_flush();
-    for (int i = 0; i < MIN(w_n, RT_MAXW); i++)
-        rt_printf("W %6d ms %7d us %9d bytes\n", wl[i].t_ms, wl[i].us, wl[i].bytes);
-    rt_flush();
+    if (rr_active)                      /* v18: clip summary for the user */
     {
+        snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit, %d frames%s", rr_base, crop_w, crop_h, c_bpp, frames,
+                 missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
+        if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
+        if (w_n >= 20 && !w_err && card10 > 300) rr_card10 = card10;   /* menu's card speed */
+    }
+    rt_flush();
+    if (rt_diag())
+    {
+        for (int i = 0; i < ntl; i++)
+            rt_printf("TL %6d ms frames %5d drops %5d buffered %3d written %5d MB\n", tl[i].t_ms4 * 4, tl[i].frames,
+                      tl[i].drops, tl[i].used, tl[i].mb_written);
+        rt_flush();
+        for (int i = 0; i < MIN(w_n, RT_MAXW); i++)
+            rt_printf("W %6d ms %7d us %9d bytes\n", wl[i].t_ms, wl[i].us, wl[i].bytes);
+        rt_flush();
         char n[32]; snprintf(n, sizeof(n), "ML/RT%02d.IDX", rt_run_id);
         FILE *f = FIO_CreateFile(n);
         if (f) { FIO_WriteFile(f, fl, sizeof(*fl) * MIN(nfr, RT_MAXFR)); FIO_CloseFile(f); }
@@ -1222,9 +1282,10 @@ done:
     rt_unlock();
     rt_printf("done t=%d\n", get_ms_clock());
     rt_flush();
-    rt_export(rt_run_id);
+    if (rt_diag()) rt_export(rt_run_id);
     rt_runs++;
-    NotifyBox(8000, "Record test: DONE %s", rt_last);
+    if (rr_active) NotifyBox(8000, "RAW: %s%s", strncmp(rt_last, rr_base, strlen(rr_base)) ? "NOT recorded: " : "", rt_last);
+    else NotifyBox(8000, "Record test: DONE %s", rt_last);
 out:
     if (rt_logbuf) free(rt_logbuf);
     if (fl) free(fl);
@@ -1268,17 +1329,17 @@ static void rr_status_task(void *unused)
     for (;;)
     {
         msleep(250);
-        if (++tick % 4 == 0 && !rr_active && !rt_osd_run) rr_key_flush();   /* no card writes of ours during a recording */
+        if (++tick % 4 == 0 && !rr_active && !rt_osd_run && rr_diag) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics */
         int on = rr_active || rt_osd_run;
-        if (!on) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 300, 30); shown = 0; last[0] = 0; } continue; }
+        if (!on) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 400, 30); shown = 0; last[0] = 0; } continue; }
         if (gui_menu_shown() || tick % 4) continue;
         char t[40];
         uint32_t s_rec = !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
         if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
         else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
-        else snprintf(t, sizeof(t), " REC %02d:%02d ", s_rec / 60, s_rec % 60);
+        else snprintf(t, sizeof(t), " REC %02d:%02d %dx%d %db ", s_rec / 60, s_rec % 60, c_cw, c_ch, c_bpp);   /* v18: + size */
         if (shown && !strcmp(t, last)) continue;
-        if (shown && strlen(t) != strlen(last)) bmp_fill(COLOR_EMPTY, 8, 8, 300, 30);
+        if (shown && strlen(t) != strlen(last)) bmp_fill(COLOR_EMPTY, 8, 8, 400, 30);
         bmp_printf(FONT(FONT_MED, COLOR_WHITE, rr_t0_ms && !rr_stop ? COLOR_RED : COLOR_BLACK), 8, 8, "%s", t);
         snprintf(last, sizeof(last), "%s", t);
         shown = 1;
@@ -1519,6 +1580,77 @@ static MENU_UPDATE_FUNC(rt_update)
     else MENU_SET_VALUE("%d runs", rt_runs);
 }
 
+/* ---- v18: Movie > RAW video (R): the user front end for REC-button clips ---- */
+/* data rate in MiB/s x10 at 23.976p (fps30 = 0) or 29.97p; full frame = the FHD frame (4K full can't be recorded) */
+static uint32_t rr_rate10(int sel, int bpp, int fps30)
+{
+    uint32_t w = rt_crop_wh[sel][0], h = rt_crop_wh[sel][1];
+    if (!w) { w = 2304; h = 1290; }
+    uint64_t b = (uint64_t)w * h * bpp / 8;
+    return (uint32_t)(b * 10 * (fps30 ? 30000 : 24000) / 1001 / (1024 * 1024));
+}
+
+static MENU_UPDATE_FUNC(rr_main_update)
+{
+    if (!rr_on) return;
+    if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
+    int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
+    if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
+    else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
+    if (rr_active) MENU_SET_RINFO("REC");
+}
+
+static MENU_UPDATE_FUNC(rr_rate_update)
+{
+    if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
+    int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
+    uint32_t r24 = rr_rate10(rt_crop_sel, bpp, 0), r30 = rr_rate10(rt_crop_sel, bpp, 1), card = rr_card10;
+    MENU_SET_VALUE("%d / %d MiB/s", (r24 + 5) / 10, (r30 + 5) / 10);
+    MENU_SET_RINFO("card %d", (card + 5) / 10);
+    if (r24 > card)
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Too fast for the card (~%d MiB/s) even at 23.98p: frames will be lost.", card / 10);
+    else if (r30 > card)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "23.98p only: 29.97p needs %d MiB/s, the card writes ~%d.", (r30 + 5) / 10, card / 10);
+    else if (r30 * 100 > card * 95)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Close to the card's speed at 29.97p: long clips may lose frames.");
+}
+
+static struct menu_entry rr_menu[] = {
+    {
+        .name     = "RAW video (R)",
+        .priv     = &rr_on,
+        .max      = 1,
+        .update   = rr_main_update,
+        .help     = "ON: the REC button records raw MLV (no audio) instead of Canon video.",
+        .help2    = "Movie mode, ML menu closed. Clips: M<day>-<hhmm>.MLV at the card root. Open in MLV App.",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "Resolution",
+                .priv    = &rt_crop_sel,
+                .max     = 6,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216"),
+                .help    = "2560 and 2880 need Canon movie size 4K (1:1 pixels, narrower view). In FHD they shrink",
+                .help2   = "to 2304 wide. Full frame: FHD 2304x1290 (4K full frame is too fast to record).",
+            },
+            {
+                .name    = "Bit depth",
+                .priv    = &rt_fmt_sel,
+                .min     = 1,
+                .max     = 3,
+                .choices = CHOICES("BIN 14-bit", "14-bit", "12-bit", "10-bit"),
+                .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
+            },
+            {
+                .name    = "Data rate",
+                .update  = rr_rate_update,
+                .help    = "Needed at 23.98p / 29.97p. Card: write speed measured during the last clip.",
+                .help2   = "Hardware-tested: 2560x1440 10-bit 23.98p, 2560x1080 10-bit 29.97p (40 s each).",
+            },
+            MENU_EOL,
+        },
+    },
+};
+
 static struct menu_entry rt_menu[] = {
     {
         .name   = "LV record test",
@@ -1547,11 +1679,11 @@ static struct menu_entry rt_menu[] = {
                 .help    = "BIN: Canon's bit order (PC converter). MLV: camera writes .MLV (pack unit set to ML order).",
             },
             {
-                .name    = "REC button",
-                .priv    = &rr_on,
+                .name    = "REC diagnostics",
+                .priv    = &rr_diag,
                 .max     = 1,
-                .help    = "ON: in movie mode the camera's REC button starts/stops raw recording",
-                .help2   = "(Format and Crop above, no time limit) instead of Canon video. Key log: ML/RRKEYS.TXT",
+                .help    = "ON: REC-button clips also write test files: ML/RTnn.IDX/.SYN, ML/RRKEYS.TXT, the full",
+                .help2   = "log and USB copies in DCIM. REC button switch: Movie > RAW video (R).",
             },
             {
                 .name    = "Sync",
@@ -1817,6 +1949,7 @@ static void rt_auto_task(void *unused)
 static void rt_init(void *unused)
 {
     task_create("rr_status", 0x1f, 0x1000, rr_status_task, 0);
+    menu_add("Movie", rr_menu, COUNT(rr_menu));       /* v18: user front end */
     menu_add("Debug", rt_menu, COUNT(rt_menu));
     task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
 }
