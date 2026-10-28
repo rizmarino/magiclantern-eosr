@@ -988,8 +988,12 @@ static struct menu_entry rt_menu[] = {
     },
 };
 
-/* ---- export for USB: the R's PTP shows only DCIM/ and MISC/, so copy the
- * small result files there (test which names/places become visible) ---- */
+/* ---- export for USB: over PTP the R shows only files in DCIM/100EOS_R with
+ * image-like names (v13.2 probe: RTPB0002.JPG visible; .TXT files, MISC and the
+ * DCIM root hidden). So copy the small result files there as RTxx00nn.JPG
+ * (nn = run). Canon playback shows them as unreadable images; harmless. ---- */
+#define RT_EXPORT_DIR "DCIM/100EOS_R/"
+
 static void rt_copy_file(const char *src, const char *dst)
 {
     int len = 0;
@@ -1002,34 +1006,37 @@ static void rt_copy_file(const char *src, const char *dst)
 
 static void rt_export(int run)
 {
-    char s[32], d[40];
-    rt_copy_file("ML/RECTEST.TXT", "DCIM/100EOS_R/RTLG0001.TXT");
-    rt_copy_file("ML/RECTEST.TXT", "MISC/RECTEST.TXT");
-    if (run < 0) return;
-    snprintf(s, sizeof(s), "ML/RT%02d.IDX", run); snprintf(d, sizeof(d), "DCIM/100EOS_R/RTIX%04d.DAT", run); rt_copy_file(s, d);
-    snprintf(s, sizeof(s), "ML/RT%02d.SYN", run); snprintf(d, sizeof(d), "DCIM/100EOS_R/RTSY%04d.DAT", run); rt_copy_file(s, d);
+    char s[32], d[48];
+    snprintf(d, sizeof(d), RT_EXPORT_DIR "RTLG%04d.JPG", run); rt_copy_file("ML/RECTEST.TXT", d);
+    snprintf(s, sizeof(s), "ML/RT%02d.IDX", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTIX%04d.JPG", run); rt_copy_file(s, d);
+    snprintf(s, sizeof(s), "ML/RT%02d.SYN", run); snprintf(d, sizeof(d), RT_EXPORT_DIR "RTSY%04d.JPG", run); rt_copy_file(s, d);
 }
 
-static void rt_probe_files(void)
+/* status for USB: which plan ran, and what's left */
+static void rt_status(const char *fmt, ...)
 {
-    static const char *names[] = { "DCIM/100EOS_R/RTPB0001.TXT", "DCIM/100EOS_R/RTPB0002.JPG", "MISC/RTPROBE.TXT",
-                                    "DCIM/RTPROBE.TXT" };
-    char t[64];
-    int n = snprintf(t, sizeof(t), "rectest probe, boot t=%d\n", get_ms_clock());
-    for (int i = 0; i < COUNT(names); i++)
-    {
-        FILE *f = FIO_CreateFile(names[i]);
-        if (f) { FIO_WriteFile(f, t, n); FIO_CloseFile(f); }
-    }
+    char t[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(t, sizeof(t) - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    n = MIN(n, (int)sizeof(t) - 2);
+    t[n++] = '\n';
+    FILE *f = FIO_CreateFile(RT_EXPORT_DIR "RTST0000.JPG");
+    if (f) { FIO_WriteFile(f, t, n); FIO_CloseFile(f); }
 }
 
-/* ---- auto-run: ML/RTAUTO.TXT, for unattended runs over USB ----
- * Read 10 s after boot. Lines: "<crop height> <seconds> <sync>", e.g.
- * "1080 20 auto", "960 10 timer" (max 6 runs); '#' starts a comment.
- * Renamed to RTAUTO.RUN before the first run, so a freeze + battery pull can
- * never re-run it on the next boot; RTAUTO.RUN -> RTAUTO.DON when finished. */
+/* ---- auto-run: ML/RTAUTO.TXT, unattended runs ----
+ * Read 10 s after boot. Plans are separated by lines starting with "---";
+ * each boot runs the next plan (ML/RTAUTO.POS holds its number). A plan has up
+ * to 6 lines "<crop height> <seconds> <auto|irq|timer>", e.g. "1080 20 auto";
+ * '#' starts a comment. Waits up to 30 s for live view; without it (e.g. USB
+ * cable in: PC-connection screen) nothing is used up. RTAUTO.POS is advanced
+ * before the plan runs, so a freeze + battery pull skips that plan instead of
+ * looping. After the last plan RTAUTO.TXT is renamed to RTAUTO.DON. */
 #define RT_AUTO_CFG "ML/RTAUTO.TXT"
-#define RT_AUTO_RUN "ML/RTAUTO.RUN"
+#define RT_AUTO_POS "ML/RTAUTO.POS"
 #define RT_AUTO_DON "ML/RTAUTO.DON"
 
 static int rt_auto_skipped;
@@ -1070,40 +1077,102 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
     return n;
 }
 
+/* find plan k (0-based) in the text: start offset and length of its chunk; returns number of plans */
+static int rt_auto_plan(const char *t, int len, int k, int *start, int *plen)
+{
+    int np = 0, ls = 0, cs = 0;
+    *start = 0; *plen = 0;
+    for (int i = 0; i <= len; i++)
+    {
+        if (i < len && t[i] != '\n') continue;
+        int sep = i - ls >= 3 && t[ls] == '-' && t[ls + 1] == '-' && t[ls + 2] == '-';
+        if (sep || i == len)
+        {
+            int end = sep ? ls : len;
+            if (np == k) { *start = cs; *plen = end - cs; }
+            np++;
+            cs = i + 1;
+        }
+        ls = i + 1;
+    }
+    return np;
+}
+
+static int rt_read_int(const char *name, int dflt)
+{
+    int len = 0, v = 0, any = 0;
+    char *b = (char *)read_entire_file(name, &len);
+    if (!b) return dflt;
+    for (int i = 0; i < len && b[i] >= '0' && b[i] <= '9'; i++) { v = v * 10 + b[i] - '0'; any = 1; }
+    fio_free(b);
+    return any ? v : dflt;
+}
+
+static void rt_write_int(const char *name, int v)
+{
+    char t[16];
+    int n = snprintf(t, sizeof(t), "%d\n", v);
+    FILE *f = FIO_CreateFile(name);
+    if (f) { FIO_WriteFile(f, t, n); FIO_CloseFile(f); }
+}
+
 static void rt_auto_task(void *unused)
 {
     msleep(10000);
-    rt_probe_files();
     if (!is_file(RT_AUTO_CFG)) return;
     int len = 0;
     char *t = (char *)read_entire_file(RT_AUTO_CFG, &len);
+    if (!t) return;
+    int pos = rt_read_int(RT_AUTO_POS, 0), ps, pl;
+    int np = rt_auto_plan(t, len, pos, &ps, &pl);
     int runs[6][3];
     rt_auto_skipped = 0;
-    int n = t ? rt_auto_parse(t, len, runs, 6) : 0;
-    if (t) fio_free(t);
-    FIO_RemoveFile(RT_AUTO_RUN);
-    FIO_RemoveFile(RT_AUTO_DON);
-    if (FIO_RenameFile(RT_AUTO_CFG, RT_AUTO_RUN)) { NotifyBox(6000, "Record test auto: cannot rename cfg, not running"); return; }
+    int n = pos < np ? rt_auto_parse(t + ps, pl, runs, 6) : 0;
+    fio_free(t);
+    if (pos >= np)
+    {
+        FIO_RemoveFile(RT_AUTO_DON);
+        FIO_RenameFile(RT_AUTO_CFG, RT_AUTO_DON);
+        FIO_RemoveFile(RT_AUTO_POS);
+        rt_status("auto: all %d plans done", np);
+        return;
+    }
     for (int w = 0; w < 30 && !lv; w++) msleep(1000);
-    if (!lv || !n) { NotifyBox(6000, "Record test auto: %s", !n ? "no valid runs in cfg" : "no live view"); FIO_RenameFile(RT_AUTO_RUN, RT_AUTO_DON); return; }
+    if (!lv)
+    {
+        NotifyBox(6000, "Record test auto: no live view, plan %d of %d kept", pos + 1, np);
+        rt_status("auto: plan %d of %d waiting (no live view at boot)", pos + 1, np);
+        return;
+    }
+    rt_write_int(RT_AUTO_POS, pos + 1);     /* before running: a freeze can't repeat this plan */
     if (rt_auto_skipped)
     {
         NotifyBox(5000, "Record test auto: %d invalid line(s) skipped", rt_auto_skipped);
         msleep(5000);
     }
+    if (!n) rt_status("auto: plan %d of %d has no valid runs", pos + 1, np);
+    int first_run = -1;
     for (int i = 0; i < n; i++)
     {
         while (rt_busy) msleep(500);
         rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2];
-        NotifyBox(3000, "Record test auto: run %d of %d", i + 1, n);
+        NotifyBox(3000, "Record test auto: plan %d/%d, run %d of %d", pos + 1, np, i + 1, n);
+        rt_status("auto: plan %d of %d, run %d of %d in progress", pos + 1, np, i + 1, n);
         msleep(3000);
         rt_busy = 1;
         rt_last[0] = 0;
         rt_task(0);                     /* synchronous; clears rt_busy */
+        if (first_run < 0) first_run = rt_run_id;
         msleep(3000);
     }
-    FIO_RenameFile(RT_AUTO_RUN, RT_AUTO_DON);
-    NotifyBox(10000, "Record test auto: all %d runs DONE", n);
+    if (pos + 1 >= np)
+    {
+        FIO_RemoveFile(RT_AUTO_DON);
+        FIO_RenameFile(RT_AUTO_CFG, RT_AUTO_DON);
+        FIO_RemoveFile(RT_AUTO_POS);
+    }
+    rt_status("auto: plan %d of %d done, runs RT%02d..RT%02d; last: %s", pos + 1, np, first_run, rt_run_id, rt_last);
+    NotifyBox(10000, "Record test auto: plan %d of %d DONE (%d runs)", pos + 1, np, n);
 }
 
 static void rt_init(void *unused)
