@@ -1,22 +1,31 @@
-/* riz/eosr-dmlog v12: sustained LV raw record test (EOS R 1.8.0).
+/* riz/eosr-dmlog v13: frame-synchronous LV raw record test (EOS R 1.8.0).
  * Personal diagnostic build, not for upstream.
  *
- * v11 proved Canon's MemoryToMemoryEsub1 EDMAC copies a 1920x1080 14-bit
- * crop out of the MEM1 raw buffer in ~5 ms, and that one setup serves many
- * copies. The burst was then limited by card writes of one 3.6 MB frame each
- * (79 MiB/s). This test records for 10/20/40 s the way a recorder would:
- *  - buffers: up to 10 contiguous shoot_malloc chunks of K frame slots each
- *    (K chosen so a chunk is ~16 MB; slots padded to 4 KiB), as mlv_lite does;
- *  - capture task: waits for each new frame (bottom crop row changes), sleeps
- *    between frames once the frame interval is known, copies the crop with
- *    EDMAC (one setup for the whole run) into the next free slot; when no
- *    slot is free the frame is dropped and counted;
- *  - writer task (higher priority): writes each full chunk with ONE
- *    FIO_WriteFile call to ML/RTnn.BIN (new part file every ~2 GB).
- * Logs ML/RECTEST.TXT (summary, timeline, per-write times) and ML/RTnn.IDX
- * (8 bytes per frame: time, DMA time, latency, flags).
+ * v12 showed the card keeps up (110 MiB/s with ~15 MB writes) but a polling
+ * capture loop at task priority 0x1e is starved in LV (msleep(1) = 2..46 ms):
+ * at 29.97p 26 frames were never seen, 45 saved twice and 16 torn.
+ * v13 syncs to the frame instead of polling:
+ *  - IRQ sync: Mem1Path (lv_save_raw) programs EDMAC port 3 and registers an
+ *    empty complete-CBR (0xE0638680: bx lr) with RegisterEDmacCompleteCBR
+ *    (0xE0535A82). The EDMAC ISR (0xE0537990) calls table[port] = {cbr, ctx}
+ *    at RAM 0x73DE8 on transfer complete. We swap port 3's cbr for a wrapper
+ *    (records time + row hashes, wakes the capture task, then calls Canon's
+ *    cbr) and put it back afterwards (only if Canon hasn't replaced it).
+ *  - Timer sync (fallback / for comparison): HPTimer wakes the capture task
+ *    3 ms before the next frame is due, then it polls briefly.
+ *  - Capture task at priority 0x12; it blocks between frames and never spins
+ *    for long. Duplicate guard: a frame whose bottom crop row equals the last
+ *    saved frame's is skipped.
+ * Before recording, a 1 s survey (HPTimer sampling the crop's top/bottom rows
+ * every 1 ms, plus the IRQ log) measures frame period, readout and where the
+ * IRQ falls; raw data -> ML/RTnn.SYN. Auto mode uses IRQ sync only if the
+ * survey shows one IRQ per new frame.
+ * Buffers/writer as v12: contiguous shoot_malloc chunks of ~16 MB, one
+ * FIO_WriteFile per chunk -> ML/RTnn.BIN (.Bxx every ~2 GB); log
+ * ML/RECTEST.TXT, per-frame ML/RTnn.IDX.
  * Every DMA wait has a timeout; on a timeout EDMAC is reset and released and
- * the run stops. No ROM writes, no property changes.
+ * the run stops. No ROM writes, no property changes; the only write to Canon
+ * RAM is the port-3 CBR pointer, restored at the end.
  */
 #include "dryos.h"
 #include "menu.h"
@@ -45,6 +54,8 @@ static void  (*const EdmacBoomerOff)(int port)                  = (void *)0xE053
 static void  (*const EdmacReset)(int port)                      = (void *)0xE0535999;
 #define RT_DMA_TIMER() GET_DIGIC_TIMER()
 #define RT_SYNC_CACHES() sync_caches()
+#define RT_DMB() asm volatile("dmb" ::: "memory")
+#define RT_CALL_ORIG(f, ctx) ((void (*)(void *))(f))(ctx)
 #else
 #include "rt_host.h"
 #endif
@@ -54,10 +65,14 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define RT_RD_PORT     0x2E
 #define RT_WR_PORT     0x0D
 
-#define RT_PATH    0x133CC              /* Mem1Path struct */
+#define RT_PATH    0x133CC              /* Mem1Path struct; +0x50 = initialised (port 3 CBR registered) */
 #define RT_BUF     0x28EEA940
 #define RT_BUFLEN  0xFB9D90
 #define RT_UNC     0x40000000
+
+#define EDMAC_CBR_TABLE 0x73DE8         /* {cbr, ctx} per port (RegisterEDmacCompleteCBR 0xE0535A82) */
+#define M1_PORT         3
+#define M1_CBR_CANON    0xE0638681      /* Mem1Path's complete CBR: bx lr */
 
 #define RT_MAXCH      10
 #define RT_CHUNK_TGT  (16 * 1024 * 1024)
@@ -65,23 +80,31 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define RT_MAXFR      3000
 #define RT_MAXW       1024
 #define RT_MAXTL      480               /* 250 ms timeline samples */
+#define RT_MAXIRQ     96
+#define RT_NSMP       1000              /* survey: 1 ms samples */
 #define RT_LOGLEN     0x10000
 #define RT_TIMEOUT    500               /* ms per DMA wait */
+#define RT_CAP_PRIO   0x12
 
 /* per-frame flags in the .IDX */
 #define F_DROP   1                      /* no free slot: not recorded */
-#define F_LATE   2                      /* first poll after a sleep already saw the new frame */
-#define F_TEAR   4                      /* top crop row changed before the copy started (not late) */
+#define F_LATE   2                      /* timer mode: frame already there on the first poll after the wake */
+#define F_TEAR   4                      /* top crop row changed before the copy started */
 #define F_TOPCHG 8                      /* top crop row changed during the copy (informational) */
 #define F_BOTCHG 16                     /* bottom crop row changed before the copy ended: torn */
+#define F_DUP    32                     /* same bottom row as the last saved frame: skipped */
 
+enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
 static int rt_crop_sel = 0;             /* 1920x1080, 1920x960, 1920x800 */
 static int rt_dur_sel = 1;              /* 10, 20, 40 s */
+static int rt_sync_sel = SYNC_AUTO;
 static const int rt_crop_h[] = { 1080, 960, 800 };
 static const int rt_dur_s[] = { 10, 20, 40 };
+static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
 
 static volatile int rt_busy = 0;
 static int rt_runs = 0;
+static int rt_run_id;
 static char rt_last[48] = "";
 
 /* ---- log ---- */
@@ -111,8 +134,22 @@ static void rt_flush(void)
 }
 
 static inline uint32_t rt_us(void) { return (uint32_t)get_us_clock(); }
+static inline uint32_t d20(uint32_t a, uint32_t b) { return (a - b) & 0xFFFFF; }   /* DIGIC timer difference */
 
-/* ---- EDMAC m2m (sequence as Canon's EFsCropVcopy; verified on camera in v11) ---- */
+static void sort_u32(uint32_t *v, int n)
+{
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && v[j - 1] > v[j]; j--) { uint32_t t = v[j]; v[j] = v[j - 1]; v[j - 1] = t; }
+}
+
+static uint32_t median_u32(uint32_t *v, int n)
+{
+    if (n <= 0) return 0;
+    sort_u32(v, n);
+    return n & 1 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+}
+
+/* ---- EDMAC m2m (sequence as Canon's EFsCropVcopy; verified on camera in v11/v12) ---- */
 static uint32_t rt_res_ids[2] = { 0x000100AD, 0x000100BB };
 static void *rt_entry;
 static int rt_locked, rt_begun;
@@ -190,7 +227,7 @@ static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_
     M2mStart();
     int r = take_semaphore(rt_dsem, RT_TIMEOUT);
     if (r || rt_cbr_n == n0) { *dma_us = 0; return r ? r : -1; }
-    *dma_us = (rt_cbr_t - t0) & 0xFFFFF;
+    *dma_us = d20(rt_cbr_t, t0);
     return 0;
 }
 
@@ -213,25 +250,22 @@ static void rt_alloc_chunks(void)
     uint32_t want = kslots * slot_bytes + 4096;
     for (int i = 0; i < RT_MAXCH; i++)
     {
-        uint32_t t = rt_us();
         struct memSuite *s = shoot_malloc_suite_contig(want);
-        t = rt_us() - t;
-        if (!s) { rt_printf("chunk %d: shoot_malloc_suite_contig(%d) failed (%d us)\n", i, want, t); break; }
+        if (!s) { rt_printf("chunk %d: shoot_malloc_suite_contig(%d) failed\n", i, want); break; }
         struct memChunk *c = GetFirstChunkFromSuite(s);
         uint32_t a = (uint32_t)GetMemoryAddressOfMemoryChunk(c);
         uint32_t sz = GetSizeOfMemoryChunk(c);
+        if (sz < want) { rt_printf("chunk %d smaller than requested (%d), dropping it\n", i, sz); shoot_free_suite(s); break; }
         ch[i].suite = s;
         ch[i].base = ((uint32_t)UNCACHEABLE(a) + 4095) & ~4095;
         ch[i].state = CH_FREE; ch[i].n = 0;
         nch++;
-        rt_printf("chunk %d: %08x size %d (%d us)\n", i, a, sz, t);
-        if (sz < want) { rt_printf("chunk %d smaller than requested, dropping it\n", i); nch--; shoot_free_suite(s); ch[i].suite = 0; break; }
     }
     RT_SYNC_CACHES();                   /* no dirty cache lines may later land on DMA-written data */
 }
 
-/* ---- live frame detection ---- */
-static uint32_t m1_w, m1_h, pitch, ubuf;
+/* ---- MEM1 row probes ---- */
+static uint32_t m1_w, m1_h, pitch, ubuf, r_top, r_bot;
 
 static uint32_t rt_probe(uint32_t row)
 {
@@ -244,18 +278,215 @@ static uint32_t rt_probe(uint32_t row)
     return h;
 }
 
+/* value once the row has been unchanged for 50 us. Re-reads before every time
+ * check: v12 could return a stale mid-write value after being preempted. */
 static uint32_t rt_probe_stable(uint32_t row)
 {
     uint32_t a = rt_probe(row);
     uint32_t t0 = rt_us(), t = t0;
     for (;;)
     {
-        uint32_t now = rt_us();
-        if (now - t >= 50 || now - t0 > 2000) break;
         uint32_t b = rt_probe(row);
-        if (b != a) { a = b; t = now; }
+        uint32_t now = rt_us();
+        if (b != a) { a = b; t = now; continue; }
+        if (now - t >= 50 || now - t0 > 2000) break;
     }
     return a;
+}
+
+/* ---- frame-end IRQ hook ---- */
+static struct semaphore *rt_fsem;       /* wakes the capture task (IRQ, HPTimer) */
+static uint32_t hook_orig;
+static int hook_on;
+static volatile uint32_t irq_seq, irq_n, irq_t, irq_top, irq_bot;
+static volatile int irq_armed, irq_log_on, irq_log_n;
+struct rt_ev { uint32_t t, top, bot; };
+static struct rt_ev *irq_log;           /* allocated once, never freed (the ISR may use it) */
+
+static void rt_m1_isr(void *ctx)
+{
+    uint32_t t = RT_DMA_TIMER();
+    uint32_t top = rt_probe(r_top), bot = rt_probe(r_bot);
+    irq_seq++;
+    RT_DMB();
+    irq_t = t; irq_top = top; irq_bot = bot; irq_n++;
+    RT_DMB();
+    irq_seq++;
+    if (irq_log_on && irq_log_n < RT_MAXIRQ)
+    {
+        irq_log[irq_log_n].t = t; irq_log[irq_log_n].top = top; irq_log[irq_log_n].bot = bot;
+        irq_log_n++;
+    }
+    if (irq_armed) give_semaphore(rt_fsem);
+    RT_CALL_ORIG(hook_orig, ctx);
+}
+
+static int rt_hook(void)
+{
+    uint32_t e = EDMAC_CBR_TABLE + M1_PORT * 8;
+    uint32_t cbr = MEM(e), ctx = MEM(e + 4), init = MEM(RT_PATH + 0x50);
+    rt_printf("port 3 complete CBR %08x ctx %08x, Mem1Path initialised %d\n", cbr, ctx, init);
+    if (cbr != M1_CBR_CANON || init != 1) { rt_printf("not Canon's Mem1Path CBR: no IRQ hook\n"); return -1; }
+    hook_orig = cbr;
+    irq_n = 0;
+    RT_DMB();
+    MEM(e) = (uint32_t)&rt_m1_isr;
+    hook_on = 1;
+    return 0;
+}
+
+static void rt_unhook(void)
+{
+    if (!hook_on) return;
+    uint32_t e = EDMAC_CBR_TABLE + M1_PORT * 8;
+    irq_armed = 0; irq_log_on = 0;
+    if (MEM(e) == (uint32_t)&rt_m1_isr) { MEM(e) = hook_orig; rt_printf("IRQ hook removed, %d IRQs seen\n", irq_n); }
+    else rt_printf("IRQ hook was already replaced by Canon (%08x), left alone\n", MEM(e));
+    hook_on = 0;
+}
+
+static int rt_irq_snapshot(uint32_t *n, uint32_t *t, uint32_t *top, uint32_t *bot)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        uint32_t s1 = irq_seq;
+        RT_DMB();
+        *n = irq_n; *t = irq_t; *top = irq_top; *bot = irq_bot;
+        RT_DMB();
+        if (s1 == irq_seq && !(s1 & 1)) return 0;
+    }
+    return -1;
+}
+
+/* ---- HPTimer: self-check, survey sampler, wake-up ---- */
+static volatile uint32_t hpt_fired;
+static int hpt_ok;
+static struct rt_ev *smp;
+static volatile int smp_n, smp_over;
+
+static void rt_hpt_chk(int last_expiry, void *p) { hpt_fired = RT_DMA_TIMER(); give_semaphore(rt_fsem); }
+static void rt_hpt_wake(int last_expiry, void *p) { give_semaphore(rt_fsem); }
+
+static void rt_smp_over(int last_expiry, void *p);
+static void rt_smp_cbr(int last_expiry, void *p)
+{
+    if (smp_n < RT_NSMP)
+    {
+        smp[smp_n].t = RT_DMA_TIMER(); smp[smp_n].top = rt_probe(r_top); smp[smp_n].bot = rt_probe(r_bot);
+        smp_n++;
+    }
+    if (smp_n < RT_NSMP) SetHPTimerNextTick(last_expiry, 1000, rt_smp_cbr, rt_smp_over, 0);
+    else give_semaphore(rt_fsem);
+}
+
+static void rt_smp_over(int last_expiry, void *p)
+{
+    smp_over++;
+    if (smp_n < RT_NSMP && smp_over < 200) SetHPTimerAfterNow(1000, rt_smp_cbr, rt_smp_over, 0);
+    else give_semaphore(rt_fsem);
+}
+
+static void rt_drain(struct semaphore *s)
+{
+    for (int i = 0; i < 1000 && !take_semaphore(s, 1); i++) ;
+}
+
+/* ---- survey: 1 s of 1 ms samples + IRQ log ---- */
+static uint32_t sv_est, sv_irq_med, sv_readout, sv_irq_after_bot, sv_irq_to_top;
+static int sv_irq_n, sv_irq_new, sv_bot_events, sv_irq_chk, sv_irq_settled;
+
+static void rt_survey(void)
+{
+    sv_est = sv_irq_med = sv_readout = sv_irq_after_bot = sv_irq_to_top = 0;
+    sv_irq_n = sv_irq_new = sv_bot_events = sv_irq_chk = sv_irq_settled = 0;
+    smp_n = 0; smp_over = 0; irq_log_n = 0;
+    irq_log_on = hook_on;
+    rt_drain(rt_fsem);
+    if (hpt_ok)
+    {
+        int r = SetHPTimerAfterNow(1000, rt_smp_cbr, rt_smp_over, 0);
+        if (r & 1) { rt_printf("survey: SetHPTimerAfterNow returned %d\n", r); msleep(1000); }
+        else take_semaphore(rt_fsem, 3000);
+    }
+    else msleep(1000);
+    irq_log_on = 0;
+    int ns = smp_n, ni = irq_log_n;
+    rt_printf("survey: %d samples (%d overruns), %d IRQs\n", ns, smp_over, ni);
+
+    /* change events in the samples (new value vs the previous sample; >3 ms apart = new event) */
+    uint32_t *bt = malloc(3 * 200 * sizeof(uint32_t));
+    if (!bt) { rt_printf("survey: no memory for analysis\n"); return; }
+    uint32_t *tt = bt + 200, *tmp = bt + 400;
+    int nb = 0, nt = 0, k;
+    for (int i = 1; i < ns; i++)
+    {
+        if (smp[i].bot != smp[i - 1].bot && nb < 200 && (!nb || d20(smp[i].t, bt[nb - 1]) > 3000)) bt[nb++] = smp[i].t;
+        if (smp[i].top != smp[i - 1].top && nt < 200 && (!nt || d20(smp[i].t, tt[nt - 1]) > 3000)) tt[nt++] = smp[i].t;
+    }
+    sv_bot_events = nb;
+    k = 0;
+    for (int i = 1; i < nb; i++) tmp[k++] = d20(bt[i], bt[i - 1]);
+    sv_est = median_u32(tmp, k);
+    k = 0;                              /* readout: top change -> following bottom change */
+    for (int i = 0; i < nb; i++)
+    {
+        uint32_t best = 0xFFFFFFFF;
+        for (int j = 0; j < nt; j++) { uint32_t d = d20(bt[i], tt[j]); if (d < best) best = d; }
+        if (best < (sv_est ? sv_est : 200000)) tmp[k++] = best;
+    }
+    sv_readout = median_u32(tmp, k);
+
+    sv_irq_n = ni;
+    k = 0;
+    for (int i = 1; i < ni; i++) { tmp[k++] = d20(irq_log[i].t, irq_log[i - 1].t); if (irq_log[i].bot != irq_log[i - 1].bot) sv_irq_new++; }
+    sv_irq_med = median_u32(tmp, k);
+    k = 0;                              /* IRQ: time since the last bottom change */
+    for (int i = 0; i < ni; i++)
+    {
+        uint32_t best = 0xFFFFFFFF;
+        for (int j = 0; j < nb; j++) { uint32_t d = d20(irq_log[i].t, bt[j]); if (d < best) best = d; }
+        if (best < 500000) tmp[k++] = best;
+    }
+    sv_irq_after_bot = median_u32(tmp, k);
+    k = 0;                              /* IRQ: time until the next top change */
+    for (int i = 0; i < ni; i++)
+    {
+        uint32_t best = 0xFFFFFFFF;
+        for (int j = 0; j < nt; j++) { uint32_t d = d20(tt[j], irq_log[i].t); if (d < best) best = d; }
+        if (best < 500000) tmp[k++] = best;
+    }
+    sv_irq_to_top = median_u32(tmp, k);
+    /* the IRQ must mark a frame that has just completed: the bottom crop row
+     * changed within the last 8 ms, and the next frame hasn't reached the top
+     * crop row yet (no top change within 1 ms after the IRQ) */
+    if (nb)
+        for (int i = 0; i < ni; i++)
+        {
+            uint32_t ab = 0xFFFFFFFF, nt_ = 0xFFFFFFFF;
+            for (int j = 0; j < nb; j++) { uint32_t d = d20(irq_log[i].t, bt[j]); if (d < ab) ab = d; }
+            for (int j = 0; j < nt; j++) { uint32_t d = d20(tt[j], irq_log[i].t); if (d < nt_) nt_ = d; }
+            if (ab > 500000) continue;      /* no sample coverage around this IRQ */
+            sv_irq_chk++;
+            if (ab < 8000 && nt_ > 1000) sv_irq_settled++;
+        }
+    rt_printf("survey: %d bottom-row changes, period %d us; readout (top->bottom crop row) %d us\n", nb, sv_est, sv_readout);
+    rt_printf("survey: IRQ period %d us, %d of %d IRQ intervals had a new bottom row; IRQ %d us after the bottom-row "
+              "change; next top-row change %d us after the IRQ\n", sv_irq_med, sv_irq_new, ni > 1 ? ni - 1 : 0,
+              sv_irq_after_bot, sv_irq_to_top);
+    rt_printf("survey: IRQ right after a completed frame (bottom row changed < 8 ms before, top row not yet) "
+              "in %d of %d checked IRQs\n", sv_irq_settled, sv_irq_chk);
+
+    char n[32]; snprintf(n, sizeof(n), "ML/RT%02d.SYN", rt_run_id);
+    FILE *f = FIO_CreateFile(n);
+    if (f)
+    {
+        uint32_t hdr[4] = { 0x4E595352, ns, ni, sizeof(struct rt_ev) };   /* "RSYN", samples, IRQs, record size */
+        FIO_WriteFile(f, hdr, sizeof(hdr));
+        if (ns) FIO_WriteFile(f, smp, ns * sizeof(struct rt_ev));
+        if (ni) FIO_WriteFile(f, irq_log, ni * sizeof(struct rt_ev));
+        FIO_CloseFile(f);
+    }
+    free(bt);
 }
 
 /* ---- writer ---- */
@@ -268,15 +499,13 @@ static char w_name[32];
 static uint32_t w_fsize;
 struct rt_wrec { uint32_t t_ms, us, bytes; };
 static struct rt_wrec *wl;
+static uint32_t rt_t0;
 
 static void rt_part_name(char *out, int run, int part)
 {
     if (part) snprintf(out, 32, "ML/RT%02d.B%02d", run, part);
     else snprintf(out, 32, "ML/RT%02d.BIN", run);
 }
-
-static int rt_run_id;
-static uint32_t rt_t0;
 
 static void rt_writer(void *unused)
 {
@@ -314,42 +543,190 @@ static void rt_writer(void *unused)
 }
 
 /* ---- capture ---- */
-struct rt_frame { uint32_t t_us; uint16_t dma_us; uint8_t lat; uint8_t flags; };   /* lat: 0.1 ms units, 255 = unknown */
+struct rt_frame { uint32_t t_us; uint16_t dma_us; uint8_t lat; uint8_t flags; };   /* lat: 0.1 ms, 255 = >= 25.5 ms */
 struct rt_tl { uint16_t t_ms4; uint16_t frames; uint16_t drops; uint16_t used; uint32_t mb_written; };
 static struct rt_frame *fl;
 static struct rt_tl *tl;
 
-static void sort_u32(uint32_t *v, int n)
+static int c_mode, c_dur_s;
+static uint32_t c_src, c_rb, c_ch, c_est;
+static int nfr, frames, drops, dups, missed, late, tears, topchg, botchg, ntl, irq_timeouts;
+static int cur, next_fill, first_drop_ms, c_abort;
+static uint32_t first_t, next_tl, max_used, dmax, dsum, last_rec_bot, t_last_ev;
+static volatile int c_done;
+static struct semaphore *rt_csem;
+
+static void rt_timeline(uint32_t now)
 {
-    for (int i = 1; i < n; i++)
-        for (int j = i; j > 0 && v[j - 1] > v[j]; j--) { uint32_t t = v[j]; v[j] = v[j - 1]; v[j - 1] = t; }
+    if (!first_t || now - first_t < next_tl || ntl >= RT_MAXTL) return;
+    int used = 0;
+    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
+    tl[ntl].t_ms4 = (now - first_t) / 4000; tl[ntl].frames = frames; tl[ntl].drops = drops;
+    tl[ntl].used = used; tl[ntl].mb_written = (uint32_t)(w_bytes >> 20); ntl++;
+    next_tl += 250000;
 }
 
-/* watch 9 frames without copying: frame interval (median of 8) and the time
- * from the top crop row changing to the bottom crop row changing (readout) */
-static uint32_t rd_meas[8];
-static int nrd;
-
-static uint32_t rt_warmup(uint32_t r_top, uint32_t r_bot)
+/* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
+ * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
+static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
 {
-    uint32_t iv[8], niv = 0, t_prev = 0, top_t = 0;
-    uint32_t prevb = rt_probe_stable(r_bot), prevt = rt_probe(r_top), t0 = rt_us();
-    nrd = 0;
-    while (niv < 8 && rt_us() - t0 < 2000000)
+    if (!first_t) { first_t = td; next_tl = 0; }
+    uint32_t us = 0;
+    if (frames && bot_ref == last_rec_bot)
     {
-        uint32_t vt = rt_probe(r_top);
-        if (vt != prevt) { prevt = vt; top_t = rt_us(); }
-        if (rt_probe(r_bot) == prevb) continue;
+        flags |= F_DUP; dups++;
+    }
+    else
+    {
+        uint32_t dst = 0;
+        if (cur < 0 && ch[next_fill].state == CH_FREE) { cur = next_fill; ch[cur].n = 0; ch[cur].state = CH_FILL; }
+        if (cur >= 0) dst = ch[cur].base + ch[cur].n * slot_bytes;
+        if (!dst)
+        {
+            flags |= F_DROP; drops++;
+            if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+        }
+        else
+        {
+            uint32_t top0 = rt_probe(r_top);
+            if (top0 != top_ref) { flags |= F_TEAR; tears++; }
+            if (rt_copy(c_src, pitch, dst, c_rb, c_ch, &us))
+            {
+                rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
+                rt_fail();
+                return -1;
+            }
+            if (rt_probe(r_top) != top0) { flags |= F_TOPCHG; topchg++; }
+            if (rt_probe(r_bot) != bot_ref) { flags |= F_BOTCHG; botchg++; }
+            frames++; dsum += us; if (us > dmax) dmax = us;
+            last_rec_bot = bot_ref;
+            if (++ch[cur].n == kslots)
+            {
+                ch[cur].state = CH_FULL;
+                give_semaphore(rt_wsem);
+                next_fill = (cur + 1) % nch;
+                cur = -1;
+            }
+        }
+    }
+    if (flags & F_LATE) late++;
+    if (nfr < RT_MAXFR)
+    {
+        fl[nfr].t_us = td - first_t; fl[nfr].dma_us = MIN(us, 65535);
+        fl[nfr].lat = MIN(lat_us / 100, 255); fl[nfr].flags = flags;
+    }
+    nfr++;
+    int used = 0;
+    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
+    if ((uint32_t)used > max_used) max_used = used;
+    return 0;
+}
+
+static void rt_capture_irq(void)
+{
+    uint32_t n_last, n, t, top, bot;
+    rt_drain(rt_fsem);
+    rt_irq_snapshot(&n_last, &t, &top, &bot);
+    irq_armed = 1;
+    int first = 1, to = 0;
+    for (;;)
+    {
+        uint32_t now = rt_us();
+        if (first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
+        rt_timeline(now);
+        if (take_semaphore(rt_fsem, 200))
+        {
+            irq_timeouts++;
+            if (++to >= 5) { rt_printf("no frame IRQ for 1 s, stopping\n"); break; }
+            continue;
+        }
+        to = 0;
+        if (rt_irq_snapshot(&n, &t, &top, &bot)) continue;
+        if (n == n_last) continue;                  /* extra semaphore count for an IRQ already handled */
+        if (!first) missed += n - n_last - 1;
+        first = 0;
+        n_last = n;
+        uint32_t lat = d20(RT_DMA_TIMER(), t);
+        uint32_t td = rt_us() - lat;
+        t_last_ev = td;
+        if (rt_frame(td, lat, 0, top, bot)) { c_abort = 1; break; }
+    }
+    irq_armed = 0;
+}
+
+static void rt_capture_timer(uint32_t est)
+{
+    uint32_t prevb = rt_probe_stable(r_bot), top_same = rt_probe(r_top), t_prev = 0, t0 = rt_us();
+    int after_wake = 0;
+    for (;;)
+    {
+        uint32_t now = rt_us();
+        if (first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
+        if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
+        if (now - (t_prev ? t_prev : t0) > 1000000) { rt_printf("no new frame for 1 s, stopping\n"); break; }
+        rt_timeline(now);
+
+        /* block until 3 ms before the next frame is due */
+        if (t_prev && !after_wake)
+        {
+            int32_t rem = (int32_t)(t_prev + est - 3000 - now);
+            if (rem > 200)
+            {
+                rt_drain(rt_fsem);
+                if (SetHPTimerAfterNow(rem, rt_hpt_wake, rt_hpt_wake, 0) & 1) msleep(MAX(rem / 1000, 1));
+                else take_semaphore(rt_fsem, 200);
+                after_wake = 1;
+                continue;
+            }
+        }
+        /* poll, at most 8 ms at a time, so this high-priority task never spins for long */
+        uint32_t spin0 = rt_us(), t_same = spin0;
+        int changed = 0, first_poll = 1;
+        while (rt_us() - spin0 < 8000)
+        {
+            uint32_t vb = rt_probe(r_bot), vt = rt_probe(r_top);
+            if (vb != prevb) { changed = 1; break; }
+            top_same = vt; first_poll = 0; t_same = rt_us();
+        }
+        if (!changed)
+        {
+            after_wake = 0;             /* frame not there yet: let others run for ~1 ms, look again */
+            rt_drain(rt_fsem);
+            if (SetHPTimerAfterNow(1000, rt_hpt_wake, rt_hpt_wake, 0) & 1) msleep(1);
+            else take_semaphore(rt_fsem, 20);
+            continue;
+        }
         prevb = rt_probe_stable(r_bot);
         uint32_t td = rt_us();
-        if (top_t && nrd < 8) rd_meas[nrd++] = td - top_t;
-        top_t = 0;
-        if (t_prev) iv[niv++] = td - t_prev;
+        int flags = (after_wake && first_poll) ? F_LATE : 0;
+        if (t_prev)
+        {
+            uint32_t d = td - t_prev, k = (d + est / 2) / est;
+            if (k >= 1)
+            {
+                missed += k - 1;
+                int32_t err = (int32_t)(d / k) - (int32_t)est;
+                if (err > -(int32_t)est / 10 && err < (int32_t)est / 10) est += err / 8;
+            }
+        }
         t_prev = td;
+        t_last_ev = td;
+        after_wake = 0;
+        /* latency: since the last poll that still saw the old frame (unknown, 25.5 ms, when late) */
+        uint32_t lat = (flags & F_LATE) ? 25500 : td - t_same;
+        if (rt_frame(td, lat, flags, (flags & F_LATE) ? rt_probe(r_top) : top_same, prevb)) { c_abort = 1; break; }
+        top_same = rt_probe(r_top);
     }
-    if (niv < 8) return 0;
-    sort_u32(iv, 8);
-    return (iv[3] + iv[4]) / 2;
+    c_est = est;
+}
+
+static void rt_capture_task(void *unused)
+{
+    if (c_mode == SYNC_IRQ) rt_capture_irq();
+    else rt_capture_timer(c_est);
+    c_done = 1;
+    give_semaphore(rt_csem);
 }
 
 static void rt_task(void *unused)
@@ -358,12 +735,16 @@ static void rt_task(void *unused)
     fl = malloc(sizeof(*fl) * RT_MAXFR);
     wl = malloc(sizeof(*wl) * RT_MAXW);
     tl = malloc(sizeof(*tl) * RT_MAXTL);
+    smp = malloc(sizeof(*smp) * RT_NSMP);
+    if (!irq_log) irq_log = malloc(sizeof(*irq_log) * RT_MAXIRQ);
     rt_loglen = 0;
-    w_file = 0; w_done = 1; nch = 0;
-    int lv_raw = 0;
-    if (!rt_logbuf || !fl || !wl || !tl) { NotifyBox(6000, "Record test: out of memory"); goto out; }
+    w_file = 0; w_done = 1; nch = 0; hook_on = 0;
+    int lv_raw = 0, mode = -1;
+    if (!rt_logbuf || !fl || !wl || !tl || !irq_log || !smp) { NotifyBox(6000, "Record test: out of memory"); goto out; }
     if (!rt_dsem) rt_dsem = create_named_semaphore("rt_dma", SEM_CREATE_LOCKED);
     if (!rt_wsem) rt_wsem = create_named_semaphore("rt_wr", SEM_CREATE_LOCKED);
+    if (!rt_fsem) rt_fsem = create_named_semaphore("rt_frm", SEM_CREATE_LOCKED);
+    if (!rt_csem) rt_csem = create_named_semaphore("rt_cap", SEM_CREATE_LOCKED);
 
     uint32_t crop_w = 1920, crop_h = rt_crop_h[rt_crop_sel];
     int dur_s = rt_dur_s[rt_dur_sel];
@@ -372,15 +753,22 @@ static void rt_task(void *unused)
         char n[32]; rt_part_name(n, rt_run_id, 0);
         if (!is_file(n)) break;
     }
-    rt_printf("start v12 record test run %d: crop %dx%d, %d s, t=%d lv=%d, card free %d MB\n", rt_run_id, crop_w, crop_h,
-              dur_s, get_ms_clock(), lv ? 1 : 0, get_free_space_32k(get_shooting_card()) / 32);
+    rt_printf("start v13 record test run %d: crop %dx%d, %d s, sync %s, t=%d lv=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, dur_s, rt_sync_name[rt_sync_sel], get_ms_clock(), lv ? 1 : 0,
+              get_free_space_32k(get_shooting_card()) / 32);
 
-    /* msleep granularity (the capture loop sleeps between frames) */
-    uint32_t sl[5];
-    for (int i = 0; i < 5; i++) { uint32_t t = rt_us(); msleep(1); sl[i] = rt_us() - t; }
-    sort_u32(sl, 5);
-    uint32_t ms1 = sl[2];
-    rt_printf("msleep(1) took %d %d %d %d %d us\n", sl[0], sl[1], sl[2], sl[3], sl[4]);
+    /* HPTimer self-check: one 2 ms timer */
+    {
+        rt_drain(rt_fsem);
+        hpt_fired = 0;
+        uint32_t t0 = RT_DMA_TIMER();
+        int r = SetHPTimerAfterNow(2000, rt_hpt_chk, rt_hpt_chk, 0);
+        int w = (r & 1) ? -1 : take_semaphore(rt_fsem, 100);
+        uint32_t d = hpt_fired ? d20(hpt_fired, t0) : 0;
+        hpt_ok = !(r & 1) && !w && d >= 1500 && d < 20000;
+        rt_printf("HPTimer check: returned %d, %s after %d us -> %s\n", r, w ? "did NOT fire" : "fired", d,
+                  hpt_ok ? "ok" : "unusable");
+    }
 
     int st = rt_lock();
     rt_printf("resource lock: %d (%s)\n", st, st == 0 ? "locked" : st == 0x1F ? "BUSY" : "error");
@@ -400,31 +788,47 @@ static void rt_task(void *unused)
     crop_w = MIN(crop_w, m1_w) & ~63;
     crop_h = MIN(crop_h, m1_h) & ~1;
     uint32_t x0 = ((m1_w - crop_w) / 2) & ~63, y0 = ((m1_h - crop_h) / 2) & ~1;
-    uint32_t rb = crop_w * 14 / 8;
-    uint32_t src = ubuf + y0 * pitch + x0 * 14 / 8;
-    uint32_t r_top = y0, r_bot = y0 + crop_h - 1;
-    frame_bytes = rb * crop_h;
+    c_rb = crop_w * 14 / 8;
+    c_ch = crop_h;
+    c_src = ubuf + y0 * pitch + x0 * 14 / 8;
+    r_top = y0; r_bot = y0 + crop_h - 1;
+    frame_bytes = c_rb * crop_h;
     slot_bytes = (frame_bytes + 4095) & ~4095;
     kslots = MAX(1, RT_CHUNK_TGT / slot_bytes);
     rt_printf("crop %dx%d at (%d,%d), %d bytes/frame, slot %d, %d slots/chunk (%d bytes per write)\n",
               crop_w, crop_h, x0, y0, frame_bytes, slot_bytes, kslots, kslots * slot_bytes);
+
+    /* frame-end IRQ hook + survey */
+    rt_hook();
+    rt_survey();
+    rt_flush();
+    /* IRQ sync needs: one IRQ per frame, a new bottom row each time, and (if the
+     * HPTimer samples exist) the frame already complete when the IRQ comes */
+    int irq_ok = hook_on && sv_irq_n >= 10 && sv_irq_new >= (sv_irq_n - 1) * 9 / 10 &&
+                 (!sv_est || (sv_irq_med > sv_est * 95 / 100 && sv_irq_med < sv_est * 105 / 100)) &&
+                 (!sv_irq_chk || sv_irq_settled >= sv_irq_chk * 9 / 10);
+    if (irq_ok && !sv_irq_chk) rt_printf("sync: IRQ position not verified (no HPTimer samples)\n");
+    int timer_ok = hpt_ok && sv_est >= 8000 && sv_est <= 200000;
+    mode = rt_sync_sel;
+    if (mode == SYNC_AUTO) mode = irq_ok ? SYNC_IRQ : timer_ok ? SYNC_TIMER : -1;
+    else if ((mode == SYNC_IRQ && !irq_ok) || (mode == SYNC_TIMER && !timer_ok)) mode = -1;
+    rt_printf("sync: IRQ %s, timer %s -> using %s\n", irq_ok ? "usable" : "NOT usable", timer_ok ? "usable" : "NOT usable",
+              mode < 0 ? "nothing (abort)" : rt_sync_name[mode]);
+    if (mode < 0) { snprintf(rt_last, sizeof(rt_last), "RT%02d: no frame sync", rt_run_id); goto done; }
+    if (mode == SYNC_TIMER) rt_unhook();
+
     rt_alloc_chunks();
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
-    if (nch < 2) { NotifyBox(6000, "Record test: not enough memory (%d)", nch); goto done; }
+    if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
 
-    /* quick sanity copy (crop of the live frame into chunk 0), as in v11 */
     rt_begin();
     {
         uint32_t us;
-        if (rt_copy(src, pitch, ch[0].base, rb, crop_h, &us))
-        { rt_printf("!! first EDMAC copy timed out\n"); rt_fail(); NotifyBox(6000, "Record test: DMA timeout"); goto done; }
+        if (rt_copy(c_src, pitch, ch[0].base, c_rb, c_ch, &us))
+        { rt_printf("!! first EDMAC copy timed out\n"); rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout"); goto done; }
         rt_printf("first copy: dma %d us\n", us);
     }
-
-    uint32_t est = rt_warmup(r_top, r_bot);
-    if (!est || est < 8000) { rt_printf("no steady LV frames (interval %d us), abort\n", est); rt_end(); NotifyBox(6000, "Record test: no LV frames"); goto done; }
-    rt_printf("frame interval %d us (%d.%02d fps), median of 8\n", est, 100000000 / est / 100, 100000000 / est % 100);
 
     rt_part_name(w_name, rt_run_id, 0);
     w_file = FIO_CreateFile(w_name);
@@ -434,112 +838,21 @@ static void rt_task(void *unused)
     task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
     rt_flush();
 
-    /* capture loop */
-    int nfr = 0, frames = 0, drops = 0, missed = 0, late = 0, tears = 0, topchg = 0, botchg = 0, ntl = 0;
-    int cur = -1, next_fill = 0, first_drop_ms = -1, abort = 0;
-    uint32_t prevb = rt_probe_stable(r_bot), top_same = rt_probe(r_top);
-    uint32_t last_same = rt_us(), t_prev = 0, first_t = 0, next_tl = 0, max_used = 0;
-    int after_sleep = 0;
-    uint32_t dmax = 0, dsum = 0, wait0 = rt_us();
-    while (!abort)
-    {
-        uint32_t now = rt_us();
-        if (first_t && now - first_t > (uint32_t)dur_s * 1000000) break;
-        if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
-        if (now - (t_prev ? t_prev : wait0) > 1000000) { rt_printf("no new frame for 1 s, stopping\n"); break; }
-
-        /* timeline every 250 ms */
-        if (first_t && now - first_t >= next_tl && ntl < RT_MAXTL)
-        {
-            int used = 0;
-            for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
-            tl[ntl].t_ms4 = (now - first_t) / 4000; tl[ntl].frames = frames; tl[ntl].drops = drops;
-            tl[ntl].used = used; tl[ntl].mb_written = (uint32_t)(w_bytes >> 20); ntl++;
-            next_tl += 250000;
-        }
-
-        /* sleep until shortly before the next frame is due */
-        if (t_prev)
-        {
-            int32_t rem = (int32_t)(t_prev + est - 4000 - now);
-            int n = (rem - (int32_t)ms1) / 1000;
-            if (n >= 1) { msleep(n); after_sleep = 1; continue; }
-        }
-
-        uint32_t vb = rt_probe(r_bot);
-        uint32_t vt = rt_probe(r_top);
-        if (vb == prevb)
-        {
-            top_same = vt; last_same = rt_us(); after_sleep = 0;
-            continue;
-        }
-        /* new frame complete */
-        prevb = rt_probe_stable(r_bot);
-        uint32_t td = rt_us();
-        int flags = 0;
-        uint32_t lat_us = td - last_same;
-        if (after_sleep) { flags |= F_LATE; late++; }
-        /* frames the loop never saw: frame number from the time since the first
-         * frame vs frames seen (interval counting misses a frame whose bottom
-         * row changed during a copy) */
-        if (first_t)
-        {
-            int seq = (td - first_t + est / 2) / est;
-            if (seq - nfr > missed) missed = seq - nfr;
-        }
-        if (!first_t) { first_t = td; next_tl = 0; }
-        t_prev = td;
-
-        /* slot */
-        uint32_t dst = 0;
-        if (cur < 0 && ch[next_fill].state == CH_FREE) { cur = next_fill; ch[cur].n = 0; ch[cur].state = CH_FILL; }
-        if (cur >= 0) dst = ch[cur].base + ch[cur].n * slot_bytes;
-
-        uint32_t us = 0;
-        if (!dst)
-        {
-            flags |= F_DROP; drops++;
-            if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
-        }
-        else
-        {
-            uint32_t top0 = rt_probe(r_top);
-            if (!(flags & F_LATE) && top0 != top_same) { flags |= F_TEAR; tears++; }
-            if (rt_copy(src, pitch, dst, rb, crop_h, &us))
-            {
-                rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
-                rt_fail();
-                abort = 1;
-                break;
-            }
-            if (rt_probe(r_top) != top0) { flags |= F_TOPCHG; topchg++; }
-            if (rt_probe(r_bot) != prevb) { flags |= F_BOTCHG; botchg++; }
-            frames++; dsum += us; if (us > dmax) dmax = us;
-            if (++ch[cur].n == kslots)
-            {
-                ch[cur].state = CH_FULL;
-                give_semaphore(rt_wsem);
-                next_fill = (cur + 1) % nch;
-                cur = -1;
-            }
-        }
-        if (nfr < RT_MAXFR)
-        {
-            fl[nfr].t_us = td - first_t; fl[nfr].dma_us = MIN(us, 65535);
-            fl[nfr].lat = (flags & F_LATE) ? 255 : MIN(lat_us / 100, 254); fl[nfr].flags = flags;
-        }
-        nfr++;
-        int used = 0;
-        for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
-        if ((uint32_t)used > max_used) max_used = used;
-        top_same = rt_probe(r_top);
-        last_same = rt_us();
-        after_sleep = 0;
-    }
-    uint32_t dur_us = t_prev - first_t;
+    /* capture in a high-priority task that blocks between frames */
+    nfr = frames = drops = dups = missed = late = tears = topchg = botchg = ntl = irq_timeouts = 0;
+    cur = -1; next_fill = 0; first_drop_ms = -1; c_abort = 0;
+    first_t = next_tl = max_used = dmax = dsum = last_rec_bot = t_last_ev = 0;
+    c_mode = mode; c_dur_s = dur_s; c_est = sv_est; c_done = 0;
+    uint32_t irq0 = irq_n;
+    rt_drain(rt_csem);
+    task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);
+    take_semaphore(rt_csem, (dur_s + 10) * 1000);
+    if (!c_done) { rt_printf("capture task did not finish in time\n"); for (int i = 0; i < 500 && !c_done; i++) msleep(10); }
+    uint32_t irq_rec = irq_n - irq0;
+    uint32_t dur_us = t_last_ev - first_t;
 
     /* hand over the partial chunk, stop the writer */
-    if (cur >= 0) { if (ch[cur].n) { ch[cur].state = CH_FULL; } else ch[cur].state = CH_FREE; }
+    if (cur >= 0) { if (ch[cur].n) ch[cur].state = CH_FULL; else ch[cur].state = CH_FREE; }
     uint32_t ts = rt_us();
     w_stop = 1;
     give_semaphore(rt_wsem);
@@ -547,28 +860,44 @@ static void rt_task(void *unused)
     uint32_t drain_ms = (rt_us() - ts) / 1000;
     if (w_done) { FIO_CloseFile(w_file); w_file = 0; }
     else rt_printf("writer still busy after 30 s; file left open, buffers kept\n");
-    if (!abort) rt_end();
+    if (!c_abort) rt_end();
+    rt_unhook();
 
     /* summary */
     uint32_t wus = 0, wmax = 0, wmin = 0xFFFFFFFF;
     for (int i = 0; i < MIN(w_n, RT_MAXW); i++) { wus += wl[i].us; wmax = MAX(wmax, wl[i].us); wmin = MIN(wmin, wl[i].us); }
-    uint32_t need10 = est ? (uint32_t)((uint64_t)frame_bytes * 10000000ULL / est / (1024 * 1024)) : 0;
     uint64_t wb = w_bytes;
+    uint32_t est = mode == SYNC_IRQ ? sv_irq_med : c_est;
+    uint32_t need10 = est ? (uint32_t)((uint64_t)frame_bytes * 10000000ULL / est / (1024 * 1024)) : 0;
     uint32_t card10 = wus ? (uint32_t)(wb * 10000000ULL / wus / (1024 * 1024)) : 0;
     uint32_t wall10 = dur_us ? (uint32_t)(wb * 10000000ULL / ((uint64_t)dur_us + drain_ms * 1000) / (1024 * 1024)) : 0;
-    rt_printf("RESULT run %d: %dx%d, %d.%03d s, %d frames seen, %d recorded, %d dropped (first drop at %d ms), "
-              "%d missed by the capture loop, %d written to card\n", rt_run_id, crop_w, crop_h, dur_us / 1000000,
-              dur_us / 1000 % 1000, nfr, frames, drops, first_drop_ms, missed, (uint32_t)(wb / slot_bytes));
+    /* start-latency percentiles from a histogram of the 8-bit .IDX values (no 12 KB sort buffer in bss) */
+    uint16_t hist[256];
+    memset(hist, 0, sizeof(hist));
+    int nl = 0;
+    for (int i = 0; i < MIN(nfr, RT_MAXFR); i++) if (!(fl[i].flags & (F_DROP | F_DUP))) { hist[fl[i].lat]++; nl++; }
+    uint32_t l50 = 0, l90 = 0, lmax = 0;
+    for (int v = 0, c = 0; v < 256; v++)
+    {
+        if (!hist[v]) continue;
+        if (c <= nl / 2 && c + hist[v] > nl / 2) l50 = v;
+        if (c <= nl * 9 / 10 && c + hist[v] > nl * 9 / 10) l90 = v;
+        c += hist[v]; lmax = v;
+    }
+    rt_printf("RESULT run %d: sync %s, %dx%d, %d.%03d s, %d frame events, %d recorded, %d dropped (first drop at %d ms), "
+              "%d missed, %d duplicates skipped, %d written to card\n", rt_run_id, rt_sync_name[mode], crop_w, crop_h,
+              dur_us / 1000000, dur_us / 1000 % 1000, nfr, frames, drops, first_drop_ms, missed, dups,
+              (uint32_t)(wb / slot_bytes));
     rt_printf("RESULT data rate needed %d.%d MiB/s; card %d.%d MiB/s while writing, %d.%d MiB/s overall; "
               "%d writes, min %d max %d us; buffer peak %d of %d frames; drain %d ms\n",
               need10 / 10, need10 % 10, card10 / 10, card10 % 10, wall10 / 10, wall10 % 10,
               w_n, wmin, wmax, max_used, nch * kslots, drain_ms);
-    rt_printf("RESULT copy dma avg %d max %d us; late %d, tear %d, topchg %d, botchg(torn) %d; writer err %d\n",
-              frames ? dsum / frames : 0, dmax, late, tears, topchg, botchg, w_err);
-    rt_printf("readout (top->bottom crop row) us:");
-    for (int i = 0; i < nrd; i++) rt_printf(" %d", rd_meas[i]);
-    rt_printf("\nfiles: %s (last part %d), %d MB total\n", w_name, w_part, (uint32_t)(wb >> 20));
-    snprintf(rt_last, sizeof(rt_last), "RT%02d: %d rec, %d drop", rt_run_id, frames, drops);
+    rt_printf("RESULT copy dma avg %d max %d us; start latency p50 %d.%d p90 %d.%d max %d.%d ms; late %d, tear %d, "
+              "topchg %d, botchg(torn) %d; IRQs during capture %d, IRQ timeouts %d; writer err %d\n",
+              frames ? dsum / frames : 0, dmax, l50 / 10, l50 % 10, l90 / 10, l90 % 10, lmax / 10, lmax % 10,
+              late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
+    rt_printf("files: %s (last part %d), %d MB total\n", w_name, w_part, (uint32_t)(wb >> 20));
+    snprintf(rt_last, sizeof(rt_last), "RT%02d %s: %d rec, %d miss", rt_run_id, rt_sync_name[mode], frames, missed + drops);
     rt_flush();
     for (int i = 0; i < ntl; i++)
         rt_printf("TL %6d ms frames %5d drops %5d buffered %3d written %5d MB\n", tl[i].t_ms4 * 4, tl[i].frames,
@@ -584,6 +913,7 @@ static void rt_task(void *unused)
     }
 
 done:
+    rt_unhook();
     if (lv_raw) call("lv_save_raw", 0);
     if (rt_begun) rt_end();
     if (w_done) rt_free_chunks();
@@ -597,7 +927,8 @@ out:
     if (fl) free(fl);
     if (wl) free(wl);
     if (tl) free(tl);
-    rt_logbuf = 0; fl = 0; wl = 0; tl = 0;
+    if (smp) free(smp);
+    rt_logbuf = 0; fl = 0; wl = 0; tl = 0; smp = 0;
     info_led_blink(3, 100, 100);
     rt_busy = 0;
 }
@@ -606,6 +937,7 @@ static MENU_SELECT_FUNC(rt_select)
 {
     if (rt_busy) return;
     rt_busy = 1;
+    rt_last[0] = 0;
     task_create("rt_task", 0x1e, 0x2000, rt_task, 0);
 }
 
@@ -620,7 +952,7 @@ static struct menu_entry rt_menu[] = {
     {
         .name   = "LV record test",
         .select = menu_open_submenu,
-        .help   = "Sustained raw record test: EDMAC crop copy + batched card writes",
+        .help   = "Raw record test: frame-synced EDMAC crop copy + batched card writes",
         .children = (struct menu_entry[]) {
             {
                 .name    = "Crop",
@@ -633,6 +965,13 @@ static struct menu_entry rt_menu[] = {
                 .priv    = &rt_dur_sel,
                 .max     = 2,
                 .choices = CHOICES("10 s", "20 s", "40 s"),
+            },
+            {
+                .name    = "Sync",
+                .priv    = &rt_sync_sel,
+                .max     = 2,
+                .choices = CHOICES("auto", "IRQ", "timer"),
+                .help    = "auto: frame-end IRQ if the survey shows it works, else HPTimer",
             },
             {
                 .name   = "Start",
