@@ -511,7 +511,10 @@ static void rt_survey(void)
 #define RT_VIDF_PRE  256
 #define RT_BLACK14   2043               /* left OB of the movie-LV dump */
 #define RT_WHITE14   16300              /* clip pile-up at 16382 */
-#define RT_HDR_BYTES (52 + 180 + 84 + 44)
+#define RT_HDR_INFO  (52 + 180 + 84 + 44)
+#define RT_HDR_BYTES 4096               /* header + NULL padding: keeps every chunk write 4 KiB-aligned in the file.
+                                         * v15/v16 wrote 360-byte headers and the card ran at 98-99 MiB/s instead of
+                                         * the 111-112 of BIN runs (all writes 360 bytes off sector alignment). */
 struct __attribute__((packed)) rt_mlvi
 {
     char magic[4]; uint32_t size; char ver[8]; uint64_t guid; uint16_t file_num, file_count; uint32_t flags;
@@ -527,7 +530,7 @@ static uint32_t c_rb, c_ch;
 static uint32_t slot_pre, slot_null, c_x0, c_y0, c_cw, mlv_fps_nom, mlv_fps_den;
 static uint64_t mlv_guid;
 static uint32_t pk_orig[5], pk_w0;
-static uint8_t mlv_hdr[RT_HDR_BYTES];
+static uint8_t *mlv_hdr;                /* RT_HDR_BYTES, malloc'd per MLV run */
 
 static int rt_pack_apply(int bpp, int ml_order)
 {
@@ -585,7 +588,7 @@ static void rt_fps_of(uint32_t period_us, uint32_t *nom, uint32_t *den)
 /* MLVI + RAWI + IDNT + RTCI for one file */
 static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
 {
-    memset(mlv_hdr, 0, sizeof(mlv_hdr));
+    memset(mlv_hdr, 0, RT_HDR_BYTES);
     struct rt_mlvi *m = (struct rt_mlvi *)mlv_hdr;
     memcpy(m->magic, "MLVI", 4); m->size = 52; memcpy(m->ver, "v2.0", 5); m->guid = mlv_guid;
     m->file_num = file_num; m->file_count = 0; m->vclass = 1; m->vframes = vframes;
@@ -617,6 +620,9 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     uint16_t *t = (uint16_t *)(p + 16);
     t[0] = now.tm_sec; t[1] = now.tm_min; t[2] = now.tm_hour; t[3] = now.tm_mday; t[4] = now.tm_mon;
     t[5] = now.tm_year; t[6] = now.tm_wday; t[7] = now.tm_yday; t[8] = now.tm_isdst;
+    p += 44;
+    b = (struct rt_blk *)p;                                      /* NULL padding to RT_HDR_BYTES */
+    memcpy(b->type, "NULL", 4); b->size = RT_HDR_BYTES - RT_HDR_INFO;
 }
 
 /* rewrite this file's MLVI with its frame count, then close it */
@@ -1017,6 +1023,8 @@ static void rt_task(void *unused)
     w_file = FIO_CreateFile(w_name);
     if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
     w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
+    if (c_mlv && !mlv_hdr) mlv_hdr = malloc(RT_HDR_BYTES);
+    if (c_mlv && !mlv_hdr) { rt_printf("no memory for the MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
     if (c_mlv)
     {
         rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
