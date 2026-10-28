@@ -654,6 +654,8 @@ static struct semaphore *rt_wsem;
 static volatile int w_stop, w_done, w_err;
 static volatile uint64_t w_bytes;      /* > 4 GB in a 40 s run */
 static int w_part, w_n;
+static uint64_t w_us_sum;               /* all writes (wl[] keeps only the first RT_MAXW for the log) */
+static uint32_t w_us_min, w_us_max;
 static uint32_t w_part_frames;
 static FILE *w_file;
 static char w_name[32];
@@ -697,6 +699,7 @@ static void rt_writer(void *unused)
             t = rt_us() - t;
             if (w_n < RT_MAXW) { wl[w_n].t_ms = (rt_us() - rt_t0) / 1000; wl[w_n].us = t; wl[w_n].bytes = bytes; }
             w_n++;
+            w_us_sum += t; if (t < w_us_min) w_us_min = t; if (t > w_us_max) w_us_max = t;
             if (r != (int)bytes) { w_err = r ? r : -1; break; }
             w_fsize += bytes;
             w_bytes += bytes;
@@ -1025,7 +1028,7 @@ static void rt_task(void *unused)
     rt_part_name(w_name, rt_run_id, 0);
     w_file = FIO_CreateFile(w_name);
     if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
-    w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
+    w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_us_sum = 0; w_us_min = 0xFFFFFFFF; w_us_max = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
     if (c_mlv && !mlv_hdr) mlv_hdr = malloc(RT_HDR_BYTES);
     if (c_mlv && !mlv_hdr) { rt_printf("no memory for the MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
     if (c_mlv)
@@ -1079,8 +1082,8 @@ static void rt_task(void *unused)
     rt_unhook();
 
     /* summary */
-    uint32_t wus = 0, wmax = 0, wmin = 0xFFFFFFFF;
-    for (int i = 0; i < MIN(w_n, RT_MAXW); i++) { wus += wl[i].us; wmax = MAX(wmax, wl[i].us); wmin = MIN(wmin, wl[i].us); }
+    uint64_t wus = w_us_sum;
+    uint32_t wmax = w_us_max, wmin = w_n ? w_us_min : 0;
     uint64_t wb = w_bytes;
     uint32_t est = mode == SYNC_IRQ ? sv_irq_med : c_est;
     uint32_t need10 = est ? (uint32_t)((uint64_t)frame_bytes * 10000000ULL / est / (1024 * 1024)) : 0;
