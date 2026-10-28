@@ -1637,7 +1637,7 @@ static struct menu_entry rr_menu[] = {
                 .priv    = &rt_fmt_sel,
                 .min     = 1,
                 .max     = 3,
-                .choices = CHOICES("BIN 14-bit", "14-bit", "12-bit", "10-bit"),
+                .choices = CHOICES("14-bit", "12-bit", "10-bit"),   /* v18.1: ML shows choices[value - min] */
                 .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
             },
             {
