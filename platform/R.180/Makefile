@@ -21,7 +21,7 @@ PLATFORM_ARCH = armv7-a
 ML_BOOT_OBJ = boot-d678.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o $(BUILD_DIR)/test_features.o
 # riz/eosr-dmlog: Debug -> LV log capture (Canon DbgMgr, no ROM patching)
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/edmtest_r.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/rectest_r.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete
