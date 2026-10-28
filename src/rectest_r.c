@@ -98,6 +98,8 @@ enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
 static int rt_crop_sel = 0;             /* 1920x1080, 1920x960, 1920x800 */
 static int rt_dur_sel = 1;              /* 10, 20, 40 s */
 static int rt_sync_sel = SYNC_AUTO;
+static int rt_fmt_sel = 0;              /* v15: 0 = BIN 14-bit Canon order, 1 = MLV 14-bit, 2 = MLV 12-bit */
+static const char *rt_fmt_name[] = { "BIN 14-bit", "MLV 14-bit", "MLV 12-bit" };
 static const int rt_crop_h[] = { 1080, 960, 800 };
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -490,10 +492,154 @@ static void rt_survey(void)
 }
 
 /* ---- writer ---- */
+/* ---- v15: MLV output ----
+ * Pack-unit settings found by the v14.1 test (notes lv-survey.md): Mem1Path pack cfg
+ * f3 = 0 gives ML raw_pixblock bit order, f2 = 1 gives 12-bit (with the width field
+ * +0x18 set so Canon's port-3 xsize = (width*14)>>3 = w*12/8). Canon re-applies the
+ * struct every frame. In MLV mode each buffer slot is one MLV block group:
+ * VIDF header (32) + frameSpace (224) + frame, then a NULL block for any slack, so
+ * the card writes stay whole chunks. Each file starts with MLVI+RAWI+IDNT+RTCI; the
+ * MLVI frame count is rewritten when the file is closed. */
+#define RT_VIDF_PRE  256
+#define RT_BLACK14   2043               /* left OB of the movie-LV dump */
+#define RT_WHITE14   16300              /* clip pile-up at 16382 */
+#define RT_HDR_BYTES (52 + 180 + 84 + 44)
+struct __attribute__((packed)) rt_mlvi
+{
+    char magic[4]; uint32_t size; char ver[8]; uint64_t guid; uint16_t file_num, file_count; uint32_t flags;
+    uint16_t vclass, aclass; uint32_t vframes, aframes, fps_nom, fps_den;
+};
+struct __attribute__((packed)) rt_vidf
+{
+    char type[4]; uint32_t size; uint64_t ts; uint32_t frame; uint16_t crop_x, crop_y, pan_x, pan_y; uint32_t space;
+};
+struct __attribute__((packed)) rt_blk { char type[4]; uint32_t size; uint64_t ts; };
+static int c_bpp = 14, c_mlv, pk_applied;
+static uint32_t c_rb, c_ch;
+static uint32_t slot_pre, slot_null, c_x0, c_y0, c_cw, mlv_fps_nom, mlv_fps_den;
+static uint64_t mlv_guid;
+static uint32_t pk_orig[5], pk_w0;
+static uint8_t mlv_hdr[RT_HDR_BYTES];
+
+static int rt_pack_apply(int bpp, int ml_order)
+{
+    for (int i = 0; i < 5; i++) pk_orig[i] = MEM(RT_PATH + 0x64 + 4 * i);
+    pk_w0 = MEM(RT_PATH + 0x18);
+    uint32_t md = MEM(RT_PATH);
+    if (pk_orig[0] != 0 || pk_orig[1] != 1 || pk_orig[2] != 2 || pk_orig[3] != 1 || pk_orig[4] != 0)
+    { rt_printf("pack cfg {%d,%d,%d,%d,%d} is not Canon's default: not touching it\n", pk_orig[0], pk_orig[1], pk_orig[2], pk_orig[3], pk_orig[4]); return -1; }
+    if (md >= 0x14 || (MEM(RT_PATH + 0x28) && (md == 0xb || md == 0xf || md == 9)) || pk_w0 != MEM(RT_PATH + 0x10))
+    { rt_printf("Mem1Path mode %d / width source %d vs %d: not the layout tested in v14.1\n", md, pk_w0, MEM(RT_PATH + 0x10)); return -1; }
+    uint32_t wset = pk_w0;
+    if (bpp == 12)
+    {
+        uint32_t lb = pk_w0 * 12 / 8;
+        wset = (lb * 8 + 13) / 14;
+        if (((wset * 14) >> 3) != lb || (pk_w0 * 12) % 8) { rt_printf("no width field gives %d bytes per line\n", lb); return -1; }
+    }
+    uint32_t old = cli();
+    MEM(RT_PATH + 0x18) = wset;
+    MEM(RT_PATH + 0x64 + 8) = bpp == 12 ? 1 : 2;
+    MEM(RT_PATH + 0x64 + 12) = ml_order ? 0 : 1;
+    sei(old);
+    pk_applied = 1;
+    msleep(300);
+    rt_printf("pack cfg: f2=%d f3=%d, width field %d -> %d (port-3 line %d bytes); unit reg %08x\n", bpp == 12 ? 1 : 2,
+              ml_order ? 0 : 1, pk_w0, wset, (wset * 14) >> 3, MEM(0xD0422224u));
+    return 0;
+}
+
+static void rt_pack_restore(void)
+{
+    if (!pk_applied) return;
+    uint32_t old = cli();
+    MEM(RT_PATH + 0x18) = pk_w0;
+    MEM(RT_PATH + 0x64 + 8) = pk_orig[2];
+    MEM(RT_PATH + 0x64 + 12) = pk_orig[3];
+    sei(old);
+    pk_applied = 0;
+    msleep(100);
+    rt_printf("pack cfg restored: width field %d, unit reg %08x\n", MEM(RT_PATH + 0x18), MEM(0xD0422224u));
+}
+
+static void rt_fps_of(uint32_t period_us, uint32_t *nom, uint32_t *den)
+{
+    static const uint32_t c[][2] = { { 24000, 1001 }, { 24000, 1000 }, { 25000, 1000 }, { 30000, 1001 }, { 30000, 1000 },
+                                     { 50000, 1000 }, { 60000, 1001 } };
+    *nom = period_us ? (uint32_t)(1000000000ULL / period_us) : 30000; *den = 1000;
+    for (int i = 0; i < COUNT(c); i++)
+    {
+        uint32_t p = (uint32_t)(1000000ULL * c[i][1] / c[i][0]);
+        if (period_us > p - p / 50 && period_us < p + p / 50) { *nom = c[i][0]; *den = c[i][1]; return; }
+    }
+}
+
+/* MLVI + RAWI + IDNT + RTCI for one file */
+static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
+{
+    memset(mlv_hdr, 0, sizeof(mlv_hdr));
+    struct rt_mlvi *m = (struct rt_mlvi *)mlv_hdr;
+    memcpy(m->magic, "MLVI", 4); m->size = 52; memcpy(m->ver, "v2.0", 5); m->guid = mlv_guid;
+    m->file_num = file_num; m->file_count = 0; m->vclass = 1; m->vframes = vframes;
+    m->fps_nom = mlv_fps_nom; m->fps_den = mlv_fps_den;
+    uint8_t *p = mlv_hdr + 52;
+    struct rt_blk *b = (struct rt_blk *)p;                       /* RAWI */
+    memcpy(b->type, "RAWI", 4); b->size = 180;
+    uint16_t *res = (uint16_t *)(p + 16); res[0] = c_cw; res[1] = c_ch;
+    int32_t *ri = (int32_t *)(p + 20);                           /* raw_info, 40 words */
+    static const int32_t cm[9] = { 6446, -366, -864, -4436, 12204, 2513, -952, 2496, 6348 };  /* Adobe EOS R D65 */
+    ri[0] = 1; ri[2] = c_ch; ri[3] = c_cw; ri[4] = c_rb; ri[5] = frame_bytes; ri[6] = c_bpp;
+    ri[7] = c_bpp == 12 ? (RT_BLACK14 + 2) / 4 : RT_BLACK14; ri[8] = c_bpp == 12 ? RT_WHITE14 / 4 : RT_WHITE14;
+    ri[11] = c_cw; ri[12] = c_ch;                                /* jpeg crop: 0, 0, w, h */
+    ri[15] = c_ch; ri[16] = c_cw;                                /* active area: 0, 0, h, w */
+    ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
+    for (int i = 0; i < 9; i++) { ri[21 + 2 * i] = cm[i]; ri[22 + 2 * i] = 10000; }
+    ri[39] = 1100;
+    p += 180;
+    b = (struct rt_blk *)p;                                      /* IDNT */
+    memcpy(b->type, "IDNT", 4); b->size = 84;
+    memcpy(p + 16, "Canon EOS R", 11);
+    *(uint32_t *)(p + 48) = 0x80000424;
+    p += 84;
+    b = (struct rt_blk *)p;                                      /* RTCI */
+    memcpy(b->type, "RTCI", 4); b->size = 44;
+    struct tm now;
+    memset(&now, 0, sizeof(now));
+    LoadCalendarFromRTC(&now);
+    uint16_t *t = (uint16_t *)(p + 16);
+    t[0] = now.tm_sec; t[1] = now.tm_min; t[2] = now.tm_hour; t[3] = now.tm_mday; t[4] = now.tm_mon;
+    t[5] = now.tm_year; t[6] = now.tm_wday; t[7] = now.tm_yday; t[8] = now.tm_isdst;
+}
+
+/* rewrite this file's MLVI with its frame count, then close it */
+static void rt_mlv_close(FILE *f, int file_num, uint32_t vframes)
+{
+    rt_mlv_build_hdr(file_num, vframes);
+    FIO_SeekSkipFile(f, 0, SEEK_SET);
+    FIO_WriteFile(f, mlv_hdr, 52);
+    FIO_CloseFile(f);
+}
+
+/* headers inside a slot: VIDF before the frame, NULL block after it */
+static void rt_mlv_slot(uint32_t slot, uint32_t frame_no, uint32_t ts_us)
+{
+    struct rt_vidf v;
+    memset(&v, 0, sizeof(v));
+    memcpy(v.type, "VIDF", 4); v.size = RT_VIDF_PRE + frame_bytes; v.ts = ts_us; v.frame = frame_no;
+    v.crop_x = c_x0 & ~7; v.crop_y = c_y0; v.pan_x = c_x0; v.pan_y = c_y0; v.space = RT_VIDF_PRE - sizeof(v);
+    memcpy((void *)slot, &v, sizeof(v));
+    if (slot_null)
+    {
+        struct rt_blk n = { { 'N', 'U', 'L', 'L' }, slot_null, ts_us };
+        memcpy((void *)(slot + RT_VIDF_PRE + frame_bytes), &n, sizeof(n));
+    }
+}
+
 static struct semaphore *rt_wsem;
 static volatile int w_stop, w_done, w_err;
 static volatile uint64_t w_bytes;      /* > 4 GB in a 40 s run */
 static int w_part, w_n;
+static uint32_t w_part_frames;
 static FILE *w_file;
 static char w_name[32];
 static uint32_t w_fsize;
@@ -503,7 +649,8 @@ static uint32_t rt_t0;
 
 static void rt_part_name(char *out, int run, int part)
 {
-    if (part) snprintf(out, 32, "ML/RT%02d.B%02d", run, part);
+    if (c_mlv) { if (part) snprintf(out, 32, "ML/RT%02d.M%02d", run, part - 1); else snprintf(out, 32, "ML/RT%02d.MLV", run); }
+    else if (part) snprintf(out, 32, "ML/RT%02d.B%02d", run, part);
     else snprintf(out, 32, "ML/RT%02d.BIN", run);
 }
 
@@ -517,11 +664,18 @@ static void rt_writer(void *unused)
             uint32_t bytes = ch[wi].n * slot_bytes;
             if (w_fsize + bytes > RT_SPLIT)
             {
-                FIO_CloseFile(w_file);
+                if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
+                else FIO_CloseFile(w_file);
                 rt_part_name(w_name, rt_run_id, ++w_part);
                 w_file = FIO_CreateFile(w_name);
-                w_fsize = 0;
+                w_fsize = 0; w_part_frames = 0;
                 if (!w_file) { w_err = -2; break; }
+                if (c_mlv)
+                {
+                    rt_mlv_build_hdr(w_part, 0);
+                    if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES) { w_err = -3; break; }
+                    w_fsize = RT_HDR_BYTES;
+                }
             }
             uint32_t t = rt_us();
             int r = FIO_WriteFile(w_file, (void *)ch[wi].base, bytes);
@@ -531,6 +685,7 @@ static void rt_writer(void *unused)
             if (r != (int)bytes) { w_err = r ? r : -1; break; }
             w_fsize += bytes;
             w_bytes += bytes;
+            w_part_frames += ch[wi].n;
             ch[wi].n = 0;
             ch[wi].state = CH_FREE;
             wi = (wi + 1) % nch;
@@ -549,7 +704,7 @@ static struct rt_frame *fl;
 static struct rt_tl *tl;
 
 static int c_mode, c_dur_s;
-static uint32_t c_src, c_rb, c_ch, c_est;
+static uint32_t c_src, c_est;
 static int nfr, frames, drops, dups, missed, late, tears, topchg, botchg, ntl, irq_timeouts;
 static int cur, next_fill, first_drop_ms, c_abort;
 static uint32_t first_t, next_tl, max_used, dmax, dsum, last_rec_bot, t_last_ev;
@@ -590,7 +745,8 @@ static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
         {
             uint32_t top0 = rt_probe(r_top);
             if (top0 != top_ref) { flags |= F_TEAR; tears++; }
-            if (rt_copy(c_src, pitch, dst, c_rb, c_ch, &us))
+            if (c_mlv) rt_mlv_slot(dst, nfr, td - first_t);
+            if (rt_copy(c_src, pitch, dst + slot_pre, c_rb, c_ch, &us))
             {
                 rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
                 rt_fail();
@@ -753,11 +909,15 @@ static void rt_task(void *unused)
     int dur_s = rt_dur_s[rt_dur_sel];
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
-        char n[32]; rt_part_name(n, rt_run_id, 0);
-        if (!is_file(n)) break;
+        char n[32], m[32];
+        snprintf(n, sizeof(n), "ML/RT%02d.BIN", rt_run_id); snprintf(m, sizeof(m), "ML/RT%02d.MLV", rt_run_id);
+        if (!is_file(n) && !is_file(m)) break;
     }
-    rt_printf("start v13 record test run %d: crop %dx%d, %d s, sync %s, t=%d lv=%d, card free %d MB\n", rt_run_id,
-              crop_w, crop_h, dur_s, rt_sync_name[rt_sync_sel], get_ms_clock(), lv ? 1 : 0,
+    c_mlv = rt_fmt_sel != 0;
+    c_bpp = rt_fmt_sel == 2 ? 12 : 14;
+    pk_applied = 0;
+    rt_printf("start v15 record test run %d: crop %dx%d, %d s, sync %s, format %s, t=%d lv=%d, card free %d MB\n", rt_run_id,
+              crop_w, crop_h, dur_s, rt_sync_name[rt_sync_sel], rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
 
     /* HPTimer self-check: one 2 ms timer */
@@ -781,25 +941,34 @@ static void rt_task(void *unused)
     lv_raw = 1;
     msleep(500);
     m1_w = MEM(RT_PATH + 0x10); m1_h = MEM(RT_PATH + 0x14);
+    if (c_mlv && m1_w && m1_h)
+    {
+        if (rt_pack_apply(c_bpp, 1))
+        { snprintf(rt_last, sizeof(rt_last), "RT%02d: pack cfg unexpected", rt_run_id); NotifyBox(6000, "Record test: %s", rt_last); goto done; }
+    }
     uint32_t a = MEM(RT_PATH + 0x58);
-    pitch = m1_w * 14 / 8;
+    pitch = m1_w * c_bpp / 8;
     ubuf = RT_BUF | RT_UNC;
-    rt_printf("M1 w=%d h=%d addr=%08x pitch=%d\n", m1_w, m1_h, a, pitch);
+    rt_printf("M1 w=%d h=%d addr=%08x pitch=%d (%d-bit)\n", m1_w, m1_h, a, pitch, c_bpp);
     if (!m1_w || !m1_h || pitch * m1_h > RT_BUFLEN || (a & ~RT_UNC) != RT_BUF || m1_h < 64)
     { rt_printf("MEM1 not active or size unexpected, abort\n"); NotifyBox(6000, "Record test: no LV raw"); goto done; }
 
     crop_w = MIN(crop_w, m1_w) & ~63;
     crop_h = MIN(crop_h, m1_h) & ~1;
     uint32_t x0 = ((m1_w - crop_w) / 2) & ~63, y0 = ((m1_h - crop_h) / 2) & ~1;
-    c_rb = crop_w * 14 / 8;
-    c_ch = crop_h;
-    c_src = ubuf + y0 * pitch + x0 * 14 / 8;
+    c_rb = crop_w * c_bpp / 8;
+    c_ch = crop_h; c_cw = crop_w; c_x0 = x0; c_y0 = y0;
+    c_src = ubuf + y0 * pitch + x0 * c_bpp / 8;
     r_top = y0; r_bot = y0 + crop_h - 1;
     frame_bytes = c_rb * crop_h;
-    slot_bytes = (frame_bytes + 4095) & ~4095;
+    slot_pre = c_mlv ? RT_VIDF_PRE : 0;
+    slot_bytes = (frame_bytes + slot_pre + 4095) & ~4095;
+    slot_null = c_mlv ? slot_bytes - slot_pre - frame_bytes : 0;   /* 0 or >= 16 (frame_bytes is a multiple of 16) */
     kslots = MAX(1, RT_CHUNK_TGT / slot_bytes);
     rt_printf("crop %dx%d at (%d,%d), %d bytes/frame, slot %d, %d slots/chunk (%d bytes per write)\n",
               crop_w, crop_h, x0, y0, frame_bytes, slot_bytes, kslots, kslots * slot_bytes);
+    if (c_mlv) rt_printf("MLV: VIDF %d + frameSpace %d before each frame, NULL block %d after\n", (int)sizeof(struct rt_vidf),
+                         RT_VIDF_PRE - (int)sizeof(struct rt_vidf), slot_null);
 
     /* frame-end IRQ hook + survey */
     rt_hook();
@@ -828,7 +997,7 @@ static void rt_task(void *unused)
     rt_begin();
     {
         uint32_t us;
-        if (rt_copy(c_src, pitch, ch[0].base, c_rb, c_ch, &us))
+        if (rt_copy(c_src, pitch, ch[0].base + slot_pre, c_rb, c_ch, &us))
         { rt_printf("!! first EDMAC copy timed out\n"); rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout"); goto done; }
         rt_printf("first copy: dma %d us\n", us);
     }
@@ -836,7 +1005,17 @@ static void rt_task(void *unused)
     rt_part_name(w_name, rt_run_id, 0);
     w_file = FIO_CreateFile(w_name);
     if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
-    w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_stop = 0; w_err = 0; w_done = 0;
+    w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
+    if (c_mlv)
+    {
+        rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
+        mlv_guid = ((uint64_t)rt_us() << 32) ^ (uint64_t)get_ms_clock() * 2654435761u ^ rt_run_id;
+        rt_mlv_build_hdr(0, 0);
+        if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES)
+        { rt_printf("cannot write MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
+        w_fsize = RT_HDR_BYTES;
+        rt_printf("MLV: %d/%d fps, guid %08x%08x\n", mlv_fps_nom, mlv_fps_den, (uint32_t)(mlv_guid >> 32), (uint32_t)mlv_guid);
+    }
     rt_t0 = rt_us();
     task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
     rt_flush();
@@ -861,7 +1040,12 @@ static void rt_task(void *unused)
     give_semaphore(rt_wsem);
     for (int i = 0; i < 3000 && !w_done; i++) msleep(10);
     uint32_t drain_ms = (rt_us() - ts) / 1000;
-    if (w_done) { FIO_CloseFile(w_file); w_file = 0; }
+    if (w_done)
+    {
+        if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
+        else FIO_CloseFile(w_file);
+        w_file = 0;
+    }
     else rt_printf("writer still busy after 30 s; file left open, buffers kept\n");
     if (!c_abort) rt_end();
     rt_unhook();
@@ -899,8 +1083,9 @@ static void rt_task(void *unused)
               "topchg %d, botchg(torn) %d; IRQs during capture %d, IRQ timeouts %d; writer err %d\n",
               frames ? dsum / frames : 0, dmax, l50 / 10, l50 % 10, l90 / 10, l90 % 10, lmax / 10, lmax % 10,
               late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
-    rt_printf("files: %s (last part %d), %d MB total\n", w_name, w_part, (uint32_t)(wb >> 20));
-    snprintf(rt_last, sizeof(rt_last), "RT%02d %s: %d rec, %d miss", rt_run_id, rt_sync_name[mode], frames, missed + drops);
+    rt_printf("files: %s (last part %d), %d MB total, format %s\n", w_name, w_part, (uint32_t)(wb >> 20), rt_fmt_name[rt_fmt_sel]);
+    snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
+             rt_sync_name[mode], frames, missed + drops);
     rt_flush();
     for (int i = 0; i < ntl; i++)
         rt_printf("TL %6d ms frames %5d drops %5d buffered %3d written %5d MB\n", tl[i].t_ms4 * 4, tl[i].frames,
@@ -917,6 +1102,7 @@ static void rt_task(void *unused)
 
 done:
     rt_unhook();
+    rt_pack_restore();
     if (lv_raw) call("lv_save_raw", 0);
     if (rt_begun) rt_end();
     if (w_done) rt_free_chunks();
@@ -1135,6 +1321,13 @@ static struct menu_entry rt_menu[] = {
                 .choices = CHOICES("10 s", "20 s", "40 s"),
             },
             {
+                .name    = "Format",
+                .priv    = &rt_fmt_sel,
+                .max     = 2,
+                .choices = CHOICES("BIN 14-bit", "MLV 14-bit", "MLV 12-bit"),
+                .help    = "BIN: Canon's bit order (PC converter). MLV: camera writes .MLV (pack unit set to ML order).",
+            },
+            {
                 .name    = "Sync",
                 .priv    = &rt_sync_sel,
                 .max     = 2,
@@ -1206,7 +1399,8 @@ static void rt_status(const char *fmt, ...)
 /* ---- auto-run: ML/RTAUTO.TXT, unattended runs ----
  * Read 10 s after boot. Plans are separated by lines starting with "---";
  * each boot runs the next plan (ML/RTAUTO.POS holds its number). A plan has up
- * to 6 lines "<crop height> <seconds> <auto|irq|timer>", e.g. "1080 20 auto", or "pack" (v14 pack test);
+ * to 6 lines "<crop height> <seconds> [auto|irq|timer] [bin|mlv14|mlv12]", e.g. "1080 20 auto mlv12",
+ * or "pack" (v14 pack test);
  * '#' starts a comment. Waits up to 30 s for live view; without it (e.g. USB
  * cable in: PC-connection screen) nothing is used up. RTAUTO.POS is advanced
  * before the plan runs, so a freeze + battery pull skips that plan instead of
@@ -1216,12 +1410,12 @@ static void rt_status(const char *fmt, ...)
 #define RT_AUTO_DON "ML/RTAUTO.DON"
 
 static int rt_auto_skipped;
-static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
+static int rt_auto_parse(const char *t, int len, int (*runs)[4], int max)
 {
     int n = 0, i = 0;
     while (i < len && n < max)
     {
-        int v[3] = { -1, -1, -1 }, k = 0;
+        int v[4] = { -1, -1, -1, 0 }, k = 0;
         while (i < len && t[i] != '\n')
         {
             char c = t[i];
@@ -1239,6 +1433,18 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
                 while (i < len && t[i] != '\n') i++;
                 break;
             }
+            if ((k == 2 || k == 3) && (c == 'b' || c == 'B' || c == 'm' || c == 'M'))   /* format: bin, mlv14, mlv12 */
+            {
+                int twelve = 0;
+                while (i < len && t[i] != '\n' && t[i] != ' ' && t[i] != '\t' && t[i] != '\r')
+                {
+                    if (t[i] == '1' && i + 1 < len && t[i + 1] == '2') twelve = 1;
+                    i++;
+                }
+                v[3] = (c == 'b' || c == 'B') ? 0 : twelve ? 2 : 1;
+                k = 4;
+                continue;
+            }
             if (k == 2 && (c == 'a' || c == 'i' || c == 'I' || c == 't'))
             {
                 v[2] = c == 'a' ? SYNC_AUTO : c == 't' ? SYNC_TIMER : SYNC_IRQ;
@@ -1250,11 +1456,11 @@ static int rt_auto_parse(const char *t, int len, int (*runs)[3], int max)
         }
         i++;
         if (k == 0) continue;           /* blank or comment line */
-        if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = 0; n++; continue; }
+        if (k == 9) { runs[n][0] = -1; runs[n][1] = runs[n][2] = runs[n][3] = 0; n++; continue; }
         int cs = v[0] == 1080 ? 0 : v[0] == 960 ? 1 : v[0] == 800 ? 2 : -1;
         int ds = v[1] == 10 ? 0 : v[1] == 20 ? 1 : v[1] == 40 ? 2 : -1;
         if (k < 2 || cs < 0 || ds < 0) { rt_auto_skipped++; continue; }
-        runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2];
+        runs[n][0] = cs; runs[n][1] = ds; runs[n][2] = v[2] < 0 ? SYNC_AUTO : v[2]; runs[n][3] = v[3];
         n++;
     }
     return n;
@@ -1308,7 +1514,7 @@ static void rt_auto_task(void *unused)
     if (!t) return;
     int pos = rt_read_int(RT_AUTO_POS, 0), ps, pl;
     int np = rt_auto_plan(t, len, pos, &ps, &pl);
-    int runs[6][3];
+    int runs[6][4];
     rt_auto_skipped = 0;
     int n = pos < np ? rt_auto_parse(t + ps, pl, runs, 6) : 0;
     fio_free(t);
@@ -1344,7 +1550,7 @@ static void rt_auto_task(void *unused)
         rt_busy = 1;
         rt_last[0] = 0;
         if (runs[i][0] < 0) { rt_pack_task(0); continue; }   /* synchronous; clears rt_busy */
-        rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2];
+        rt_crop_sel = runs[i][0]; rt_dur_sel = runs[i][1]; rt_sync_sel = runs[i][2]; rt_fmt_sel = runs[i][3];
         rt_task(0);                     /* synchronous; clears rt_busy */
         if (first_run < 0) first_run = rt_run_id;
         msleep(3000);
