@@ -746,7 +746,9 @@ static void rr_pick_name(void)
     for (int i = 0; sep[i]; i++)
     {
         char n[24];
-        snprintf(rr_base, sizeof(rr_base), "M%02d%c%02d%02d", now.tm_mday, sep[i], now.tm_hour, now.tm_min);
+        /* no %c: Canon's vsnprintf (the one ML uses) doesn't support it; v18.1 named a clip "M29------------" */
+        snprintf(rr_base, sizeof(rr_base), "M%02d-%02d%02d", now.tm_mday % 100, now.tm_hour % 100, now.tm_min % 100);
+        rr_base[3] = sep[i];
         snprintf(n, sizeof(n), "%s.MLV", rr_base);
         if (!is_file(n)) return;
     }
