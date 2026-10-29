@@ -4455,6 +4455,9 @@ livev_hipriority_task( void* unused )
                 #endif
                 if (k % 4 == 0)
                     BMP_LOCK( if (lv) draw_false_downsampled(); )
+                #ifdef CONFIG_R
+                if (k % 4 == 0 && lv) ml_refresh_display_needed = 1;   /* see below */
+                #endif
             }
             else
             #endif
@@ -4468,6 +4471,13 @@ livev_hipriority_task( void* unused )
                     if (lv)
                         draw_zebra_and_focus(zZ, zF);
                 )
+                #ifdef CONFIG_R
+                /* riz/eosr: zebras and peaking write ML's indexed layer directly and never asked for the
+                 * RGBA/XIMR refresh (only text, bmp_fill and the menu do), so their changes reached the screen
+                 * only when something else redrew: v19.1 ZEBDIAG showed overlays drawn 2.5-6x/s but refreshes
+                 * stalling for seconds (user: up to ~8 s behind). The refresh task caps this at 20/s. */
+                if (lv && ((zZ && zebra_draw) || (zF && focus_peaking))) ml_refresh_display_needed = 1;
+                #endif
             }
         }
 
