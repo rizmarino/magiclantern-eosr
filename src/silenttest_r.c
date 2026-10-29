@@ -53,7 +53,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.5"
+#define ST_VER              "v1.6"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -631,7 +631,7 @@ static void st_shot_task(void *unused)
  * tables (A 0xE0F16BF8, B 0xE0F16A00; 8-byte entries {fps100, lag_us}). Patched through ML's MMU remap of the
  * 64 KB ROM page 0xE0F10000 into RAM: cpu0 only, gone at power off, never written to flash. */
 #define ST_FPS_N 4
-static const uint32_t st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
+static const uint32_t __attribute__((unused)) st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
 static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750 };
 static int st_fps_sel;                  /* menu choice */
 static int st_fps_applied;              /* choice currently in effect */
@@ -667,6 +667,15 @@ static void st_fps_apply(int sel)
         err |= unpatch_memory(st_fps_addr[2]);
         if (!err) st_fps_applied = 0;
     }
+#ifdef CONFIG_MMU_REMAP_LAZY
+    /* v1.6: the remap is set up on first use (memory from Canon's AllocateMemory pool, not ML's footprint);
+     * errors show as 0x1000N: N = 1 wrong cpu, 4 alloc failed, 5 < 1 MB would stay free, 6 bad address, else init */
+    if (!err && sel != 0)
+    {
+        int mi = mmu_init_lazy();
+        if (mi < 0) err = 0x10000 | (-mi);
+    }
+#endif
     if (!err && sel != 0)
     {
         /* v1.5: two 12-byte patches {fps61, lag61, fps62} per table instead of four 4-byte ones: each ROM patch

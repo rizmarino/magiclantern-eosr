@@ -24,7 +24,11 @@
 #error "Attempting to build patch_mmu.c but cam not listed as having an MMU - this is probably a mistake"
 #endif
 
-#if !defined(PTR_ALLOC_MEM_START)
+#if defined(CONFIG_MMU_REMAP_LAZY)
+// riz/EOS R: no space in magiclantern.bin; mmu_init_lazy() takes it from AllocateMemory on first use
+static uint8_t *lazy_mmu_space = NULL;
+static uint32_t lazy_mmu_size = 0;
+#elif !defined(PTR_ALLOC_MEM_START)
 // If AllocMem start is defined, we assume MMU tables should be located there.
 // Otherwise we reserve space in magiclantern.bin:
 // 0x10000 for 1 remapped page, (0x10000 aligned)
@@ -495,6 +499,10 @@ static void init_mmu_globals(void)
     int res = calc_mmu_globals(orig_AM_start,
                                mmu_space);
 
+#elif defined(CONFIG_MMU_REMAP_LAZY)
+    if (!lazy_mmu_space)
+        return;
+    int res = calc_mmu_globals((uint32_t)lazy_mmu_space, lazy_mmu_size);
 #else
     // use space within magiclantern.bin
     int res = calc_mmu_globals((uint32_t)generic_mmu_space,
@@ -765,6 +773,40 @@ static int init_remap_mmu(void)
 
     return 0;
 }
+
+#if defined(CONFIG_MMU_REMAP_LAZY)
+extern void *_AllocateMemory(size_t size);
+extern void  _FreeMemory(void *ptr);
+extern int GetFreeMemForAllocateMemory(void);
+// riz/EOS R: set up the remap at runtime (cpu0, from a normal task), the first time a patch is wanted.
+// Takes one 64 KB page + L1/L2 tables (+ 64 KB alignment slack) from Canon's AllocateMemory pool, never freed.
+// Returns 0 on success, < 0 on failure (nothing changed).
+int mmu_init_lazy(void)
+{
+    if (mmu_globals_initialised)
+        return 0;
+    if (get_cpu_id() != 0)
+        return -1;
+    if (!lazy_mmu_space)
+    {
+        uint32_t sz = 2 * MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE + 0x300 + MMU_L2_TABLE_SIZE
+                      + sizeof(struct mmu_L2_page_info);
+        if (GetFreeMemForAllocateMemory() < (int)sz + 1024 * 1024)
+            return -5;                  // keep >= 1 MB free for Canon (mem.c: "at 1MB free, dispcheck may stop working")
+        uint8_t *p = _AllocateMemory(sz);
+        if (!p)
+            return -4;
+        if ((uint32_t)p >= 0x40000000)  // tables must be at a cacheable, identity-mapped address
+        {
+            _FreeMemory(p);
+            return -6;
+        }
+        lazy_mmu_space = p;
+        lazy_mmu_size = sz;
+    }
+    return init_remap_mmu();
+}
+#endif
 
 int mmu_init(void)
 {

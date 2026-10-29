@@ -41,5 +41,8 @@ int apply_normal_patches(void);
 // Sets up structures required for remapping via MMU,
 // and applies compile-time specified patches from platform/XXD/include/platform/mmu_patches.h
 int mmu_init(void);
+#if defined(CONFIG_MMU_REMAP_LAZY)
+int mmu_init_lazy(void);
+#endif
 
 #endif // _patch_mmu_h_

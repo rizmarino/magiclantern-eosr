@@ -444,7 +444,7 @@ static void my_big_init_task()
         return;
     }
 
-#if defined(CONFIG_MMU_REMAP) && defined(CONFIG_RPC)
+#if defined(CONFIG_MMU_REMAP) && defined(CONFIG_RPC) && !defined(CONFIG_MMU_REMAP_LAZY)
     int err = apply_normal_patches();
     if (err < 0)
         qprintf("Error from apply_normal_patches: %d\n", err);
@@ -632,7 +632,7 @@ void boot_pre_init_task()
     #if defined(CONFIG_RPC)
     RPC_sem = create_named_semaphore("RPC", SEM_CREATE_UNLOCKED);
     #endif
-    #if defined(CONFIG_MMU_REMAP)
+    #if defined(CONFIG_MMU_REMAP) && !defined(CONFIG_MMU_REMAP_LAZY)
     if (mmu_init() < 0)
         DryosDebugMsg(0, 15, "ERROR doing mmu_init()");
     #endif
