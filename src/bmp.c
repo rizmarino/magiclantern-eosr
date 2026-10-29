@@ -110,13 +110,9 @@ void bmp_draw_to_idle(int value) { bmp_idle_flag = value; }
 struct MARV *rgb_vram_info = NULL;
 static uint8_t *bmp_vram_indexed = NULL;
 // SJE what is an appropriate priority for this task?
-#if defined(CONFIG_R)
-/* riz/eosr: one step above the overlay loop (livev_hiprio 0x18). At 0x1e the busier v19.3 overlay loop stretched each
- * refresh to 35-65 ms wall time (10-15 ms CPU) and delayed the next one. */
-TASK_CREATE( "redraw_task", refresh_yuv_from_rgb_task, 0, 0x17, 0x1000 );
-#else
+/* riz/eosr: v19.4 tried 0x17 (above the overlay loop): refreshes got faster (14/s, 9-14 ms) but overlay passes slowed
+ * to match (no visible gain) and refreshes interrupting the menu's drawing made the ML menu flicker. Kept at 0x1e. */
 TASK_CREATE( "redraw_task", refresh_yuv_from_rgb_task, 0, 0x1e, 0x1000 );
-#endif
 #endif
 // SJE should this global live in bmp.c?
 uint32_t ml_refresh_display_needed = 0;
@@ -386,7 +382,8 @@ void refresh_yuv_from_rgb_task(void *unused)
             #endif
         }
         #if defined(CONFIG_R)
-        msleep(ml_refresh_display_needed ? 10 : 20);   // riz/eosr: poll faster (overlays request ~14 refreshes/s)
+        // riz/eosr: poll faster for LV overlays; menu keeps the stock 50 ms (faster refreshes caught it mid-draw)
+        msleep(gui_menu_shown() ? 50 : ml_refresh_display_needed ? 10 : 20);
         #else
         msleep(50); // max 20 fps refresh
         #endif
