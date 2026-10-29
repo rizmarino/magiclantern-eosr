@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1"
+#define ST_VER              "v1.1"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -161,11 +161,10 @@ static void st_scs_poll(void)
 }
 
 /* ---- Canon DbgMgr log ---- */
-static const uint8_t st_lv_classes[] = { 0xC9, 0x9C, 0x9D, 0x9E, 0xCA, 0x93, 0xB7 };    /* muted: ~95 KB/s in LV */
+static const uint8_t st_lv_classes[] = { 0xC9, 0x9C, 0x9D, 0x9E, 0xCA, 0x93, 0xB7, 0x92 };  /* muted; 0x92 = LVGMT/LVEZM (v1: flooded the log) */
 static const uint8_t st_cap_classes[] = {
     0x8E,   /* CaptureState: ShutType/ROMode/ReleaseType, scs* */
     0x8C,   /* CAPD: ImageSequence / ImageController (EshutState) */
-    0x92,   /* PROP_SILENT_SHUTTER_SETTING dispatcher */
     0x82,   /* GUI: GUI_SetSilentShutter, Dlg* */
     0x81,   /* PROP_DRIVE_MODE defaults per shot mode */
     0x0C,   /* "%s : PROP_DRIVE_MODE(%d)" */
@@ -226,6 +225,8 @@ static const char *st_note_name(uint32_t id)
         case 5: return "abort";
         case 6: return "idle-timeout";
         case 7: return "queue-probe";   /* retry mode: 3 presses while busy; extra shots = queued */
+        case 8: return "runaway";       /* Canon fired without our press: presses, shots */
+        case 9: return "runaway-stop";  /* shots after release-up, after press cycle */
         default: return "note";
     }
 }
@@ -238,11 +239,11 @@ static void st_dump_state(const char *tag)
     st_scs_read(s);
     st_printf("%s:", tag);
     for (int k = 0; k < P_N; k++)
-        st_printf(st_dec(k) ? " %s=%u" : " %s=%x", st_pname[k], (unsigned)st_cur[k]);
-    st_printf(" jobedges=%u SCS10=%x SCS2C=%x SCS58=%x\n", (unsigned)st_job_edges, (unsigned)s[0], (unsigned)s[1], (unsigned)s[2]);
+        st_printf(st_dec(k) ? " %s=%d" : " %s=%x", st_pname[k], (unsigned)st_cur[k]);
+    st_printf(" jobedges=%d SCS10=%x SCS2C=%x SCS58=%x\n", (unsigned)st_job_edges, (unsigned)s[0], (unsigned)s[1], (unsigned)s[2]);
     st_printf("%s handler calls:", tag);
     for (int k = 0; k < P_N; k++)
-        st_printf(" %s=%u/%ub", st_pname[k], (unsigned)st_cnt[k], (unsigned)st_cur_len[k]);
+        st_printf(" %s=%d/%db", st_pname[k], (unsigned)st_cnt[k], (unsigned)st_cur_len[k]);
     st_printf("\n");
 }
 
@@ -260,7 +261,7 @@ static void st_dump_events(void)
             {
                 int pk = -1;
                 for (int k = 0; k < P_N; k++) if (st_props[k] == e->id) pk = k;
-                st_printf(pk >= 0 && st_dec(pk) ? "%6d P %-6s len %u: %u %u %u\n" : "%6d P %-6s len %u: %x %x %x\n",
+                st_printf(pk >= 0 && st_dec(pk) ? "%6d P %s len %d: %d %d %d\n" : "%6d P %s len %d: %x %x %x\n",
                           t, pk >= 0 ? st_pname[pk] : "?", e->len, (unsigned)e->v[0], (unsigned)e->v[1], (unsigned)e->v[2]);
                 break;
             }
@@ -268,13 +269,13 @@ static void st_dump_events(void)
                 st_printf("%6d S SCS +10=%x +2C=%x +58=%x\n", t, (unsigned)e->v[0], (unsigned)e->v[1], (unsigned)e->v[2]);
                 break;
             case EV_PRESS:
-                st_printf("%6d > press %u (hold %u ms)\n", t, (unsigned)e->id, (unsigned)e->v[0]);
+                st_printf("%6d > press %d (hold %d ms)\n", t, (unsigned)e->id, (unsigned)e->v[0]);
                 break;
             case EV_UNPRESS:
-                st_printf("%6d < unpress %u\n", t, (unsigned)e->id);
+                st_printf("%6d < unpress %d\n", t, (unsigned)e->id);
                 break;
             default:
-                st_printf("%6d N %s %u: %u %u %u\n", t, st_note_name(e->id), (unsigned)e->id, (unsigned)e->v[0], (unsigned)e->v[1], (unsigned)e->v[2]);
+                st_printf("%6d N %s %d: %d %d %d\n", t, st_note_name(e->id), (unsigned)e->id, (unsigned)e->v[0], (unsigned)e->v[1], (unsigned)e->v[2]);
         }
     }
 }
@@ -307,7 +308,7 @@ static void st_begin(int run, const char *what)
     st_loglen = 0;
     st_t0 = get_ms_clock();
     st_scs_read(st_scs);
-    st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%u ms\n", ST_VER, run, what, st_dm_sel ? "ON" : "OFF", (unsigned)st_t0);
+    st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%d ms\n", ST_VER, run, what, st_dm_sel ? "ON" : "OFF", (unsigned)st_t0);
     st_dump_state("start");
     st_armed = 1;
     if (st_dm_sel) st_dm_start(run);
@@ -372,7 +373,19 @@ static void st_sleep_poll(int ms)
     for (int t = 0; t < ms; t += 10) { st_scs_poll(); msleep(10); }
 }
 
-/* job state non-zero seen, then zero for `quiet` ms; returns 0 on timeout */
+/* v1.1: release-up sent twice. In v1 Canon once kept firing ~1/s for 12 s after a press (single drive, silent on),
+ * as if the release-up was lost, and stopped after the next press/release cycle. */
+static void st_release_up(void)
+{
+    SetEventIrRemoteReleaseBtn(0);
+    st_sleep_poll(30);
+    SetEventIrRemoteReleaseBtn(0);
+}
+
+/* runaway guard: more shots than this means Canon fired without a press of ours (0 = off) */
+static int st_guard;
+
+/* job state non-zero seen, then zero for `quiet` ms; returns 0 on timeout, -1 when the guard trips */
 static int st_wait_idle(int busy_wait, int quiet, int max_ms)
 {
     uint32_t t0 = get_ms_clock();
@@ -380,11 +393,38 @@ static int st_wait_idle(int busy_wait, int quiet, int max_ms)
     uint32_t q0 = get_ms_clock();
     while ((int)(get_ms_clock() - t0) < max_ms)
     {
+        if (st_guard && st_progress() > st_guard) return -1;
         if (ST_JOB() != 0) q0 = get_ms_clock();
         else if ((int)(get_ms_clock() - q0) >= quiet) return 1;
         st_sleep_poll(10);
     }
     return 0;
+}
+
+/* Canon fired without our press: release-up again, watch 2.5 s; if it still fires, one press/release cycle (what
+ * ended the v1 runaway), watch 3 s more. Returns the shots seen after the guard tripped. */
+static int st_runaway_stop(int presses)
+{
+    st_guard = 0;
+    int p0 = st_progress();
+    st_note(8, presses, p0, 0);
+    NotifyBox(5000, "Silent test: camera fired on its own. Switch it OFF if it keeps going.");
+    st_release_up();
+    st_sleep_poll(2500);
+    int more1 = st_progress() - p0, more2 = 0;
+    if (more1 > 0)
+    {
+        SetEventIrRemoteReleaseBtn(1);
+        st_sleep_poll(300);
+        st_release_up();
+        int p1 = st_progress();
+        st_sleep_poll(3000);
+        more2 = st_progress() - p1;
+    }
+    st_note(9, more1, more2, 0);
+    st_printf("RUNAWAY: Canon fired without a press (shots %d > expected after %d presses); "
+              "after release-up %d more, after press cycle %d more\n", p0, presses, more1, more2);
+    return more1 + more2;
 }
 
 struct st_shot { uint16_t press, hold; uint32_t t_press, t_acc; uint8_t step, after_probe; };
@@ -399,6 +439,7 @@ static void st_shot_task(void *unused)
     if (!st_menu_wait()) { snprintf(st_last, sizeof(st_last), "menu still open"); free(sh); st_busy = 0; return; }
 
     st_begin(run, retry ? "shot test RETRY" : "shot test PACED");
+    st_printf("v1.1 safety: release-up sent twice, runaway guard on\n");
     st_printf("shots %d, mode %s\n", nshots, retry ? "retry (hold 100 ms, re-press after 150 ms without accept)" : "paced (hold 300 ms, next press after job idle 150 ms)");
     st_rel0 = st_cur[P_RELCNT];
     st_file0 = st_cur[P_FILENO];
@@ -406,12 +447,14 @@ static void st_shot_task(void *unused)
 
     int hold = retry ? 100 : 300;
     int acc = 0, presses = 0, miss_run = 0, aborted = 0, nsh = 0, frozen = !st_dm_sel;
-    int probed = !retry, probe_mark = 0;
+    int probed = !retry, probe_mark = 0, runaway = 0;
     uint32_t t_first_acc = 0;
     const char *why = "done";
 
     while (acc < nshots)
     {
+        /* each press gives at most one shot; paced: nothing may arrive after the accepted one */
+        if (st_progress() > (retry ? presses : acc)) { why = "RUNAWAY (camera fired on its own)"; aborted = 1; runaway = 1; break; }
         if ((int)(get_ms_clock() - st_t0) > 90000) { why = "90 s limit"; aborted = 1; break; }
         if (presses >= (retry ? nshots * 30 : nshots * 3)) { why = "press limit"; aborted = 1; break; }
 
@@ -421,7 +464,7 @@ static void st_shot_task(void *unused)
         st_add(EV_PRESS, presses, 0, hv);
         SetEventIrRemoteReleaseBtn(1);
         st_sleep_poll(hold);
-        SetEventIrRemoteReleaseBtn(0);
+        st_release_up();
         st_add(EV_UNPRESS, presses, 0, 0);
 
         /* accepted = release counter or file number moved on */
@@ -430,6 +473,7 @@ static void st_shot_task(void *unused)
         while (st_progress() <= acc && (int)(get_ms_clock() - tu) < wait) st_sleep_poll(10);
         int p = st_progress();
         int got = p > acc;
+        if (got && st_progress() > presses) { why = "RUNAWAY (camera fired on its own)"; aborted = 1; runaway = 1; break; }
         if (got)
         {
             uint32_t ta = get_ms_clock();
@@ -464,6 +508,7 @@ static void st_shot_task(void *unused)
             st_note(4, acc, 0, 0);
             frozen = 1;
         }
+        st_guard = retry ? presses : acc;
         if (!retry && got && acc < nshots && !st_wait_idle(3000, 150, 15000)) st_note(6, presses, 0, 0);
 
         /* retry mode, once after the first shot: 3 quick presses while the camera is busy. Canon dropped such
@@ -479,10 +524,11 @@ static void st_shot_task(void *unused)
                 st_add(EV_PRESS, presses, 0, pv);
                 SetEventIrRemoteReleaseBtn(1);
                 st_sleep_poll(hold);
-                SetEventIrRemoteReleaseBtn(0);
+                st_release_up();
                 st_add(EV_UNPRESS, presses, 0, 0);
                 st_sleep_poll(50);
             }
+            st_guard = presses;
             st_wait_idle(3000, 500, 15000);
             st_sleep_poll(500);
             int extra = st_progress() - acc;
@@ -495,27 +541,38 @@ static void st_shot_task(void *unused)
     }
 
     /* let Canon finish writing before any card I/O of ours: idle for 2 s (max 30 s) */
+    /* (runaway: stop it first, before any waiting) */
+    int run_more = runaway ? st_runaway_stop(presses) : 0;
     if (!frozen)
     {
-        st_sleep_poll(4000);
+        for (int t = 0; t < 4000 && (runaway || st_progress() <= presses); t += 10) st_sleep_poll(10);
         st_dm_freeze(run, "after shots");
     }
+    st_guard = runaway ? 0 : presses;
     int idle = st_wait_idle(0, 2000, 30000);
+    if (!runaway && st_progress() > presses)
+    {
+        why = "RUNAWAY (camera fired on its own)"; aborted = 1; runaway = 1;
+        run_more = st_runaway_stop(presses);
+        idle = st_wait_idle(0, 2000, 30000);
+    }
+    st_guard = 0;
     st_sleep_poll(1000);
     st_end(run);
 
     /* summary */
-    st_printf("summary: %s; presses %d, accepted %d of %d%s; RELCNT +%d, FILENO +%d, MECHA +%d, job edges +%u; final idle %s\n",
+    st_printf("summary: %s; presses %d, accepted %d of %d%s; RELCNT +%d, FILENO +%d, MECHA +%d, job edges +%d; final idle %s\n",
               why, presses, acc, nshots, aborted ? " (ABORTED)" : "",
               (int)(st_cur[P_RELCNT] - st_rel0), (int)(st_cur[P_FILENO] - st_file0), (int)(st_cur[P_MECHA] - mech0),
-              (unsigned)(st_job_edges - edges0), idle ? "ok" : "TIMEOUT");
+              (unsigned)(st_job_edges - edges0), idle > 0 ? "ok" : "TIMEOUT");
+    if (runaway) st_printf("RUNAWAY: %d shot(s) after the guard tripped\n", run_more);
     st_printf("shot press# hold t_press t_accept latency interval\n");
     int imin = 0, imax = 0, isum = 0, nint = 0;
     for (int i = 0; i < nsh; i++)
     {
         int lat = sh[i].t_acc - sh[i].t_press;
         int itv = i ? (int)(sh[i].t_acc - sh[i - 1].t_acc) : 0;
-        st_printf("%4d %6u %4u %7u %8u %7d %8d%s%s\n", i + 1, sh[i].press, sh[i].hold, (unsigned)sh[i].t_press, (unsigned)sh[i].t_acc, lat, itv,
+        st_printf("%4d %6d %4d %7d %8d %7d %8d%s%s\n", i + 1, sh[i].press, sh[i].hold, (unsigned)sh[i].t_press, (unsigned)sh[i].t_acc, lat, itv,
                   sh[i].step > 1 ? " (several at once)" : "", sh[i].after_probe ? " (after queue probe, not timed)" : "");
         if (i && !sh[i].after_probe)
         {
@@ -533,6 +590,7 @@ static void st_shot_task(void *unused)
     }
     else
         snprintf(st_last, sizeof(st_last), "%d/%d shots (%s)", acc, nshots, why);
+    if (runaway) snprintf(st_last, sizeof(st_last), "RUNAWAY: camera fired on its own (%d/%d)", acc, nshots);
 
     st_save(run);
     free(sh);
