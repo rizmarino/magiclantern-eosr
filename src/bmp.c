@@ -110,7 +110,13 @@ void bmp_draw_to_idle(int value) { bmp_idle_flag = value; }
 struct MARV *rgb_vram_info = NULL;
 static uint8_t *bmp_vram_indexed = NULL;
 // SJE what is an appropriate priority for this task?
+#if defined(CONFIG_R)
+/* riz/eosr: one step above the overlay loop (livev_hiprio 0x18). At 0x1e the busier v19.3 overlay loop stretched each
+ * refresh to 35-65 ms wall time (10-15 ms CPU) and delayed the next one. */
+TASK_CREATE( "redraw_task", refresh_yuv_from_rgb_task, 0, 0x17, 0x1000 );
+#else
 TASK_CREATE( "redraw_task", refresh_yuv_from_rgb_task, 0, 0x1e, 0x1000 );
+#endif
 #endif
 // SJE should this global live in bmp.c?
 uint32_t ml_refresh_display_needed = 0;
@@ -200,7 +206,7 @@ extern struct semaphore *winsys_sem;
  * words. Our dedicated compositor layer is written only by ML, so skipping
  * unchanged pixels is safe; a full redraw every R_FULL_EVERY refreshes (and
  * whenever the RGBA buffer pointer changes) guards against anything else. */
-#define R_FULL_EVERY 100 /* ~1 full redraw per 15-20 s; also forced on pointer/output change */
+#define R_FULL_EVERY 300 /* ~1 full redraw per ~20 s at v19.4's ~14 refreshes/s (a full one takes 100-400 ms); also forced on pointer/output change */
 static uint32_t *r_shadow = NULL;
 static uint32_t *r_shadow_rgb = NULL;
 static int r_full_countdown = 0;
@@ -379,7 +385,11 @@ void refresh_yuv_from_rgb_task(void *unused)
             refresh_yuv_from_rgb();
             #endif
         }
+        #if defined(CONFIG_R)
+        msleep(ml_refresh_display_needed ? 10 : 20);   // riz/eosr: poll faster (overlays request ~14 refreshes/s)
+        #else
         msleep(50); // max 20 fps refresh
+        #endif
     }
 }
 
