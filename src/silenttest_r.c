@@ -53,7 +53,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.3"
+#define ST_VER              "v1.4"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -311,8 +311,8 @@ static void st_dump_events(void)
 static int st_watch_sel = 1;            /* 30 / 90 / 180 s */
 static const int st_watch_s[] = { 30, 90, 180 };
 static int st_mode_sel = 0;             /* 0 paced, 1 retry */
-static int st_nsel = 1;                 /* 5 / 10 / 20 shots */
-static const int st_nshots[] = { 5, 10, 20 };
+static int st_nsel = 1;                 /* 5 / 10 / 20 / 200 shots (200: burst log buffer test) */
+static const int st_nshots[] = { 5, 10, 20, 200 };
 static int st_dm_sel = 1;               /* Canon log */
 
 static volatile int st_busy;
@@ -633,9 +633,19 @@ static void st_shot_task(void *unused)
 #define ST_FPS_N 4
 static const uint32_t st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
 static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750 };
-static int st_fps_sel;                  /* menu choice; not saved, so every boot starts at Canon's 5.0 */
+static int st_fps_sel;                  /* menu choice */
 static int st_fps_applied;              /* choice currently in effect */
 static int st_fps_err;
+/* v1.4: the choice is saved and re-applied ~5 s after boot. A marker file is written before that apply and removed
+ * after it; if it is still there at the next boot (the apply froze the camera), the auto-apply is skipped once and
+ * the saved choice goes back to Canon. */
+#ifdef ST_HOST
+static int st_fps_saved;
+#else
+static CONFIG_INT("silent.test.hfps", st_fps_saved, 0);
+#endif
+#define ST_FPS_MARKER "ML/SETTINGS/SFPS.PND"
+static char st_fps_boot[48] = "";
 
 static void st_fps_table(uint32_t *o)
 {
@@ -673,11 +683,47 @@ static void st_fps_apply(int sel)
     }
     st_fps_err = err;
     if (err) st_fps_sel = st_fps_applied;
+    st_fps_saved = st_fps_applied;      /* only a working setting is saved */
 #else
     st_fps_err = -1;
     st_fps_sel = 0;
 #endif
 }
+
+
+#if defined(CONFIG_MMU_REMAP) && !defined(ST_HOST)
+static void st_fps_boot_task(void *unused)
+{
+    /* INIT_FUNCs run before config_load(): wait until ML has started (config read), then ~4 s more for Canon */
+    extern int ml_started;
+    for (int i = 0; i < 300 && !ml_started; i++) msleep(100);
+    msleep(4000);
+    int want = st_fps_saved;
+    if (want <= 0 || want >= COUNT(st_fps_val)) { st_fps_saved = 0; return; }
+    if (st_fps_applied) return;         /* already set from the menu meanwhile */
+    uint32_t sz;
+    if (FIO_GetFileSize(ST_FPS_MARKER, &sz) == 0)
+    {
+        /* the previous boot started this apply and never finished it */
+        FIO_RemoveFile(ST_FPS_MARKER);
+        st_fps_saved = 0;
+        snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-apply skipped (last one didn't finish)");
+        NotifyBox(5000, "Silent H fps: auto-apply skipped, back to Canon 5.0");
+        return;
+    }
+    FILE *f = FIO_CreateFile(ST_FPS_MARKER);
+    if (f) FIO_CloseFile(f);
+    st_fps_sel = want;
+    st_fps_apply(want);
+    FIO_RemoveFile(ST_FPS_MARKER);
+    int v = st_fps_val[st_fps_applied];
+    if (st_fps_err)
+        snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-apply ERROR %x", st_fps_err);
+    else
+        snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-applied at boot");
+    NotifyBox(4000, "Silent H fps %d.%d %s", v / 100, (v / 10) % 10, st_fps_err ? "FAILED" : "applied");
+}
+#endif
 
 /* ---- burst log (v1.2): the user holds the shutter in High-speed continuous; ML never presses ---- */
 static void st_burst_task(void *unused)
@@ -688,7 +734,8 @@ static void st_burst_task(void *unused)
 
     st_burst_mode = 1;
     st_begin(run, "burst log (user holds the shutter)");
-    st_printf("v1.2 burst log: read-only, no presses; stop after %d frames, 3 s, or 600 ms without a frame\n", nmax);
+    int tmax = nmax >= 200 ? 40000 : 3000;
+    st_printf("v1.2 burst log: read-only, no presses; stop after %d frames, %d s, or 600 ms without a frame\n", nmax, tmax / 1000);
     {
         uint32_t tb[ST_FPS_N];
         st_fps_table(tb);
@@ -696,14 +743,20 @@ static void st_burst_task(void *unused)
                   st_fps_val[st_fps_applied], st_fps_err, (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
     }
     uint32_t rel0 = st_cur[P_RELCNT], mech0 = st_cur[P_MECHA];
-    NotifyBox(5000, "Burst log armed: hold the shutter about 3 s now");
+    NotifyBox(5000, "Burst log armed: hold the shutter now (ML menu = cancel)");
 
+    /* v1.4: opening the ML menu while armed cancels the run */
     uint32_t tw = get_ms_clock();
-    while (st_cur[P_RELCNT] == rel0 && (int)(get_ms_clock() - tw) < 60000) st_sleep_poll(10);
+    int cancelled = 0;
+    while (st_cur[P_RELCNT] == rel0 && (int)(get_ms_clock() - tw) < 60000)
+    {
+        if (gui_menu_shown()) { cancelled = 1; break; }
+        st_sleep_poll(10);
+    }
 
-    const char *why = "no frame within 60 s";
+    const char *why = cancelled ? "cancelled (ML menu opened)" : "no frame within 60 s";
     int win = 0;
-    if (st_cur[P_RELCNT] != rel0)
+    if (!cancelled && st_cur[P_RELCNT] != rel0)
     {
         uint32_t t1 = get_ms_clock(), tlast = t1, last = st_cur[P_RELCNT];
         while (1)
@@ -712,7 +765,7 @@ static void st_burst_task(void *unused)
             uint32_t c = st_cur[P_RELCNT];
             if (c != last) { last = c; tlast = get_ms_clock(); }
             if ((int)(c - rel0) >= nmax) { why = "frame limit"; break; }
-            if ((int)(get_ms_clock() - t1) >= 3000) { why = "3 s limit"; break; }
+            if ((int)(get_ms_clock() - t1) >= tmax) { why = "time limit"; break; }
             if ((int)(get_ms_clock() - tlast) >= 600) { why = "shutter released"; break; }
         }
         win = (int)(st_cur[P_RELCNT] - rel0);
@@ -732,6 +785,7 @@ static void st_burst_task(void *unused)
 
     st_printf("frame t_ms interval_ms\n");
     int n = st_n, k = 0, imin = 0, imax = 0, isum = 0, nint = 0, tprev = 0;
+    int *ivs = malloc(512 * sizeof(int));   /* intervals, for the buffer-full check */
     for (int i = 0; i < n; i++)
     {
         struct st_ev *e = &st_ev[i];
@@ -740,6 +794,7 @@ static void st_burst_task(void *unused)
         int itv = k ? t - tprev : 0;
         k++;
         st_printf("%5d %7d %8d\n", k, t, itv);
+        if (k > 1 && ivs && nint < 512) ivs[nint] = itv;
         if (k > 1)
         {
             if (!nint || itv < imin) imin = itv;
@@ -755,10 +810,41 @@ static void st_burst_task(void *unused)
         st_printf("interval ms (%d): min %d, mean %d, max %d = %d.%02d fps at the mean\n",
                   nint, imin, mean, imax, 1000 / MAX(1, mean), (100000 / MAX(1, mean)) % 100);
         snprintf(st_last, sizeof(st_last), "%d frames, mean %d ms", k, mean);
+
+        /* buffer full: first interval > 1.4x the median of the first 8, with 3 of the next 5 also slow */
+        int nb = MIN(nint, 512);
+        if (ivs && nb >= 12)
+        {
+            int h[8], m = MIN(8, nb);
+            for (int i = 0; i < m; i++) h[i] = ivs[i];
+            for (int i = 1; i < m; i++) for (int j = i; j > 0 && h[j - 1] > h[j]; j--) { int x = h[j]; h[j] = h[j - 1]; h[j - 1] = x; }
+            int base = h[m / 2], lim = base * 14 / 10, at = -1;
+            for (int i = 8; i + 5 <= nb && at < 0; i++)
+            {
+                if (ivs[i] <= lim) continue;
+                int slow = 0;
+                for (int j = i + 1; j <= i + 5; j++) slow += ivs[j - 1] > lim;
+                if (slow >= 3) at = i;
+            }
+            if (at >= 0)
+            {
+                int s0 = 0, s1 = 0;
+                for (int i = 0; i < at; i++) s0 += ivs[i];
+                for (int i = at; i < nb; i++) s1 += ivs[i];
+                int m0 = s0 / MAX(1, at), m1 = s1 / MAX(1, nb - at);
+                st_printf("buffer full after frame %d (%d.%d s): before %d ms (%d.%02d fps), after %d ms (%d.%02d fps)\n",
+                          at + 1, s0 / 1000, (s0 / 100) % 10, m0, 1000 / MAX(1, m0), (100000 / MAX(1, m0)) % 100,
+                          m1, 1000 / MAX(1, m1), (100000 / MAX(1, m1)) % 100);
+                snprintf(st_last, sizeof(st_last), "%d frames; slows after %d (%d -> %d ms)", k, at + 1, m0, m1);
+            }
+            else
+                st_printf("buffer: no slowdown in %d frames (base %d ms)\n", k, base);
+        }
     }
     else
         snprintf(st_last, sizeof(st_last), "%d frames (%s)", k, why);
 
+    if (ivs) free(ivs);
     st_save(run);
     st_burst_mode = 0;
     st_busy = 0;
@@ -800,8 +886,8 @@ static MENU_UPDATE_FUNC(st_fps_update)
     else
     {
         MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
-        MENU_SET_WARNING(MENU_WARN_INFO, "Table now %d %d %d %d (500 = Canon). RAM only, gone at power off.",
-                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
+        MENU_SET_WARNING(MENU_WARN_INFO, "Table %d %d %d %d. Saved, re-applied at boot. %s",
+                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3], st_fps_boot);
     }
 }
 
@@ -853,8 +939,8 @@ static struct menu_entry st_menu[] = {
             {
                 .name    = "Shots",
                 .priv    = &st_nsel,
-                .max     = 2,
-                .choices = CHOICES("5", "10", "20"),
+                .max     = 3,
+                .choices = CHOICES("5", "10", "20", "200"),
             },
             {
                 .name    = "Silent H fps",
@@ -863,8 +949,8 @@ static struct menu_entry st_menu[] = {
                 .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5"),
                 .select  = st_fps_select,
                 .update  = st_fps_update,
-                .help    = "Patches Canon's silent High-speed burst rate in RAM.",
-                .help2   = "Not saved: power off returns to Canon 5.0.",
+                .help    = "Patches Canon's silent High-speed burst rate (RAM copy of ROM).",
+                .help2   = "Saved; re-applied ~5 s after boot. Canon 5.0 = off.",
             },
             {
                 .name   = "Burst log",
@@ -888,6 +974,9 @@ static struct menu_entry st_menu[] = {
 static void st_init(void *unused)
 {
     menu_add("Debug", st_menu, COUNT(st_menu));
+#ifdef CONFIG_MMU_REMAP
+    task_create("st_fps_boot", 0x1e, 0x1000, st_fps_boot_task, 0);
+#endif
 }
 
 INIT_FUNC("silenttest", st_init);
