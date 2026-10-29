@@ -748,6 +748,15 @@ struct vram_info * get_yuv422_vram()
         vram_lv.vram = CACHEABLE(get_lcd_422_buf());
     else
         vram_lv.vram = CACHEABLE(get_fastrefresh_422_buf());
+#ifdef CONFIG_R
+    /* riz/eosr: overlays read the cached LV snapshot (zebra.c lv_snapshot_update) when it is fresh */
+    if (lv && !(gui_state == GUISTATE_PLAYMENU || lv_paused || QR_MODE))
+    {
+        extern void *lv_snapshot_get(void);
+        void *snap = lv_snapshot_get();
+        if (snap) vram_lv.vram = snap;
+    }
+#endif
     return &vram_lv;
 }
 
@@ -909,7 +918,29 @@ static MENU_UPDATE_FUNC(r_evf_align_update)
         MENU_SET_WARNING(MENU_WARN_INFO, "Applies only with the viewfinder (EVF) active.");
 }
 
+extern int lv_snap_on;
+static MENU_UPDATE_FUNC(r_snap_update)
+{
+    extern uint32_t r_snap_us_last, r_snap_count, r_snap_fail, r_snap_verify, r_snap_heap_kb, r_snap_stale;
+    if (!lv_snap_on) return;
+    if (r_snap_us_last) MENU_SET_RINFO("%d ms", (r_snap_us_last + 500) / 1000);
+    if (r_snap_verify == 2)
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Copy check failed on this camera: overlays read Canon's buffer directly.");
+    else if (!r_snap_count && r_snap_fail)
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "No memory for the copy (Canon heap %d KB free): overlays read directly.", r_snap_heap_kb);
+    else if (r_snap_stale > r_snap_count)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Copy often stale (cache): overlays mostly read directly.");
+}
+
 static struct menu_entry r_evf_menus[] = {
+    {
+        .name   = "Fast LV copy",
+        .priv   = &lv_snap_on,
+        .max    = 1,
+        .update = r_snap_update,
+        .help   = "ON: overlays read a DMA copy of the live view (fast). OFF: they read Canon's",
+        .help2  = "uncached buffer directly (slow, the old behaviour; for comparison).",
+    },
     {
         .name   = "EVF overlay align",
         .update = r_evf_align_update,

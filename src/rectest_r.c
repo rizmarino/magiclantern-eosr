@@ -113,6 +113,7 @@ static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
 
 static volatile int rt_busy = 0;
+int rawrec_running(void) { return rt_busy; }   /* zebra.c: no overlay LV copies while the recorder runs */
 /* v16: REC-button raw recording. rr_on = menu switch; rr_active = the current run was started by REC
  * (no fixed duration; stops on the next REC press, rr_stop); rr_t0/rr_frames feed the on-screen status. */
 static CONFIG_INT("r.rawrec.rec", rr_on, 0);
