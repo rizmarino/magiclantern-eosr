@@ -53,7 +53,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.4"
+#define ST_VER              "v1.5"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -313,7 +313,7 @@ static const int st_watch_s[] = { 30, 90, 180 };
 static int st_mode_sel = 0;             /* 0 paced, 1 retry */
 static int st_nsel = 1;                 /* 5 / 10 / 20 / 200 shots (200: burst log buffer test) */
 static const int st_nshots[] = { 5, 10, 20, 200 };
-static int st_dm_sel = 1;               /* Canon log */
+static int st_dm_sel = 0;               /* Canon log; v1.5: default OFF (heavy DbgMgr logging is a suspect in 3 crashes) */
 
 static volatile int st_busy;
 static int st_runs;
@@ -663,22 +663,28 @@ static void st_fps_apply(int sel)
     int err = 0;
     if (st_fps_applied != 0)
     {
-        for (int i = 0; i < ST_FPS_N; i++) err |= unpatch_memory(st_fps_addr[i]);
+        err |= unpatch_memory(st_fps_addr[0]);
+        err |= unpatch_memory(st_fps_addr[2]);
         if (!err) st_fps_applied = 0;
     }
     if (!err && sel != 0)
     {
-        struct patch p[ST_FPS_N];
-        for (int i = 0; i < ST_FPS_N; i++)
+        /* v1.5: two 12-byte patches {fps61, lag61, fps62} per table instead of four 4-byte ones: each ROM patch
+         * runs with interrupts off (TTBR update + cache clean), and the v1.4 boot apply was followed by Canon
+         * "EISSyncTimer0CBR:OVERRUN" warnings. apply_patches copies the values, so locals are fine. */
+        static const uint32_t old3[3] = { 500, 44000, 500 };
+        uint32_t new3[3] = { (uint32_t)st_fps_val[sel], 44000, (uint32_t)st_fps_val[sel] };
+        struct patch p[2];
+        for (int i = 0; i < 2; i++)
         {
-            p[i].addr = (uint8_t *)st_fps_addr[i];
-            p[i].old_value = 500;       /* apply_patches refuses all four on any mismatch */
-            p[i].new_value = st_fps_val[sel];
-            p[i].size = 4;
+            p[i].addr = (uint8_t *)st_fps_addr[i * 2];
+            p[i].old_values = (uint8_t *)old3;   /* apply_patches refuses both on any mismatch */
+            p[i].new_values = (uint8_t *)new3;
+            p[i].size = 12;
             p[i].description = "Silent H burst fps";
             p[i].is_instruction = 0;
         }
-        err = apply_patches(p, ST_FPS_N);
+        err = apply_patches(p, 2);
         if (!err) st_fps_applied = sel;
     }
     st_fps_err = err;
