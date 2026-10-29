@@ -5,6 +5,12 @@
 /** This camera has a DIGIC VIII chip */
 #define CONFIG_DIGIC_VIII
 
+/** has inter-core RPC (depends on SGI 0xC), required by CONFIG_MMU_REMAP (PR #281) */
+#define CONFIG_RPC
+
+/** Cam has MMU (by itself does nothing, see CONFIG_MMU_REMAP) */
+#define CONFIG_MMU
+
 /** Digic 8 does not have bitmap font in ROM, try to load it from card **/
 #define CONFIG_NO_BFNT
 

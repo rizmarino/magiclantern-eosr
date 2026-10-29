@@ -39,6 +39,14 @@ THUMB_FN(0xE02C6D40,  dcache_clean)                         /* loop with MCR p15
 THUMB_FN(0xE02C6E14,  icache_invalidate)                    /* loop with MCR p15 c7,c5,1; c7,c1,6; c7,c1,0; ISB */
 THUMB_FN(0xE004022C,  init_task)                            /* USER_MEM size checking, dmSetup, termDriverInit, stdlibSetup etc */
 
+/** MMU remap (CONFIG_MMU_REMAP), from PR #281 (jed2nd; ML boot with remap HW-tested by the author) **/
+THUMB_FN(0xE0554466,  change_mmu_tables)                    /* DACR/TTBR0/TTBR1/CONTEXTIDR/TTBCR/TLBIALL/SCTLR.M=1 */
+THUMB_FN(0xE0563064,  memcpy_dryos)                         /* thumb veneer -> ARM aeabi memcpy @0xE0563068 */
+/* dcache_clean_multicore (Canon 0xE008E23E) crashes this early on the R: no-op in function_overrides.c */
+THUMB_FN(0xDF002BAA,  _request_RPC)                         /* (func,arg) int-disable wrapper -> 0xdf002a32 */
+THUMB_FN(0xDF002BCA,  clear_RPC_request)                    /* -> 0xdf002b56 */
+THUMB_FN(0xE05172FA,  task_create_ex)                       /* = task_create, cpu_id ignored (cpu0-only remap) */
+
 /** Tasks **/
 DATA_PTR(    0x1010,  current_interrupt)                    /* from interrupt handler (VBAR + 0x18); where the interrupt ID is stored */
 DATA_PTR(    0x1028,  current_task)                         /* from task_create; pointer to the current task structure */

@@ -37,6 +37,9 @@
 #include "timer.h"
 #include "config.h"
 #include "fio-ml.h"
+#ifdef CONFIG_MMU_REMAP
+#include "patch.h"
+#endif
 
 #ifndef ST_HOST
 #include "arm-mcr.h"
@@ -50,7 +53,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.2"
+#define ST_VER              "v1.3"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -333,11 +336,10 @@ static void st_begin(int run, const char *what)
     st_t0 = get_ms_clock();
     st_scs_read(st_scs);
     st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%d ms\n", ST_VER, run, what,
-              st_burst_mode ? "BURST" : st_dm_sel ? "ON" : "OFF", (unsigned)st_t0);
+              !st_dm_sel ? "OFF" : st_burst_mode ? "BURST" : "ON", (unsigned)st_t0);
     st_dump_state("start");
     st_armed = 1;
-    if (st_burst_mode) st_dm_start_burst(run);
-    else if (st_dm_sel) st_dm_start(run);
+    if (st_dm_sel) { if (st_burst_mode) st_dm_start_burst(run); else st_dm_start(run); }
 }
 
 static void st_end(int run)
@@ -352,7 +354,7 @@ static void st_end(int run)
 static void st_save(int run)
 {
     int ok = st_flush();
-    if (st_dm_sel || st_burst_mode)
+    if (st_dm_sel)
     {
         msleep(200);
         call("dumpf");                  /* LOGnnn.LOG on the card root */
@@ -623,6 +625,60 @@ static void st_shot_task(void *unused)
     st_busy = 0;
 }
 
+/* ---- silent H burst fps patch (v1.3, needs CONFIG_MMU_REMAP) ----
+ * Canon plans each frame of a silent High-speed burst 1e8 / fps100 us after the previous one (FUN_e01d74fc,
+ * PoReleaseRequestManager.c). fps100 = 500 for scene seq 61/62 (LvSilentHiContiOneshot/Servo) in both period
+ * tables (A 0xE0F16BF8, B 0xE0F16A00; 8-byte entries {fps100, lag_us}). Patched through ML's MMU remap of the
+ * 64 KB ROM page 0xE0F10000 into RAM: cpu0 only, gone at power off, never written to flash. */
+#define ST_FPS_N 4
+static const uint32_t st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
+static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750 };
+static int st_fps_sel;                  /* menu choice; not saved, so every boot starts at Canon's 5.0 */
+static int st_fps_applied;              /* choice currently in effect */
+static int st_fps_err;
+
+static void st_fps_table(uint32_t *o)
+{
+#ifdef CONFIG_MMU_REMAP
+    for (int i = 0; i < ST_FPS_N; i++) o[i] = *(volatile uint32_t *)st_fps_addr[i];
+#else
+    for (int i = 0; i < ST_FPS_N; i++) o[i] = 0;
+#endif
+}
+
+static void st_fps_apply(int sel)
+{
+#ifdef CONFIG_MMU_REMAP
+    if (sel == st_fps_applied) return;
+    int err = 0;
+    if (st_fps_applied != 0)
+    {
+        for (int i = 0; i < ST_FPS_N; i++) err |= unpatch_memory(st_fps_addr[i]);
+        if (!err) st_fps_applied = 0;
+    }
+    if (!err && sel != 0)
+    {
+        struct patch p[ST_FPS_N];
+        for (int i = 0; i < ST_FPS_N; i++)
+        {
+            p[i].addr = (uint8_t *)st_fps_addr[i];
+            p[i].old_value = 500;       /* apply_patches refuses all four on any mismatch */
+            p[i].new_value = st_fps_val[sel];
+            p[i].size = 4;
+            p[i].description = "Silent H burst fps";
+            p[i].is_instruction = 0;
+        }
+        err = apply_patches(p, ST_FPS_N);
+        if (!err) st_fps_applied = sel;
+    }
+    st_fps_err = err;
+    if (err) st_fps_sel = st_fps_applied;
+#else
+    st_fps_err = -1;
+    st_fps_sel = 0;
+#endif
+}
+
 /* ---- burst log (v1.2): the user holds the shutter in High-speed continuous; ML never presses ---- */
 static void st_burst_task(void *unused)
 {
@@ -633,6 +689,12 @@ static void st_burst_task(void *unused)
     st_burst_mode = 1;
     st_begin(run, "burst log (user holds the shutter)");
     st_printf("v1.2 burst log: read-only, no presses; stop after %d frames, 3 s, or 600 ms without a frame\n", nmax);
+    {
+        uint32_t tb[ST_FPS_N];
+        st_fps_table(tb);
+        st_printf("v1.3 silent H fps patch: %d (err %x); table A61 %d A62 %d B61 %d B62 %d\n",
+                  st_fps_val[st_fps_applied], st_fps_err, (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
+    }
     uint32_t rel0 = st_cur[P_RELCNT], mech0 = st_cur[P_MECHA];
     NotifyBox(5000, "Burst log armed: hold the shutter about 3 s now");
 
@@ -717,6 +779,32 @@ static MENU_SELECT_FUNC(st_watch_select) { st_start(st_watch_task, "st_watch"); 
 static MENU_SELECT_FUNC(st_shot_select)  { st_start(st_shot_task, "st_shots"); }
 static MENU_SELECT_FUNC(st_burst_select) { st_start(st_burst_task, "st_burst"); }
 
+static MENU_SELECT_FUNC(st_fps_select)
+{
+    if (st_busy) return;                /* not while a test runs */
+    menu_numeric_toggle(&st_fps_sel, delta, 0, COUNT(st_fps_val) - 1);
+    st_fps_apply(st_fps_sel);
+}
+
+static MENU_UPDATE_FUNC(st_fps_update)
+{
+    uint32_t tb[ST_FPS_N];
+    st_fps_table(tb);
+    int v = st_fps_val[st_fps_applied];
+    if (st_fps_err)
+    {
+        MENU_SET_VALUE("ERROR %x", st_fps_err);
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Patch failed (%x); table %d %d %d %d. Power cycle.", st_fps_err,
+                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
+    }
+    else
+    {
+        MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
+        MENU_SET_WARNING(MENU_WARN_INFO, "Table now %d %d %d %d (500 = Canon). RAM only, gone at power off.",
+                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
+    }
+}
+
 static MENU_UPDATE_FUNC(st_update)
 {
     if (st_busy)
@@ -767,6 +855,16 @@ static struct menu_entry st_menu[] = {
                 .priv    = &st_nsel,
                 .max     = 2,
                 .choices = CHOICES("5", "10", "20"),
+            },
+            {
+                .name    = "Silent H fps",
+                .priv    = &st_fps_sel,
+                .max     = 5,
+                .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5"),
+                .select  = st_fps_select,
+                .update  = st_fps_update,
+                .help    = "Patches Canon's silent High-speed burst rate in RAM.",
+                .help2   = "Not saved: power off returns to Canon 5.0.",
             },
             {
                 .name   = "Burst log",

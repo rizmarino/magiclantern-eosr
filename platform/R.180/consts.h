@@ -6,6 +6,12 @@
 #define LEDON                       0xD0002
 #define LEDOFF                      0xC0003
 
+/* MMU remap (CONFIG_MMU_REMAP), from PR #281 (jed2nd, author HW-tested boot): Canon's original L1 MMU table sits at
+ * the ROM start (DIGIC 8, same as M50). DRYOS_SGI_HANDLERS_PTR: .data word 0x402c = 0x28028 at boot (ROM copy at
+ * 0xE12C42C0), a zeroed bss array = DryOS SGI handler table (riz notes, silent burst stage 3). */
+#define CANON_ORIG_MMU_TABLE_ADDR   0xe0000000
+#define DRYOS_SGI_HANDLERS_PTR      0x402c
+
 #define BR_ICACHE_INV_1     0xE0040072   /* first call to icache_invalidate, before cstart */
 #define BR_DCACHE_CLN_1     0xE0040068   /* first call to dcache_clean, before cstart */
 #define BR_DCACHE_CLN_2     0xE00400A0   /* second call to dcache_clean, before cstart */

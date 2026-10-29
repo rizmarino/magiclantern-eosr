@@ -23,6 +23,16 @@
 
 #include <dryos.h>
 #include <property.h>
+
+/* MMU remap (PR #281, author HW-bisected): Canon's dcache_clean_multicore (0xE008E23E, inter-core cache broadcast)
+ * red-LEDs the R when mmu_init calls it this early. The remap is cpu0-only (no CONFIG_INIT1_HIJACK), and
+ * dcache_clean covers cpu0, so all its callers in the MMU code get this no-op. */
+void dcache_clean_multicore(uint32_t addr, uint32_t size)
+{
+    (void)addr;
+    (void)size;
+}
+
 #include <bmp.h>
 #include <config.h>
 #include <consts.h>

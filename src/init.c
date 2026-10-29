@@ -611,6 +611,11 @@ void ml_crash_message(char* msg)
 uint32_t is_cpu1_ready = 0;
 static void cpu1_ready(void)
 {
+    /* EOS R: task_create_ex is plain task_create there (the cpu argument is ignored), so this task runs on cpu0.
+     * Only mark cpu1 ready when it really is cpu1; otherwise MMU patches would wait (interrupts off) for a cpu1
+     * busy-wait handshake that never comes. With 0, patches stay cpu0-only. */
+    if (get_cpu_id() != 1)
+        return;
     is_cpu1_ready = 1;
 }
 #endif

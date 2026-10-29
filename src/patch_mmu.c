@@ -32,10 +32,13 @@
 //   0x300 padding
 //   0x400 per L2 table (0x400 aligned) // need one per 1MB region containing remaps
 // sizeof(struct mmu_L2_page_info)
+/* EOS R (PR #281, author HW-tested): aligned(0x10000) left a ~257 KB linker hole in BSS and overran the R's
+ * user_mem (red LED). calc_mmu_globals() aligns the L1 table / 64 KB page inside the buffer itself, so the buffer
+ * only needs one extra page of slack. */
 static uint8_t generic_mmu_space[MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE
                                  + 0x300 + MMU_L2_TABLE_SIZE
-                                 + sizeof(struct mmu_L2_page_info)]
-               __attribute__((aligned(0x10000)));
+                                 + sizeof(struct mmu_L2_page_info)
+                                 + MMU_PAGE_SIZE];
 #endif
 
 #include "platform/mmu_patches.h"
