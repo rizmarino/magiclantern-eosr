@@ -53,6 +53,9 @@
 #endif
 
 extern uint32_t ml_refresh_display_needed;
+#ifdef CONFIG_R
+uint8_t *lv_window(uint8_t *base, uint32_t off);   /* riz/eosr: cached LV row window (defined below) */
+#endif
 
 #if defined(FEATURE_RAW_HISTOGRAM) || defined(FEATURE_RAW_ZEBRAS) || defined(FEATURE_RAW_SPOTMETER)
 #define FEATURE_RAW_OVERLAYS
@@ -1294,7 +1297,11 @@ static void draw_zebras( int Z )
             #define color_rgb_clipRGB    zebra_rgb_color(0, 1, 1, 1, y)
             #define color_rgb_clipRGB_2  zebra_rgb_color(0, 1, 1, 1, y+1)
 
+            #ifdef CONFIG_R
+            uint32_t * const v_row = (uint32_t*)lv_window(lvram, BM2LV_R(y));  // riz/eosr: cached row window
+            #else
             uint32_t * const v_row = (uint32_t*)( lvram        + BM2LV_R(y)    );  // 2 pixels
+            #endif
             uint32_t * const b_row = (uint32_t*)( bvram        + BM_R(y)       );  // 4 pixels
             uint32_t * const m_row = (uint32_t*)( bvram_mirror + BM_R(y)       );  // 4 pixels
             
@@ -1715,7 +1722,6 @@ static int FAST
 draw_zebra_and_focus( int Z, int F )
 {
     #ifdef CONFIG_R
-    extern void *lv_snapshot_get(void);     /* riz/eosr: LV snapshot (see lv_snapshot_update) */
     extern uint32_t r_zeb_count, r_zeb_us_last, r_zeb_us_max, r_peak_count, r_peak_us_last, r_peak_us_max;
     #endif
     if (unlikely(!get_global_draw())) return 0;
@@ -1786,9 +1792,6 @@ draw_zebra_and_focus( int Z, int F )
         dirty_pixels_num = 0;
         
         uint32_t vram = (uint32_t)CACHEABLE(YUV422_LV_BUFFER_DISPLAY_ADDR);
-        #ifdef CONFIG_R
-        { void *snap = lv_snapshot_get(); if (snap) vram = (uint32_t)snap; }
-        #endif
         if (!vram) return 0;
         
         int off = get_y_skip_offset_for_overlays();
@@ -1824,7 +1827,11 @@ draw_zebra_and_focus( int Z, int F )
             n_total = ((yEnd - yStart) * (xEnd - xStart)) / 6;
             for(int y = yStart; y < yEnd; y += 3)
             {
+                #ifdef CONFIG_R
+                uint32_t row = (uint32_t)lv_window((uint8_t *)vram, BM2LV_R(y));   /* riz/eosr: cached row window */
+                #else
                 uint32_t row = vram + BM2LV_R(y);
+                #endif
                 
                 for (int x = xStart; x < xEnd; x += 2)
                 {
@@ -4071,33 +4078,22 @@ void update_lv_fps() // to be called every 10 seconds
 // Magic Zoom, Focus Peaking, zebra*, spotmeter*, false color*
 // * = not really high FPS, but still fluent
 #ifdef CONFIG_R
-/* riz/eosr: LV snapshot for overlays. Canon's LV YUV buffers (0x9F2xxxxx) are in the R's non-cacheable 2nd GB
- * (MMU table, lv-survey.md): CPU reads there run at ~10 MiB/s (measured on MEM1), so a zebra pass over the
- * 1024x682 panel image takes ~0.1-0.5 s and peaking (several reads per pixel) more; with the loop's redraw
- * throttling the overlays trail the image by seconds. HPCopy (XDMAC, camera-verified exact with uncached
- * addresses, 355-470 MiB/s, returns 0) copies the displayed frame (~1.4 MB, ~4 ms) into a cached buffer once
- * per overlay pass; get_yuv422_vram() and peaking read the copy. Overlay > Fast LV copy switches it off (A/B).
- * Skipped while the raw recorder runs (its card writes need the memory bandwidth). */
+/* riz/eosr: LV row window for overlays. Canon's LV YUV buffers (0x9F2xxxxx) are in the R's non-cacheable 2nd GB.
+ * v19.2 ZEBDIAG: a zebra pass (~43k word reads) took ~50 ms (~1.2 us per read), peaking ~100 ms. A full-frame copy
+ * doesn't fit Canon's heap (1.9 MB free, v19.1), so zebras and peaking read through a 64 KB window of whole LV rows
+ * that HPCopy (XDMAC; camera-verified exact with uncached addresses, ~64 us per call + ~2.5 us/KB) refills as the
+ * pass moves down the frame: ~22 copies per pass. Overlay > Fast LV copy switches it off (A/B). Not used while the
+ * raw recorder runs (its card writes need the memory bandwidth). */
 static int (*const HPCopy)(void *dst, void *src, uint32_t len) = (void *)0xE0328A33;
 CONFIG_INT("lv.snap", lv_snap_on, 1);             /* menu: Overlay > Fast LV copy (vram.c) */
-static uint8_t *lv_snap_raw, *lv_snap_buf;      /* malloc'd / 64-byte aligned, cached alias */
-static uint32_t lv_snap_cap, lv_snap_size, lv_snap_src, lv_snap_ms;
-static volatile int lv_snap_ok;
-uint32_t r_snap_count, r_snap_fail, r_snap_us_last, r_snap_us_max;
-uint32_t r_snap_heap_kb;                 /* Canon heap free when the snapshot buffer was allocated */
-#define LV_SNAP_CAP (1280 * 720 * 2)            /* largest LV YUV buffer seen (EVF); panel 1024x682 */
+#define LVW_BYTES (64 * 1024)
+static uint8_t *lvw_raw, *lvw_buf;                /* malloc'd / 64-byte aligned cached alias */
+static uint8_t *lvw_base;                         /* LV frame the window holds rows of */
+static uint32_t lvw_r0, lvw_n, lvw_pitch, lvw_us_pass;
+static int lvw_pass_ok;                           /* window usable in the current pass */
+uint32_t r_snap_count, r_snap_fail, r_snap_us_last, r_snap_us_max, r_snap_stale, r_snap_verify, r_snap_refills;
 uint32_t r_zeb_count, r_zeb_us_last, r_zeb_us_max, r_peak_count, r_peak_us_last, r_peak_us_max;
 extern int rawrec_running(void);
-
-/* the snapshot, if it is current and matches the LV buffer geometry; else 0 (callers use the live buffer).
- * No source-address check: Canon alternates two display buffers every frame; a panel <-> EVF switch changes
- * the size (1024x682 vs 1280x720). */
-void *lv_snapshot_get(void)
-{
-    if (!lv_snap_ok || !lv_snap_on || lv_snap_size != (uint32_t)(vram_lv.pitch * vram_lv.height)) return 0;
-    if (get_ms_clock() - lv_snap_ms > 500) return 0;   /* stale: the overlay loop stopped refreshing it */
-    return lv_snap_buf;
-}
 
 /* invalidate the L1 data-cache lines of [p, p+n) by address (DCIMVAC). ML's sync_caches() on DIGIC 6-8 only
  * cleans (writes back); it never invalidates, so lines of the previous snapshot would stay readable. */
@@ -4113,79 +4109,73 @@ static void lv_dcache_invalidate(void *p, uint32_t n)
     asm volatile ("dsb sy");
 }
 
-uint32_t r_snap_stale, r_snap_verify;   /* passes with cached != memory words; first-use check result */
-
-/* sample 64 words spread over the snapshot: cached view vs memory (uncached alias). Catches stale lines that the
- * L1 invalidate can't reach (the R has an outer L2 controller at 0xC1100000, not maintained here). */
-static int lv_snapshot_coherent(uint32_t size)
-{
-    uint32_t step = (size / 64) & ~3;
-    for (int i = 0; i < 64; i++)
-    {
-        uint32_t o = i * step + (i * 52 & 0x3C);
-        if (MEM((uint32_t)lv_snap_buf + o) != MEM((uint32_t)UNCACHEABLE(lv_snap_buf) + o)) return 0;
-    }
-    return 1;
-}
-
-/* first use: does HPCopy read Canon's LV VRAM (2nd GB, never DMA-read by ML before)? compare 256 words of the
- * copy (memory) with the source right after the copy; the displayed buffer isn't rewritten for several ms */
-static int lv_snapshot_verify(uint32_t src, uint32_t size)
+/* first use: does HPCopy read Canon's LV VRAM correctly? copy 16 rows, compare 256 words with the source right
+ * after the copy (the displayed buffer isn't rewritten for several ms); retry a few times */
+static int lv_window_verify(uint32_t src, uint32_t len)
 {
     for (int tries = 0; tries < 5; tries++)
     {
-        if (HPCopy(UNCACHEABLE(lv_snap_buf), (void *)src, size)) return 0;
-        uint32_t o0 = (size / 2) & ~0xFFF, bad = 0;
+        if (HPCopy(UNCACHEABLE(lvw_buf), (void *)src, len)) return 0;
+        uint32_t bad = 0;
         for (int i = 0; i < 256; i++)
-            if (MEM((uint32_t)UNCACHEABLE(lv_snap_buf) + o0 + 4 * i) != MEM(src + o0 + 4 * i)) bad++;
+            if (MEM((uint32_t)UNCACHEABLE(lvw_buf) + 4 * i * (len / 1024)) != MEM(src + 4 * i * (len / 1024))) bad++;
         if (!bad) return 1;
         msleep(5);
     }
     return 0;
 }
 
-static void lv_snapshot_update(void)
+/* call before an overlay pass */
+static void lv_window_begin(void)
 {
-    lv_snap_ok = 0;
-    if (!lv_snap_on || !lv || rawrec_running()) return;
-    if (r_snap_verify == 2) return;     /* HPCopy can't read the LV VRAM: stay on direct reads */
-    uint32_t src = YUV422_LV_BUFFER_DISPLAY_ADDR;
-    if (!R_LV_PTR_OK(src) || (src & 0xF0000000) != 0x90000000) return;   /* only the known 2nd-GB VRAM area */
-    uint32_t size = vram_lv.pitch * vram_lv.height;
-    if (size < 0x10000 || size > LV_SNAP_CAP) return;
-    if (!lv_snap_raw)
+    r_snap_us_last = lvw_us_pass; if (lvw_us_pass > r_snap_us_max) r_snap_us_max = lvw_us_pass;
+    lvw_us_pass = 0;
+    lvw_pass_ok = 0; lvw_base = 0;
+    if (!lv_snap_on || !lv || rawrec_running() || r_snap_verify == 2) return;
+    if (!lvw_raw)
     {
-        /* one block for the largest LV buffer (EVF 1280x720), never freed: another task may be reading the
-         * snapshot (histogram) when the display switches. Canon's heap via AllocateMemory, only with 2 MB left
-         * over; ML's malloc would put a block this size in shoot memory, which photo bursts need. */
-        extern void *_AllocateMemory(size_t size);
-        extern int GetFreeMemForAllocateMemory(void);
-        static int tried;
-        if (tried) return;
-        tried = 1;
-        r_snap_heap_kb = GetFreeMemForAllocateMemory() / 1024;
-        if (GetFreeMemForAllocateMemory() < (int)LV_SNAP_CAP + 64 + 2 * 1024 * 1024) { r_snap_fail++; return; }
-        lv_snap_raw = _AllocateMemory(LV_SNAP_CAP + 64);
-        if (!lv_snap_raw) { r_snap_fail++; return; }
-        lv_snap_cap = LV_SNAP_CAP;
-        lv_snap_buf = (uint8_t *)(((uint32_t)CACHEABLE(lv_snap_raw) + 63) & ~63);
-        sync_caches();                  /* write back dirty lines of the fresh buffer before the DMA fills it */
+        lvw_raw = malloc(LVW_BYTES + 64);           /* small: Canon's malloc heap */
+        if (!lvw_raw) { r_snap_fail++; return; }
+        lvw_buf = (uint8_t *)(((uint32_t)CACHEABLE(lvw_raw) + 63) & ~63);
+        sync_caches();                              /* write back dirty lines before the DMA fills the buffer */
     }
-    if (!r_snap_verify)
-    {
-        r_snap_verify = lv_snapshot_verify(src, size) ? 1 : 2;
-        if (r_snap_verify == 2) { NotifyBox(5000, "Fast LV copy unavailable (HPCopy check failed)"); return; }
-    }
-    uint32_t t0 = (uint32_t)get_us_clock();
-    int r = HPCopy(UNCACHEABLE(lv_snap_buf), (void *)src, size);
-    lv_dcache_invalidate(lv_snap_buf, size);
-    uint32_t us = (uint32_t)get_us_clock() - t0;
-    r_snap_us_last = us; if (us > r_snap_us_max) r_snap_us_max = us;
-    if (r) { r_snap_fail++; return; }
-    if (!lv_snapshot_coherent(size)) { r_snap_stale++; return; }
+    lvw_pitch = vram_lv.pitch;
+    if (lvw_pitch < 256 || lvw_pitch * 4 > LVW_BYTES || !vram_lv.height) return;
+    lvw_pass_ok = 1;
     r_snap_count++;
-    lv_snap_size = size; lv_snap_src = src; lv_snap_ms = get_ms_clock();
-    lv_snap_ok = 1;
+}
+
+/* cached pointer to byte `off` of the LV frame at `base`; rows off/pitch - 1 .. + 1 are readable through it.
+ * Falls back to base + off (direct reads) whenever the window can't be used. */
+uint8_t *lv_window(uint8_t *base, uint32_t off)
+{
+    if (!lvw_pass_ok) return base + off;
+    uint32_t p = lvw_pitch, h = vram_lv.height, r = off / p;
+    if (r >= h) return base + off;
+    int have = base == lvw_base && (r ? r - 1 >= lvw_r0 : lvw_r0 == 0) && (r + 1 < lvw_r0 + lvw_n || lvw_r0 + lvw_n >= h);
+    if (!have)
+    {
+        uint32_t r0 = r ? r - 1 : 0, n = MIN(LVW_BYTES / p, h - r0);
+        uint32_t src = (uint32_t)base + r0 * p;
+        if ((src & 0xF0000000) != 0x90000000) { lvw_pass_ok = 0; return base + off; }   /* only the known VRAM area */
+        if (!r_snap_verify)
+        {
+            r_snap_verify = lv_window_verify(src, MIN(n, 16) * p) ? 1 : 2;
+            if (r_snap_verify == 2) { lvw_pass_ok = 0; NotifyBox(5000, "Fast LV copy off: HPCopy check failed"); return base + off; }
+        }
+        uint32_t t0 = (uint32_t)get_us_clock();
+        int e = HPCopy(UNCACHEABLE(lvw_buf), (void *)src, n * p);
+        lv_dcache_invalidate(lvw_buf, n * p);
+        lvw_us_pass += (uint32_t)get_us_clock() - t0;
+        if (e) { r_snap_fail++; lvw_pass_ok = 0; return base + off; }
+        /* stale-cache spot check (an outer L2 cache isn't maintained here): cached view vs memory */
+        uint32_t a = (uint32_t)lvw_buf, z = a + n * p - 4, m = a + (n * p / 2 & ~3);
+        if (MEM(a) != MEM((uint32_t)UNCACHEABLE(a)) || MEM(m) != MEM((uint32_t)UNCACHEABLE(m)) || MEM(z) != MEM((uint32_t)UNCACHEABLE(z)))
+        { r_snap_stale++; lvw_pass_ok = 0; return base + off; }
+        lvw_base = base; lvw_r0 = r0; lvw_n = n;
+        r_snap_refills++;
+    }
+    return lvw_buf + (off - lvw_r0 * p);
 }
 
 /* riz/eosr-experimental: on-camera diagnostics for zebras / focus peaking /
@@ -4251,8 +4241,8 @@ static void zdiag_tick(void)
            r_conv_us_max, r_ximr_us_max, r_refresh_words_last);
         r_refresh_us_max = r_conv_us_max = r_ximr_us_max = 0;
     }
-    ZD(" snap on=%d verify=%d heap_kb=%d n=%d fail=%d stale=%d last_us=%d max_us=%d src=%x size=%d | zebras n=%d last_us=%d max_us=%d | peaking n=%d last_us=%d max_us=%d\n",
-       lv_snap_on, r_snap_verify, r_snap_heap_kb, r_snap_count, r_snap_fail, r_snap_stale, r_snap_us_last, r_snap_us_max, lv_snap_src, lv_snap_size,
+    ZD(" window on=%d verify=%d passes=%d refills=%d fail=%d stale=%d copy_us_pass last=%d max=%d | zebras n=%d last_us=%d max_us=%d | peaking n=%d last_us=%d max_us=%d\n",
+       lv_snap_on, r_snap_verify, r_snap_count, r_snap_refills, r_snap_fail, r_snap_stale, r_snap_us_last, r_snap_us_max,
        r_zeb_count, r_zeb_us_last, r_zeb_us_max, r_peak_count, r_peak_us_last, r_peak_us_max);
     r_snap_us_max = r_zeb_us_max = r_peak_us_max = 0;
 
@@ -4450,9 +4440,6 @@ livev_hipriority_task( void* unused )
             #ifdef FEATURE_FALSE_COLOR
             if (falsecolor_draw)
             {
-                #ifdef CONFIG_R
-                if (k % 4 == 0) lv_snapshot_update();   /* riz/eosr: one fast copy per overlay pass */
-                #endif
                 if (k % 4 == 0)
                     BMP_LOCK( if (lv) draw_false_downsampled(); )
                 #ifdef CONFIG_R
@@ -4465,7 +4452,9 @@ livev_hipriority_task( void* unused )
                 int zZ = k % ((focus_peaking ? 5 : 3) * (RECORDING ? 5 : 1)) == 0; /* should redraw zebras? */
                 int zF = k % 2 == 1;                                                /* should redraw focus peaking? */
                 #ifdef CONFIG_R
-                if ((zZ && zebra_draw) || (zF && focus_peaking)) lv_snapshot_update();
+                /* riz/eosr: passes are cheap with the row window: zebras on even passes (peaking on odd ones) */
+                zZ = k % (2 * (RECORDING ? 5 : 1)) == 0;
+                if ((zZ && zebra_draw) || (zF && focus_peaking)) lv_window_begin();
                 #endif
                 BMP_LOCK(
                     if (lv)
