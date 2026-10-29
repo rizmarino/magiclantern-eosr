@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.1"
+#define ST_VER              "v1.2"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -181,6 +181,30 @@ static void st_dm_start(int run)
     DryosDebugMsg(0, 15, "=== riz silt %s run %d start", ST_VER, run);
 }
 
+/* Burst log (v1.2): only the release/capture classes, everything else muted (stage-1 plan, lv-survey.md) */
+static const uint8_t st_burst_full[] = {
+    0xDC,   /* PO: SCN, SEQ, CAPREADY + fps + Plan, CAPREADY_DELAY, TRSEND, LvPoCom, burst counters */
+    0x41,   /* CFLW ConcurrentFlow: every release step Start/Complete */
+    0x8E,   /* SHTC CaptureState: ShutType/ROMode, scsShootStart/scsContinuousShootStart */
+    0x96,   /* FSS: SW1/SW2 */
+};
+static const uint8_t st_burst_l3[] = {
+    0x8C,   /* CAPD: SRS/VSize/CapEnd/ReadoutDone/LV_* */
+    0x8D,   /* CAPE */
+    0x33,   /* JOB */
+    0xDF,   /* ICODEC */
+};
+static int st_burst_mode;
+
+static void st_dm_start_burst(int run)
+{
+    dm_set_store_level(0xFF, 15);
+    for (int i = 0; i < COUNT(st_burst_full); i++) dm_set_store_level(st_burst_full[i], 0);
+    for (int i = 0; i < COUNT(st_burst_l3); i++) dm_set_store_level(st_burst_l3[i], 3);
+    st_dm_on = 1;
+    DryosDebugMsg(0, 15, "=== riz silt %s run %d burst start", ST_VER, run);
+}
+
 static void st_dm_freeze(int run, const char *why)
 {
     if (!st_dm_on) return;
@@ -308,10 +332,12 @@ static void st_begin(int run, const char *what)
     st_loglen = 0;
     st_t0 = get_ms_clock();
     st_scs_read(st_scs);
-    st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%d ms\n", ST_VER, run, what, st_dm_sel ? "ON" : "OFF", (unsigned)st_t0);
+    st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%d ms\n", ST_VER, run, what,
+              st_burst_mode ? "BURST" : st_dm_sel ? "ON" : "OFF", (unsigned)st_t0);
     st_dump_state("start");
     st_armed = 1;
-    if (st_dm_sel) st_dm_start(run);
+    if (st_burst_mode) st_dm_start_burst(run);
+    else if (st_dm_sel) st_dm_start(run);
 }
 
 static void st_end(int run)
@@ -326,7 +352,7 @@ static void st_end(int run)
 static void st_save(int run)
 {
     int ok = st_flush();
-    if (st_dm_sel)
+    if (st_dm_sel || st_burst_mode)
     {
         msleep(200);
         call("dumpf");                  /* LOGnnn.LOG on the card root */
@@ -597,6 +623,85 @@ static void st_shot_task(void *unused)
     st_busy = 0;
 }
 
+/* ---- burst log (v1.2): the user holds the shutter in High-speed continuous; ML never presses ---- */
+static void st_burst_task(void *unused)
+{
+    int run = ++st_runs;
+    int nmax = st_nshots[st_nsel];
+    if (!st_menu_wait()) { snprintf(st_last, sizeof(st_last), "menu still open"); st_busy = 0; return; }
+
+    st_burst_mode = 1;
+    st_begin(run, "burst log (user holds the shutter)");
+    st_printf("v1.2 burst log: read-only, no presses; stop after %d frames, 3 s, or 600 ms without a frame\n", nmax);
+    uint32_t rel0 = st_cur[P_RELCNT], mech0 = st_cur[P_MECHA];
+    NotifyBox(5000, "Burst log armed: hold the shutter about 3 s now");
+
+    uint32_t tw = get_ms_clock();
+    while (st_cur[P_RELCNT] == rel0 && (int)(get_ms_clock() - tw) < 60000) st_sleep_poll(10);
+
+    const char *why = "no frame within 60 s";
+    int win = 0;
+    if (st_cur[P_RELCNT] != rel0)
+    {
+        uint32_t t1 = get_ms_clock(), tlast = t1, last = st_cur[P_RELCNT];
+        while (1)
+        {
+            st_sleep_poll(10);
+            uint32_t c = st_cur[P_RELCNT];
+            if (c != last) { last = c; tlast = get_ms_clock(); }
+            if ((int)(c - rel0) >= nmax) { why = "frame limit"; break; }
+            if ((int)(get_ms_clock() - t1) >= 3000) { why = "3 s limit"; break; }
+            if ((int)(get_ms_clock() - tlast) >= 600) { why = "shutter released"; break; }
+        }
+        win = (int)(st_cur[P_RELCNT] - rel0);
+        st_sleep_poll(300);
+        st_dm_freeze(run, "after burst");
+    }
+
+    /* Canon is still writing (and the user may still hold the shutter): no card I/O until idle for 2 s */
+    int idle = st_wait_idle(0, 2000, 30000);
+    st_sleep_poll(500);
+    st_end(run);
+
+    int total = (int)(st_cur[P_RELCNT] - rel0);
+    st_printf("summary: %s; %d frames in the log window, %d in total; MECHA +%d; SILENT=%x DRIVE=%x; final idle %s\n",
+              why, win, total, (int)(st_cur[P_MECHA] - mech0), (unsigned)st_cur[P_SILENT], (unsigned)st_cur[P_DRIVE],
+              idle > 0 ? "ok" : "TIMEOUT");
+
+    st_printf("frame t_ms interval_ms\n");
+    int n = st_n, k = 0, imin = 0, imax = 0, isum = 0, nint = 0, tprev = 0;
+    for (int i = 0; i < n; i++)
+    {
+        struct st_ev *e = &st_ev[i];
+        if (e->kind != EV_PROP || e->id != PROP_RELEASE_COUNTER || (int)(e->v[0] - rel0) <= 0) continue;
+        int t = (int)(e->ms - st_t0);
+        int itv = k ? t - tprev : 0;
+        k++;
+        st_printf("%5d %7d %8d\n", k, t, itv);
+        if (k > 1)
+        {
+            if (!nint || itv < imin) imin = itv;
+            if (!nint || itv > imax) imax = itv;
+            isum += itv;
+            nint++;
+        }
+        tprev = t;
+    }
+    if (nint)
+    {
+        int mean = isum / nint;
+        st_printf("interval ms (%d): min %d, mean %d, max %d = %d.%02d fps at the mean\n",
+                  nint, imin, mean, imax, 1000 / MAX(1, mean), (100000 / MAX(1, mean)) % 100);
+        snprintf(st_last, sizeof(st_last), "%d frames, mean %d ms", k, mean);
+    }
+    else
+        snprintf(st_last, sizeof(st_last), "%d frames (%s)", k, why);
+
+    st_save(run);
+    st_burst_mode = 0;
+    st_busy = 0;
+}
+
 static void st_start(void (*task)(void *), const char *name)
 {
     if (st_busy) return;
@@ -610,6 +715,7 @@ static void st_start(void (*task)(void *), const char *name)
 #ifndef ST_HOST
 static MENU_SELECT_FUNC(st_watch_select) { st_start(st_watch_task, "st_watch"); }
 static MENU_SELECT_FUNC(st_shot_select)  { st_start(st_shot_task, "st_shots"); }
+static MENU_SELECT_FUNC(st_burst_select) { st_start(st_burst_task, "st_burst"); }
 
 static MENU_UPDATE_FUNC(st_update)
 {
@@ -661,6 +767,13 @@ static struct menu_entry st_menu[] = {
                 .priv    = &st_nsel,
                 .max     = 2,
                 .choices = CHOICES("5", "10", "20"),
+            },
+            {
+                .name   = "Burst log",
+                .select = st_burst_select,
+                .update = st_update,
+                .help   = "You hold the shutter in High-speed continuous; ML only logs.",
+                .help2  = "Logs the first 5/10/20 frames (Shots). SILENT.TXT + LOGnnn.LOG",
             },
             {
                 .name    = "Canon log",
