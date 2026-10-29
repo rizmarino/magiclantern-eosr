@@ -775,6 +775,7 @@ static int init_remap_mmu(void)
 }
 
 #if defined(CONFIG_MMU_REMAP_LAZY)
+void (*mmu_lazy_progress)(const char *stage, uint32_t a, uint32_t b) = NULL;
 extern void *_AllocateMemory(size_t size);
 extern void  _FreeMemory(void *ptr);
 extern int GetFreeMemForAllocateMemory(void);
@@ -798,13 +799,38 @@ int mmu_init_lazy(void)
             return -4;
         if ((uint32_t)p >= 0x40000000)  // tables must be at a cacheable, identity-mapped address
         {
+            if (mmu_lazy_progress) mmu_lazy_progress("alloc-rejected", (uint32_t)p, sz);
             _FreeMemory(p);
             return -6;
         }
         lazy_mmu_space = p;
         lazy_mmu_size = sz;
     }
-    return init_remap_mmu();
+    if (mmu_lazy_progress) mmu_lazy_progress("alloc", (uint32_t)lazy_mmu_space, (uint32_t)GetFreeMemForAllocateMemory());
+
+    // = init_remap_mmu() for cpu0, minus the boot-only parts (SGI wake handler for cpu1, early patches),
+    // with a progress report before each step so a freeze can be located
+    init_mmu_globals();
+    if (!mmu_globals_initialised)
+        return -2;
+    {
+        // the copy must equal Canon's table except the two fixed-up L2 pointers
+        uint32_t *a = (uint32_t *)global_mmu_conf.L1_table, *b = (uint32_t *)CANON_ORIG_MMU_TABLE_ADDR;
+        uint32_t diff = 0;
+        for (uint32_t i = 0; i < MMU_L1_TABLE_SIZE / 4; i++)
+            if (a[i] != b[i] && i != 0x1200 && i != 0x1220) diff++;
+        if (mmu_lazy_progress) mmu_lazy_progress("tables", (uint32_t)global_mmu_conf.L1_table, diff);
+        if (mmu_lazy_progress) mmu_lazy_progress("page", (uint32_t)global_mmu_conf.phys_mem_pages, a[0x1200]);
+        if (diff)
+        {
+            mmu_globals_initialised = 0;
+            return -7;
+        }
+    }
+    if (mmu_lazy_progress) mmu_lazy_progress("ttbr-next", 0, 0);
+    change_mmu_tables_wrapper();
+    if (mmu_lazy_progress) mmu_lazy_progress("ttbr-done", 0, 0);
+    return 0;
 }
 #endif
 

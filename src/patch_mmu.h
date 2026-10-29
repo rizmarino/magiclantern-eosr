@@ -43,6 +43,7 @@ int apply_normal_patches(void);
 int mmu_init(void);
 #if defined(CONFIG_MMU_REMAP_LAZY)
 int mmu_init_lazy(void);
+extern void (*mmu_lazy_progress)(const char *stage, uint32_t a, uint32_t b);  /* optional, for diagnostics */
 #endif
 
 #endif // _patch_mmu_h_

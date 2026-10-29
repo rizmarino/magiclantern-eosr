@@ -53,7 +53,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.6"
+#define ST_VER              "v1.7"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -656,6 +656,18 @@ static void st_fps_table(uint32_t *o)
 #endif
 }
 
+#ifdef CONFIG_MMU_REMAP_LAZY
+/* v1.7: every step of the first-use remap setup and of the patch is appended to ML/MMUTEST.TXT (file closed after
+ * each line), so after a freeze the last line shows where it stopped */
+static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
+{
+    char line[96];
+    int n = snprintf(line, sizeof(line), "%d ms %s %x %x\n", (int)get_ms_clock(), stage, (unsigned)a, (unsigned)b);
+    FILE *f = FIO_CreateFileOrAppend("ML/MMUTEST.TXT");
+    if (f) { FIO_WriteFile(f, line, n); FIO_CloseFile(f); }
+}
+#endif
+
 static void st_fps_apply(int sel)
 {
 #ifdef CONFIG_MMU_REMAP
@@ -672,7 +684,10 @@ static void st_fps_apply(int sel)
      * errors show as 0x1000N: N = 1 wrong cpu, 4 alloc failed, 5 < 1 MB would stay free, 6 bad address, else init */
     if (!err && sel != 0)
     {
+        mmu_lazy_progress = st_mmu_log;
+        st_mmu_log("v1.7 apply", sel, st_fps_val[sel]);
         int mi = mmu_init_lazy();
+        st_mmu_log("init-ret", (uint32_t)mi, 0);
         if (mi < 0) err = 0x10000 | (-mi);
     }
 #endif
@@ -693,7 +708,13 @@ static void st_fps_apply(int sel)
             p[i].description = "Silent H burst fps";
             p[i].is_instruction = 0;
         }
+#ifdef CONFIG_MMU_REMAP_LAZY
+        st_mmu_log("patch-next", st_fps_val[sel], 0);
+#endif
         err = apply_patches(p, 2);
+#ifdef CONFIG_MMU_REMAP_LAZY
+        st_mmu_log("patch-done", err, *(volatile uint32_t *)0xE0F16DE0);
+#endif
         if (!err) st_fps_applied = sel;
     }
     st_fps_err = err;
