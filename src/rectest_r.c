@@ -37,6 +37,8 @@
 #include "config.h"
 #include "bmp.h"
 #include "gui-common.h"
+#include "property.h"   /* LVMS_ENABLE_MOVIE (crop marker) */
+#include "zebra.h"      /* get_global_draw (crop marker) */
 
 #ifndef RT_HOST
 static void *(*const ErscCreateLockEntry)(uint32_t *ids, int n) = (void *)0xE054761F;
@@ -1618,6 +1620,83 @@ static MENU_UPDATE_FUNC(rr_rate_update)
         MENU_SET_WARNING(MENU_WARN_ADVICE, "Close to the card's speed at 29.97p: long clips may lose frames.");
 }
 
+/* Crop marker (2026-10-30): a frame on the live view around the area the raw recorder will record. Shown in movie
+ * mode (PROP_LV_MOVIE_SELECT 2) with RAW video ON, Global Draw on and the ML menu closed. The crop is placed like
+ * the recorder does (centred in the MEM1 frame, x on a 64-px grid), then mapped from the MEM1 active area (optical
+ * black removed) onto the LV image. MEM1 size from the Mem1Path struct when it holds a known size, else FHD. */
+static CONFIG_INT("r.rawrec.mark", rr_mark, 1);
+static int rr_mark_4k_guess;            /* 1 = MEM1 reported 4K, 0 = FHD (reported or assumed) */
+static int rr_mark_assumed;             /* 1 = MEM1 size not readable, FHD assumed */
+
+static int rr_mark_rect(int *bx, int *by, int *bw, int *bh)
+{
+    uint32_t m1w = MEM(RT_PATH + 0x10), m1h = MEM(RT_PATH + 0x14);
+    int obl, obt;
+    rr_mark_assumed = 0;
+    if (m1w == 4256 && m1h == 2214) { obl = 144; obt = 46; rr_mark_4k_guess = 1; }
+    else
+    {
+        if (!(m1w == 2304 && m1h == 1290)) rr_mark_assumed = 1;
+        m1w = 2304; m1h = 1290; obl = RT_OB_LEFT; obt = RT_OB_TOP; rr_mark_4k_guess = 0;
+    }
+    int sel = rt_crop_sel;
+    if (sel < 0 || sel >= COUNT(rt_crop_wh)) sel = 0;
+    uint32_t cw, ch;
+    if (sel == RT_CROP_FULL) { cw = m1w; ch = m1h & ~1; }
+    else { cw = MIN(rt_crop_wh[sel][0], m1w) & ~63; ch = MIN(rt_crop_wh[sel][1], m1h) & ~1; }
+    uint32_t x0 = ((m1w - cw) / 2) & ~63, y0 = ((m1h - ch) / 2) & ~1;
+    int aw = m1w - obl, ah = m1h - obt;
+    int ax0 = MAX((int)x0 - obl, 0), ay0 = MAX((int)y0 - obt, 0);
+    int ax1 = MIN((int)(x0 + cw) - obl, aw), ay1 = MIN((int)(y0 + ch) - obt, ah);
+    struct vram_info *v = get_yuv422_vram();   /* also refreshes the overlay geometry */
+    if (!v || !vram_lv.width || !vram_lv.height) return 0;
+    int lx0 = ax0 * vram_lv.width / aw, lx1 = ax1 * vram_lv.width / aw;
+    int ly0 = ay0 * vram_lv.height / ah, ly1 = ay1 * vram_lv.height / ah;
+    *bx = LV2BM_X(lx0); *by = LV2BM_Y(ly0);
+    *bw = LV2BM_X(lx1) - *bx; *bh = LV2BM_Y(ly1) - *by;
+    return *bw > 8 && *bh > 8;
+}
+
+static void rr_mark_draw(int color, int x, int y, int w, int h)
+{
+    bmp_draw_rect(color, x, y, w, h);
+    bmp_draw_rect(color, x + 1, y + 1, w - 2, h - 2);
+}
+
+static void rr_mark_task(void *unused)
+{
+    int drawn = 0, dx = 0, dy = 0, dw = 0, dh = 0, tick = 0;
+    for (;;)
+    {
+        msleep(250);
+        tick++;
+        int want = rr_mark && rr_on && lv && lv_movie_select == LVMS_ENABLE_MOVIE && get_global_draw()
+                   && !gui_menu_shown() && DISPLAY_IS_ON;
+        int x = 0, y = 0, w = 0, h = 0;
+        if (want) want = rr_mark_rect(&x, &y, &w, &h);
+        if (!want)
+        {
+            if (drawn && !gui_menu_shown()) { rr_mark_draw(COLOR_EMPTY, dx, dy, dw, dh); drawn = 0; }
+            continue;
+        }
+        if (drawn && (x != dx || y != dy || w != dw || h != dh)) { rr_mark_draw(COLOR_EMPTY, dx, dy, dw, dh); drawn = 0; }
+        if (!drawn || tick % 8 == 0)    /* redraw every 2 s: overlay wipes / Canon redraws may erase it */
+        {
+            rr_mark_draw(COLOR_YELLOW, x, y, w, h);
+            dx = x; dy = y; dw = w; dh = h; drawn = 1;
+        }
+    }
+}
+
+static MENU_UPDATE_FUNC(rr_mark_update)
+{
+    if (!rr_mark) return;
+    if (rr_mark_assumed)
+        MENU_SET_WARNING(MENU_WARN_INFO, "Movie size not known yet: frame assumes FHD (exact after the first clip).");
+    else if (rr_mark_4k_guess)
+        MENU_SET_WARNING(MENU_WARN_INFO, "4K: frame position not verified on the camera yet.");
+}
+
 static struct menu_entry rr_menu[] = {
     {
         .name     = "RAW video (R)",
@@ -1642,6 +1721,14 @@ static struct menu_entry rr_menu[] = {
                 .max     = 3,
                 .choices = CHOICES("14-bit", "12-bit", "10-bit"),   /* v18.1: ML shows choices[value - min] */
                 .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
+            },
+            {
+                .name    = "Crop marker",
+                .priv    = &rr_mark,
+                .max     = 1,
+                .update  = rr_mark_update,
+                .help    = "Yellow frame on the live view around the area the raw recorder records.",
+                .help2   = "Movie mode, RAW video ON, Global Draw ON.",
             },
             {
                 .name    = "Data rate",
@@ -1952,6 +2039,7 @@ static void rt_auto_task(void *unused)
 static void rt_init(void *unused)
 {
     task_create("rr_status", 0x1f, 0x1000, rr_status_task, 0);
+    task_create("rr_mark", 0x1f, 0x1000, rr_mark_task, 0);
     menu_add("Movie", rr_menu, COUNT(rr_menu));       /* v18: user front end */
     menu_add("Debug", rt_menu, COUNT(rt_menu));
     task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
