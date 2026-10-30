@@ -6,7 +6,7 @@
 #define CONFIG_DIGIC_VIII
 
 /** has inter-core RPC (depends on SGI 0xC), required by CONFIG_MMU_REMAP (PR #281) */
-#define CONFIG_RPC
+// #define CONFIG_RPC   (only needed by CONFIG_MMU_REMAP)
 
 /** Cam has MMU (by itself does nothing, see CONFIG_MMU_REMAP) */
 #define CONFIG_MMU

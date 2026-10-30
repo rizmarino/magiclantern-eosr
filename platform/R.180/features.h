@@ -5,12 +5,13 @@
 #define CONFIG_COMPOSITOR_XCM_V1
 
 /* Remap ROM pages to RAM (ML ROM patching, cpu0 only), from PR #281. Used by the silent burst fps patch. */
-#define CONFIG_SGI_HANDLERS
-#define CONFIG_MMU_REMAP
+/* v1.8: ML's patch_mmu is no longer used (silenttest_r.c has its own 24 KB, 4 KB-page remap); see lv-survey.md */
+// #define CONFIG_SGI_HANDLERS
+// #define CONFIG_MMU_REMAP
 /* riz: set up the remap only when first needed, in ~148 KB from Canon's AllocateMemory pool instead of ML's bss.
  * A 544 KB ML (bss incl. generic_mmu_space) left Canon too little user_mem: silent bursts locked up / Err 70 once the
  * buffer filled, with or without the remap (camera-tested 2026-10-30). */
-#define CONFIG_MMU_REMAP_LAZY
+// #define CONFIG_MMU_REMAP_LAZY
 
 // Don't Click Me menu looks to be intended as a place
 // for devs to put custom code in debug.c run_test(),

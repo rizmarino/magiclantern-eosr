@@ -37,9 +37,6 @@
 #include "timer.h"
 #include "config.h"
 #include "fio-ml.h"
-#ifdef CONFIG_MMU_REMAP
-#include "patch.h"
-#endif
 
 #ifndef ST_HOST
 #include "arm-mcr.h"
@@ -53,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.7"
+#define ST_VER              "v1.8"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -625,11 +622,20 @@ static void st_shot_task(void *unused)
     st_busy = 0;
 }
 
-/* ---- silent H burst fps patch (v1.3, needs CONFIG_MMU_REMAP) ----
+/* ---- silent H burst fps patch ----
  * Canon plans each frame of a silent High-speed burst 1e8 / fps100 us after the previous one (FUN_e01d74fc,
  * PoReleaseRequestManager.c). fps100 = 500 for scene seq 61/62 (LvSilentHiContiOneshot/Servo) in both period
- * tables (A 0xE0F16BF8, B 0xE0F16A00; 8-byte entries {fps100, lag_us}). Patched through ML's MMU remap of the
- * 64 KB ROM page 0xE0F10000 into RAM: cpu0 only, gone at power off, never written to flash. */
+ * tables (A 0xE0F16BF8, B 0xE0F16A00; 8-byte entries {fps100, lag_us}).
+ * v1.8: own minimal remap instead of ML's patch_mmu: one 4 KB small page (0xE0F16000) backed by RAM in ML's bss
+ * (L1 copy + L2 table + page = 24 KB), cpu0 only, set up on first use (runtime TTBR switch, camera-proven in v1.7).
+ * v1.3-v1.5 kept ~150 KB in ML (Canon short of user_mem: full-buffer lock-ups / Err 70); v1.6/1.7 took ~148 KB from
+ * Canon's AllocateMemory pool (crash while the buffer cleared). Values change by writing the RAM page directly:
+ * no MMU work, no interrupts-off section after the first setup. Gone at power off, never written to flash. */
+#if defined(CONFIG_MMU) && !defined(ST_HOST)
+#define ST_REMAP
+#include "mmu_utils.h"
+extern void change_mmu_tables(uint8_t *ttbr0, uint8_t *ttbr1, uint32_t cpu_id);
+#endif
 #define ST_FPS_N 4
 static const uint32_t __attribute__((unused)) st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
 static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750 };
@@ -649,16 +655,15 @@ static char st_fps_boot[48] = "";
 
 static void st_fps_table(uint32_t *o)
 {
-#ifdef CONFIG_MMU_REMAP
+#ifdef ST_REMAP
     for (int i = 0; i < ST_FPS_N; i++) o[i] = *(volatile uint32_t *)st_fps_addr[i];
 #else
     for (int i = 0; i < ST_FPS_N; i++) o[i] = 0;
 #endif
 }
 
-#ifdef CONFIG_MMU_REMAP_LAZY
-/* v1.7: every step of the first-use remap setup and of the patch is appended to ML/MMUTEST.TXT (file closed after
- * each line), so after a freeze the last line shows where it stopped */
+#ifdef ST_REMAP
+/* every step of the first-use setup is appended to ML/MMUTEST.TXT (file closed after each line) */
 static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
 {
     char line[96];
@@ -666,58 +671,80 @@ static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
     FILE *f = FIO_CreateFileOrAppend("ML/MMUTEST.TXT");
     if (f) { FIO_WriteFile(f, line, n); FIO_CloseFile(f); }
 }
+
+#define ST_ROMPAGE  0xE0F16000          /* 4 KB page holding both tables' seq 61/62 entries */
+#define ST_SECTION  0xE0F00000
+#define ST_L1_SIZE  0x4900              /* Canon L1 (0x4000) + core L2s for 0-1 MB + core L1s for 0-32 MB */
+/* L1 copy (16 KB aligned) + L2 table (1 KB aligned) + RAM page (4 KB aligned), aligned at runtime inside a plain
+ * array: a linker-aligned struct cost ~51 KB of bss in v1.8-pre, this costs 39 KB */
+#define ST_MMU_SPAN 0x6000              /* l1 at +0, l2 at +0x4C00, page at +0x5000 */
+static uint8_t st_mmu_buf[ST_MMU_SPAN + 0x3C00];
+static uint8_t *st_mmu_l1;
+static uint32_t *st_mmu_l2;
+static uint8_t *st_mmu_page;
+static int st_mmu_on;
+
+/* returns 0, or a negative step number */
+static int st_remap_init(void)
+{
+    if (st_mmu_on) return 0;
+    if (get_cpu_id() != 0) return -1;
+    uint32_t l1 = ((uint32_t)st_mmu_buf + 0x3FFF) & ~0x3FFF;
+    if (l1 + ST_MMU_SPAN > (uint32_t)st_mmu_buf + sizeof(st_mmu_buf)) return -9;
+    st_mmu_l1 = (uint8_t *)l1;
+    st_mmu_l2 = (uint32_t *)(l1 + 0x4C00);
+    st_mmu_page = (uint8_t *)(l1 + 0x5000);
+    st_mmu_log("v1.8 init", l1, (uint32_t)st_mmu_page);
+    if (copy_mmu_tables_ex(l1, 0xE0000000, ST_L1_SIZE)) return -2;
+    uint32_t *a = (uint32_t *)l1, *b = (uint32_t *)0xE0000000, diff = 0;
+    for (int i = 0; i < ST_L1_SIZE / 4; i++) if (a[i] != b[i] && i != 0x1200 && i != 0x1220) diff++;
+    st_mmu_log("copy-diff", diff, a[ST_SECTION >> 20]);
+    if (diff) return -3;
+    if (split_l1_supersection(ST_SECTION, l1)) return -4;
+    uint32_t lf = get_l2_largepage_flags_from_l1_section(ST_SECTION, l1);
+    if (lf == 0xffffffff) return -5;
+    /* large-page flags -> small-page descriptor: B C AP AP2 S nG stay, TEX 14:12 -> 8:6, XN 15 -> 0, type 0b1x */
+    uint32_t sp = (lf & 0xE3C) | (((lf >> 12) & 7) << 6) | ((lf >> 15) & 1) | 2;
+    for (int i = 0; i < 256; i++) st_mmu_l2[i] = (ST_SECTION + i * 0x1000) | sp;
+    memcpy(st_mmu_page, (void *)ST_ROMPAGE, 0x1000);
+    st_mmu_l2[(ST_ROMPAGE - ST_SECTION) >> 12] = (uint32_t)st_mmu_page | sp;
+    if (assign_l2_table_to_l1_section(ST_SECTION, l1, (uint32_t)st_mmu_l2)) return -6;
+    st_mmu_log("tables", lf, sp);
+    dcache_clean(l1, ST_MMU_SPAN);
+    st_mmu_log("ttbr-next", 0, 0);
+    uint32_t old = cli();
+    change_mmu_tables(st_mmu_l1 + ST_L1_SIZE - 0x100, st_mmu_l1, 0);   /* also TLBIALL */
+    sei(old);
+    _sync_caches();
+    st_mmu_on = 1;
+    uint32_t r0 = *(volatile uint32_t *)st_fps_addr[0];
+    st_mmu_log("ttbr-done", r0, *(volatile uint32_t *)0xE0F17000);
+    if (r0 != 500) return -7;          /* the remap itself is proven by st_remap_set's read-back */
+    return 0;
+}
+
+/* write fps100 for seq 61/62 into both tables through the RAM page; read back through the ROM address */
+static int st_remap_set(int v)
+{
+    for (int i = 0; i < ST_FPS_N; i++)
+        *(volatile uint32_t *)(st_mmu_page + (st_fps_addr[i] - ST_ROMPAGE)) = v;
+    dcache_clean((uint32_t)st_mmu_page, 0x1000);
+    int bad = 0;
+    for (int i = 0; i < ST_FPS_N; i++) bad += *(volatile uint32_t *)st_fps_addr[i] != (uint32_t)v;
+    st_mmu_log("set", v, bad);
+    return bad ? -8 : 0;
+}
 #endif
 
 static void st_fps_apply(int sel)
 {
-#ifdef CONFIG_MMU_REMAP
+#ifdef ST_REMAP
     if (sel == st_fps_applied) return;
     int err = 0;
-    if (st_fps_applied != 0)
-    {
-        err |= unpatch_memory(st_fps_addr[0]);
-        err |= unpatch_memory(st_fps_addr[2]);
-        if (!err) st_fps_applied = 0;
-    }
-#ifdef CONFIG_MMU_REMAP_LAZY
-    /* v1.6: the remap is set up on first use (memory from Canon's AllocateMemory pool, not ML's footprint);
-     * errors show as 0x1000N: N = 1 wrong cpu, 4 alloc failed, 5 < 1 MB would stay free, 6 bad address, else init */
-    if (!err && sel != 0)
-    {
-        mmu_lazy_progress = st_mmu_log;
-        st_mmu_log("v1.7 apply", sel, st_fps_val[sel]);
-        int mi = mmu_init_lazy();
-        st_mmu_log("init-ret", (uint32_t)mi, 0);
-        if (mi < 0) err = 0x10000 | (-mi);
-    }
-#endif
-    if (!err && sel != 0)
-    {
-        /* v1.5: two 12-byte patches {fps61, lag61, fps62} per table instead of four 4-byte ones: each ROM patch
-         * runs with interrupts off (TTBR update + cache clean), and the v1.4 boot apply was followed by Canon
-         * "EISSyncTimer0CBR:OVERRUN" warnings. apply_patches copies the values, so locals are fine. */
-        static const uint32_t old3[3] = { 500, 44000, 500 };
-        uint32_t new3[3] = { (uint32_t)st_fps_val[sel], 44000, (uint32_t)st_fps_val[sel] };
-        struct patch p[2];
-        for (int i = 0; i < 2; i++)
-        {
-            p[i].addr = (uint8_t *)st_fps_addr[i * 2];
-            p[i].old_values = (uint8_t *)old3;   /* apply_patches refuses both on any mismatch */
-            p[i].new_values = (uint8_t *)new3;
-            p[i].size = 12;
-            p[i].description = "Silent H burst fps";
-            p[i].is_instruction = 0;
-        }
-#ifdef CONFIG_MMU_REMAP_LAZY
-        st_mmu_log("patch-next", st_fps_val[sel], 0);
-#endif
-        err = apply_patches(p, 2);
-#ifdef CONFIG_MMU_REMAP_LAZY
-        st_mmu_log("patch-done", err, *(volatile uint32_t *)0xE0F16DE0);
-#endif
-        if (!err) st_fps_applied = sel;
-    }
-    st_fps_err = err;
+    if (sel != 0) err = st_remap_init();
+    if (!err && st_mmu_on) err = st_remap_set(st_fps_val[sel]);
+    if (!err) st_fps_applied = sel;
+    st_fps_err = err ? 0x20000 | (-err) : 0;     /* ERROR 2000N: N = step that failed */
     if (err) st_fps_sel = st_fps_applied;
     st_fps_saved = st_fps_applied;      /* only a working setting is saved */
 #else
@@ -726,8 +753,7 @@ static void st_fps_apply(int sel)
 #endif
 }
 
-
-#if defined(CONFIG_MMU_REMAP) && !defined(ST_HOST)
+#ifdef ST_REMAP
 static void st_fps_boot_task(void *unused)
 {
     /* INIT_FUNCs run before config_load(): wait until ML has started (config read), then ~4 s more for Canon */
@@ -1010,7 +1036,7 @@ static struct menu_entry st_menu[] = {
 static void st_init(void *unused)
 {
     menu_add("Debug", st_menu, COUNT(st_menu));
-#ifdef CONFIG_MMU_REMAP
+#ifdef ST_REMAP
     task_create("st_fps_boot", 0x1e, 0x1000, st_fps_boot_task, 0);
 #endif
 }
