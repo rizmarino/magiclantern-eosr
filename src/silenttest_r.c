@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.2"
+#define ST_VER              "v2.3"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -692,7 +692,7 @@ extern void change_mmu_tables(uint8_t *ttbr0, uint8_t *ttbr1, uint32_t cpu_id);
 #endif
 #define ST_FPS_N 4
 static const uint32_t __attribute__((unused)) st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
-static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750 };
+static const int st_fps_val[] = { 500, 550, 600, 650, 700, 750, 800, 900, 1000 };   /* v2.3: 8-10 to find the floor per crop/format */
 static int st_fps_sel;                  /* menu choice */
 static int st_fps_applied;              /* choice currently in effect */
 static int st_fps_err;
@@ -1147,8 +1147,8 @@ static struct menu_entry st_menu[] = {
             {
                 .name    = "Silent H fps",
                 .priv    = &st_fps_sel,
-                .max     = 5,
-                .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5"),
+                .max     = 8,
+                .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5", "8.0", "9.0", "10.0"),
                 .select  = st_fps_select,
                 .update  = st_fps_update,
                 .help    = "Patches Canon's silent High-speed burst rate (RAM copy of ROM).",
