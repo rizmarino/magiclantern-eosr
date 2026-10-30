@@ -4230,9 +4230,12 @@ static void zdiag_tick(void)
        (int)bvram, (int)bmp_vram_real(), (int)bvram_mirror, (int)lvram,
        (int)YUV422_LV_BUFFER_DISPLAY_ADDR, (int)DV_VRAM_PANEL, (int)DV_VRAM_EVF, (int)DV_VRAM_LINE,
        vram_lv.width, vram_lv.height, vram_lv.pitch, (int)LV_OVERLAYS_MODE, (int)DV_DISP_TYPE);
-    ZD(" os x0=%d y0=%d xmax=%d ymax=%d xex=%d yex=%d off=%d bm2lv tx=%d ty=%d sx=%d sy=%d\n",
-       os.x0, os.y0, os.x_max, os.y_max, os.x_ex, os.y_ex,
-       get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy);
+    {
+        extern volatile int vram_params_gen;
+        ZD(" os x0=%d y0=%d xmax=%d ymax=%d xex=%d yex=%d off=%d bm2lv tx=%d ty=%d sx=%d sy=%d gen=%d\n",
+           os.x0, os.y0, os.x_max, os.y_max, os.x_ex, os.y_ex,
+           get_y_skip_offset_for_overlays(), bm2lv.tx, bm2lv.ty, bm2lv.sx, bm2lv.sy, vram_params_gen);
+    }
     {
         extern uint32_t r_refresh_us_last, r_refresh_us_max, r_refresh_count, r_refresh_words_last;
         extern uint32_t r_conv_us_max, r_ximr_us_max, r_full_count;
@@ -4362,6 +4365,20 @@ livev_hipriority_task( void* unused )
         fps_ticks++;
         #ifdef CONFIG_R
         zdiag_tick();
+        {
+            /* riz 2026-10-30: when the overlay geometry changes (panel <-> EVF, photo <-> movie), pixels drawn for the
+             * old layout lie outside the new overlay area, so no later pass ever clears them (camera: EVF zebras left
+             * on the rear screen, and a stale band in movie mode). Wipe ML's layer and the mirror once per change. */
+            extern volatile int vram_params_gen;
+            static int seen_gen = -1;
+            get_yuv422_vram();          /* recomputes the params if dirty */
+            if (seen_gen != vram_params_gen && !gui_menu_shown())
+            {
+                seen_gen = vram_params_gen;
+                clrscr();
+                bvram_mirror_clear();
+            }
+        }
         #endif
 
         while (is_mvr_buffer_almost_full())

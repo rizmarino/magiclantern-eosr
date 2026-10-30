@@ -250,8 +250,15 @@ PROP_HANDLER(PROP_LOGICAL_CONNECT)
     vram_params_set_dirty();
 }
 
+#ifdef CONFIG_R
+volatile int vram_params_gen = 0;      /* riz: bumped on every geometry recompute; zebra.c wipes stale overlays */
+#endif
+
 void _update_vram_params()
 {
+#ifdef CONFIG_R
+    vram_params_gen++;
+#endif
     #if CONFIG_DEBUGMSG
     if (is_menu_active("VRAM")) return;
     #endif
