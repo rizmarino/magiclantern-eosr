@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.0"
+#define ST_VER              "v2.1"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -79,6 +79,8 @@ static volatile uint32_t st_cur[P_N];   /* latest value (first word), kept even 
 static volatile uint16_t st_cur_len[P_N];
 static volatile uint32_t st_cnt[P_N];   /* handler calls since boot */
 static volatile uint32_t st_job_edges;  /* job state 0 -> non-zero transitions since boot */
+static volatile uint32_t st_last_frame_ms;  /* v2.1: time of the last release-counter change */
+static uint32_t st_bc_start;            /* v2.1: buffer count (free shots) at run start */
 
 static struct st_ev *st_ev;
 static volatile int st_n, st_over, st_armed;
@@ -124,6 +126,7 @@ static void st_prop(unsigned property, void *priv, void *buf, unsigned len)
     memcpy(v, buf, n);
 
     if (k == P_JOB && st_cur[P_JOB] == 0 && v[0] != 0) st_job_edges++;
+    if (k == P_RELCNT && v[0] != st_cur[P_RELCNT]) st_last_frame_ms = get_ms_clock();
     st_cur[k] = v[0];
     st_cur_len[k] = len;
     st_cnt[k]++;
@@ -333,6 +336,7 @@ static void st_begin(int run, const char *what)
     st_loglen = 0;
     st_t0 = get_ms_clock();
     st_scs_read(st_scs);
+    st_bc_start = st_cur[P_BURST];
     st_printf("\n=== silent test %s run %d: %s, Canon log %s, boot+%d ms\n", ST_VER, run, what,
               !st_dm_sel ? "OFF" : st_burst_mode ? "BURST" : "ON", (unsigned)st_t0);
     st_dump_state("start");
@@ -349,8 +353,42 @@ static void st_end(int run)
     st_dump_events();
 }
 
+/* v2.1: no card I/O until Canon has finished writing the burst. ML writing SILENT.TXT while Canon still flushed a full
+ * buffer is the deadlock lens.c documents for brackets ("card writes racing Canon's image write"); JOB idle for 2 s
+ * (what v1-v2.0 waited for) comes long before the buffer is empty. Waits for: min_ms since the last frame, JOB idle
+ * 3 s, the buffer count back to its start value (if Canon reports it), and the card LED off 3 s (if it was ever seen
+ * on). Returns 0 if still busy after 3 minutes; the caller then skips the write. */
+static int st_wait_card_idle(int min_ms)
+{
+    uint32_t t0 = get_ms_clock(), job_q = t0, led_q = t0;
+    int led_seen = 0;
+    while ((int)(get_ms_clock() - t0) < 180000)
+    {
+        uint32_t now = get_ms_clock();
+        if (ST_JOB() != 0) job_q = now;
+#if defined(CARD_LED_ADDRESS) && !defined(ST_HOST)
+        if (*(volatile uint32_t *)CARD_LED_ADDRESS == LEDON) { led_seen = 1; led_q = now; }
+#endif
+        int frame_ok = (int)(now - st_last_frame_ms) >= min_ms;
+        int buf_ok = !st_cnt[P_BURST] || st_cur[P_BURST] >= st_bc_start;
+        if (frame_ok && buf_ok && (int)(now - job_q) >= 3000 && (!led_seen || (int)(now - led_q) >= 3000))
+        {
+            st_printf("card idle after %d ms (BURST %d, start %d, LED seen %d)\n", (int)(now - t0), (int)st_cur[P_BURST],
+                      (int)st_bc_start, led_seen);
+            return 1;
+        }
+        msleep(50);
+    }
+    return 0;
+}
+
 static void st_save(int run)
 {
+    if (!st_wait_card_idle(st_burst_mode ? 10000 : 3000))
+    {
+        NotifyBox(8000, "Silent test run %d: card still busy after 3 min, log NOT written. %s", run, st_last);
+        return;
+    }
     int ok = st_flush();
     if (st_dm_sel)
     {
@@ -667,6 +705,11 @@ static void st_fps_table(uint32_t *o)
 /* every step of the first-use setup is appended to ML/MMUTEST.TXT (file closed after each line) */
 static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
 {
+    /* v2.1: skip the line rather than touch the card while a burst may still be writing */
+    if (st_last_frame_ms && (int)(get_ms_clock() - st_last_frame_ms) < 30000) return;
+#ifdef CARD_LED_ADDRESS
+    if (*(volatile uint32_t *)CARD_LED_ADDRESS == LEDON) return;
+#endif
     char line[96];
     int n = snprintf(line, sizeof(line), "%d ms %s %x %x\n", (int)get_ms_clock(), stage, (unsigned)a, (unsigned)b);
     FILE *f = FIO_CreateFileOrAppend("ML/MMUTEST.TXT");
@@ -737,8 +780,7 @@ static int st_remap_write(int v)
 
 static int st_remap_set(int v)
 {
-    int bad = st_remap_write(v);
-    st_mmu_log("set", v, bad);
+    int bad = st_remap_write(v);       /* v2.1: no log line here (card I/O right after a burst can deadlock) */
     return bad ? -8 : 0;
 }
 
