@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.9"
+#define ST_VER              "v2.0"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -742,30 +742,61 @@ static int st_remap_set(int v)
     return bad ? -8 : 0;
 }
 
-/* v1.9: full-buffer fallback. v1.8 froze when a long 7 fps burst filled the buffer and it started to clear (short
- * bursts and full buffers at Canon's 5.0 are fine). While the patch is on, a task watches PROP_BURST_COUNT (free
- * shots in the buffer); at <= 3 it writes Canon's 500 back (plain memory write), and above 8 the patched value again. */
-static int st_fb_sel = 1;               /* menu: ON */
+/* v1.9/v2.0: full-buffer fallback. v1.8 froze when a long 7 fps burst filled the buffer and it started to clear
+ * (short bursts, and full buffers at Canon's 5.0 even with the remap on, are fine). v1.9 switched on PROP_BURST_COUNT
+ * <= 3 and still froze (unknown whether it fired). v2.0 also counts frames: after "Fast frames" frames of one burst,
+ * Canon's 500 goes back for the rest of it; the patched value returns when the burst has ended (no new frame for
+ * 800 ms). Plain memory writes into the RAM page; events kept in RAM and printed by Burst log. */
+static int st_fb_sel = 1;               /* menu: buffer-count trigger ON */
+static int st_fast_sel = 2;             /* menu: fast frames per burst: All / 10 / 15 / 20 */
+static const int st_fast_n[] = { 0, 10, 15, 20 };
 static volatile int st_fb_active, st_fb_count, st_fb_min = 999;
+#define ST_FBE_MAX 32
+static struct { uint32_t ms; uint16_t on, why; uint32_t rel, bc; } st_fbe[ST_FBE_MAX];
+static volatile int st_fbe_n;
+static void st_fb_note(int on, int why, uint32_t rel, int bc)
+{
+    int i = st_fbe_n;
+    if (i >= ST_FBE_MAX) return;
+    st_fbe[i].ms = get_ms_clock(); st_fbe[i].on = on; st_fbe[i].why = why; st_fbe[i].rel = rel; st_fbe[i].bc = bc;
+    st_fbe_n = i + 1;
+}
 static void st_fb_task(void *unused)
 {
+    uint32_t last_rel = 0, burst_rel0 = 0, last_change = 0;
+    int in_burst = 0, primed = 0;
     for (;;)
     {
-        msleep(20);
+        msleep(10);
         if (!st_mmu_on) continue;
-        int bc = (int)st_cur[P_BURST];
-        if (st_cnt[P_BURST] == 0) continue;     /* property never delivered: no data, do nothing */
-        if (bc < st_fb_min) st_fb_min = bc;
-        if (!st_fb_active && st_fb_sel && st_fps_applied && bc <= 3)
+        uint32_t now = get_ms_clock(), rel = st_cur[P_RELCNT];
+        if (!primed) { last_rel = rel; primed = 1; continue; }
+        int have_bc = st_cnt[P_BURST] != 0, bc = (int)st_cur[P_BURST];
+        if (have_bc && bc < st_fb_min) st_fb_min = bc;
+        if (rel != last_rel)
+        {
+            if (!in_burst || (int)(now - last_change) > 800) { in_burst = 1; burst_rel0 = last_rel; }
+            last_rel = rel;
+            last_change = now;
+        }
+        else if (in_burst && (int)(now - last_change) > 800)
+            in_burst = 0;
+        int nfast = st_fast_n[st_fast_sel];
+        int frames = in_burst ? (int)(rel - burst_rel0) : 0;
+        int want_slow = st_fps_applied && ((nfast && frames >= nfast) || (st_fb_sel && have_bc && bc <= 3));
+        int want_fast = st_fps_applied && !in_burst && (!have_bc || bc >= 8 || !st_fb_sel);
+        if (!st_fb_active && want_slow)
         {
             st_remap_write(500);
             st_fb_active = 1;
             st_fb_count++;
+            st_fb_note(1, (nfast && frames >= nfast) ? 1 : 2, rel, bc);
         }
-        else if (st_fb_active && (bc >= 8 || !st_fb_sel || !st_fps_applied))
+        else if (st_fb_active && (want_fast || !st_fps_applied))
         {
             st_remap_write(st_fps_val[st_fps_applied]);
             st_fb_active = 0;
+            st_fb_note(0, 0, rel, bc);
         }
     }
 }
@@ -877,8 +908,13 @@ static void st_burst_task(void *unused)
 
     int total = (int)(st_cur[P_RELCNT] - rel0);
 #ifdef ST_REMAP
-    st_printf("full-buffer fallback: %s, switched to 5.0 %d time(s) so far, lowest BURST seen %d\n",
-              st_fb_sel ? "ON" : "OFF", st_fb_count, st_fb_min);
+    st_printf("v2.0 fallback: fast frames %d (0 = all), buffer trigger %s; switched to 5.0 %d time(s), lowest BURST %d\n",
+              st_fast_n[st_fast_sel], st_fb_sel ? "ON" : "OFF", st_fb_count, st_fb_min);
+    for (int i = 0; i < st_fbe_n; i++)
+        st_printf("  fallback %d ms: %s (%s), RELCNT %d, BURST %d\n", (int)(st_fbe[i].ms - st_t0),
+                  st_fbe[i].on ? "-> 5.0" : "-> patched", st_fbe[i].why == 1 ? "frame count" : st_fbe[i].why == 2 ? "buffer" : "burst ended",
+                  (int)st_fbe[i].rel, (int)st_fbe[i].bc);
+    st_fbe_n = 0;
 #endif
     st_printf("summary: %s; %d frames in the log window, %d in total; MECHA +%d; SILENT=%x DRIVE=%x; final idle %s\n",
               why, win, total, (int)(st_cur[P_MECHA] - mech0), (unsigned)st_cur[P_SILENT], (unsigned)st_cur[P_DRIVE],
@@ -1062,6 +1098,14 @@ static struct menu_entry st_menu[] = {
                 .help2   = "Saved; re-applied ~5 s after boot. Canon 5.0 = off.",
             },
 #ifdef ST_REMAP
+            {
+                .name    = "Fast frames",
+                .priv    = &st_fast_sel,
+                .max     = 3,
+                .choices = CHOICES("All", "10", "15", "20"),
+                .help    = "While patched: frames per burst at the patched rate,",
+                .help2   = "then Canon 5.0 until the burst ends (avoids the full-buffer freeze).",
+            },
             {
                 .name    = "Full buffer -> 5.0",
                 .priv    = &st_fb_sel,
