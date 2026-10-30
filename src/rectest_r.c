@@ -135,10 +135,9 @@ static volatile int rr_full;            /* last clip stopped because the card wa
  * while the trigger is held (Burst) or all the time into a short ring (Pre-capture), and sp_writer turns each kept
  * frame into a DNG (4096-byte header in the slot, pixels byte-swapped to DNG's MSB-first order). Keys: see sp_keys. */
 static CONFIG_INT("r.silent.lv", sp_mode, 0);            /* 0 OFF, 1 Burst, 2 Pre-capture */
-static CONFIG_INT("r.silent.lv.bits", sp_bits, 0);       /* 0 = 12-bit, 1 = 10-bit */
+static CONFIG_INT("r.silent.lv.bpp", sp_bits, 0);        /* v3.8: 0 = 10-bit, 1 = 12-bit (12-bit 4K copy ~30 ms: tears) */
 static CONFIG_INT("r.silent.lv.pre", sp_pre_sel, 1);     /* frames kept before the press: sp_pre_n[] */
 static CONFIG_INT("r.silent.lv.arm", sp_arm_sel, 0);     /* 0 half-press, 1 always (movie LV, ML menu closed) */
-static CONFIG_INT("r.silent.lv.trig", sp_trig_sel, 0);   /* 0 shutter button, 1 AF-ON button */
 static const int sp_pre_n[] = { 3, 5, 7, 9 };
 static volatile int sp_active;          /* the current rt_task run is a silent-picture session */
 static volatile int sp_ready;           /* armed: capture loop running */
@@ -147,6 +146,16 @@ static volatile int sp_end;             /* end the session (released, cancelled,
 static volatile int sp_rel;             /* trigger released: end once at least one frame is kept (quick taps)  */
 static volatile int sp_sim;             /* Debug timed test running */
 static volatile int sp_kept, sp_saved, sp_pre_kept;   /* frames kept for DNG, DNGs written, of them before the press */
+static volatile int sp_half;            /* v3.8: half-press held (0x7D seen, 0x7E not yet) */
+static volatile int sp_n85;             /* lone 0x85 events in a row (full press held: see sp_keys) */
+static volatile uint32_t sp_t85;        /* ms of the last 0x85 */
+static volatile int sp_wait_rel;        /* a session ended with the full press still held: no new one until it's let go */
+#define SP_TICK_GAP_MS  250
+/* full press let go but the half-press still held: the 0x85 stream stops */
+static inline void sp_check_tick_end(void)
+{
+    if (sp_trig && !sp_sim && !sp_rel && get_ms_clock() - sp_t85 > SP_TICK_GAP_MS) sp_rel = 1;
+}
 static inline int rt_diag(void) { return !(rr_active || sp_active) || rr_diag; }
 static volatile int rt_osd_run;         /* auto-run "osd": show the REC status during a timed run (A/B cost test) */
 static volatile uint32_t rr_t0_ms;
@@ -1448,6 +1457,8 @@ static void sp_writer(void *unused)
         int k = -1;
         uint32_t best = 0xFFFFFFFF;
         for (int i = 0; i < nch; i++) if (ch[i].state == CH_FULL && ch[i].seq < best) { best = ch[i].seq; k = i; }
+        if (k >= 0 && sp_ready && !w_stop) k = -1;     /* v3.8: no swap/card writes while frames are copied: the
+                                                         * 4K camera test showed copies 31 -> 43 ms with them */
         if (k >= 0)
         {
             int r = sp_write_dng(k);
@@ -1497,6 +1508,7 @@ static int sp_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
 {
     if (!first_t) { first_t = td; next_tl = 0; }
     uint32_t us = 0;
+    sp_check_tick_end();
     int trig = sp_trig;
     if (trig && !sp_trig_cap)           /* press: the ring frames become kept frames */
     {
@@ -1521,6 +1533,7 @@ static int sp_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
     {
         flags |= F_DROP; drops++;
         if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+        if (trig) sp_end = 1;           /* v3.8: memory full: stop and start writing (no writes during capture) */
         goto out;
     }
     ch[k].state = CH_FILL;
@@ -1784,7 +1797,7 @@ static void rt_task(void *unused)
     c_free0 = (uint64_t)get_free_space_32k(get_shooting_card()) * 32768;
     c_dng = sp_active ? 1 : 0;          /* v20 */
     c_mlv = rt_fmt_sel != 0 && !c_dng;
-    c_bpp = c_dng ? (sp_bits ? 10 : 12) : rt_fmt_bpp[rt_fmt_sel];
+    c_bpp = c_dng ? (sp_bits ? 12 : 10) : rt_fmt_bpp[rt_fmt_sel];
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
     if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
@@ -1799,9 +1812,9 @@ static void rt_task(void *unused)
         sp_ready = 0; sp_kept = sp_saved = sp_pre_kept = 0; sp_ring_n = 0; sp_trig_cap = 0;
         sp_swap_us_sum = sp_swap_us_max = sp_wr_us_sum = sp_wr_us_max = sp_chk_bad = sp_torn = sp_midtear = 0;
         sp_dir[0] = 0;
-        rt_printf("v20 silent session: %s, %d-bit, arm %s, trigger %s, keep %d before the press%s, lv_movie_select %d\n",
+        rt_printf("v20 silent session (v3.8 keys): %s, %d-bit, arm %s, keep %d before the press%s, lv_movie_select %d\n",
                   sp_run_mode == 2 ? "pre-capture" : "burst", c_bpp, sp_arm_sel ? "always" : "half-press",
-                  sp_trig_sel ? "AF-ON" : "shutter", sp_pre_n[sp_pre_sel & 3], sp_sim ? ", timed test" : "", lv_movie_select);
+                  sp_pre_n[sp_pre_sel & 3], sp_sim ? ", timed test" : "", lv_movie_select);
         if (!sp_hdr) sp_hdr = malloc(SP_HDR);
         if (!sp_recs) sp_recs = malloc(sizeof(*sp_recs) * SP_MAXREC);
         if (!sp_hdr || !sp_recs) { snprintf(rt_last, sizeof(rt_last), "no memory"); goto done; }
@@ -2211,18 +2224,25 @@ static void rr_status_task(void *unused)
  * (shooting_mode == 0x14; v10 logged movie=0 in movie mode), so the movie check is gone; and every
  * button event (not Canon's 0x9D info events) is logged with the state, flushed to ML/RRKEYS.TXT. */
 struct rr_key { uint32_t t_ms; int16_t param; uint8_t lv, menu, movie, taken; uint16_t smode; uint8_t rec, sp; };   /* v20: sp = silent session bits */
-#define RR_NKEY 64
+#define RR_NKEY 128
 static struct rr_key rr_keys[RR_NKEY];
 static volatile uint32_t rr_nkey;       /* total logged; ring index = n % RR_NKEY */
 static uint32_t rr_nkey_flushed;
 
 static int rr_key_log(int param, int taken)
 {
+    static uint32_t t85;                /* v3.8: a held full press sends 0x85 every ~100 ms: log 2 per second */
+    if (param == 0x85)
+    {
+        uint32_t t = get_ms_clock();
+        if (t - t85 < 500) return taken ? 0 : 1;
+        t85 = t;
+    }
     uint32_t n = rr_nkey;
     struct rr_key *k = &rr_keys[n % RR_NKEY];
     k->t_ms = get_ms_clock(); k->param = param; k->lv = lv ? 1 : 0; k->menu = gui_menu_shown() ? 1 : 0;
     k->movie = is_movie_mode() ? 1 : 0; k->taken = taken; k->smode = shooting_mode; k->rec = RECORDING ? 1 : 0;
-    k->sp = (sp_active ? 1 : 0) | (sp_ready ? 2 : 0) | (sp_trig ? 4 : 0) | (lv_movie_select == LVMS_ENABLE_MOVIE ? 8 : 0);
+    k->sp = (sp_active ? 1 : 0) | (sp_ready ? 2 : 0) | (sp_trig ? 4 : 0) | (lv_movie_select == LVMS_ENABLE_MOVIE ? 8 : 0) | (sp_half ? 0x10 : 0);
     rr_nkey = n + 1;
     return taken ? 0 : 1;
 }
@@ -2249,18 +2269,17 @@ static void rr_key_flush(void)
 }
 
 /* ---- v20: LV silent pictures: keys, session start, watcher, timed test ----
- * Shutter codes are ML's convention for the R (gui.h 0x7D half-press; release/full/full-release = +1/+2/+3), NOT yet
- * seen on this camera: the key log (ML/RRKEYS.TXT, written after each session and every second while idle) shows
- * what really arrives. AF-ON 0x81/0x82 (kitor's list) is the alternative trigger.
- * Half-press arms a session (~2 s: LV raw on, survey, memory), the trigger held = frames kept, its release ends the
- * session (then the DNGs are written); a half release without a trigger cancels. Canon still gets the half-press
- * (AF); the trigger press/release are taken. REC is taken during a session (no Canon recording on our memory). */
+ * Shutter on the R (camera key log, v3.7 test 2026-10-30): half-press = 0x85 0x85 0x81 0x7D, half release = 0x82 0x7E.
+ * The full press has NO code of its own: while it is held Canon sends a lone 0x85 about every 100 ms (0x85 also comes
+ * right before every other key's code, so a lone 0x85 is one not followed by another code). Full press = 2 lone 0x85
+ * within 250 ms while the half-press is held; its end = 0x7E, or no 0x85 for 250 ms (sp_frame / sp_watch_task).
+ * 0x81/0x82 come with every half-press, so AF-ON can't be a separate trigger.
+ * Half-press arms a session (~2 s: LV raw on, survey, memory), the full press held = frames kept, its release ends the
+ * session (then the DNGs are written); a half release without a full press cancels. All shutter events still go to
+ * Canon (AF; the full press does nothing in movie mode). REC is taken during a session. */
 #define SP_KEY_HALF     0x7D
 #define SP_KEY_UNHALF   0x7E
-#define SP_KEY_FULL     0x7F
-#define SP_KEY_UNFULL   0x80
-#define SP_KEY_AFON     0x81
-#define SP_KEY_UNAFON   0x82
+#define SP_KEY_TICK     0x85
 #define SP_PND          "ML/SETTINGS/SPARM.PND"   /* Arm = Always session running (see sp_watch_task) */
 
 static int sp_movie_lv(void) { return lv && lv_movie_select == LVMS_ENABLE_MOVIE && !gui_menu_shown(); }
@@ -2269,6 +2288,7 @@ static void sp_task(void *unused)
 {
     rt_task(0);                         /* synchronous; clears rt_busy */
     if (is_file(SP_PND)) FIO_RemoveFile(SP_PND);     /* session finished normally */
+    if (sp_half && get_ms_clock() - sp_t85 < SP_TICK_GAP_MS) sp_wait_rel = 1;   /* memory full while held */
     sp_active = 0; sp_ready = 0; sp_trig = 0; sp_end = 0; sp_rel = 0;   /* key log: rr_status_task flushes it once idle */
 }
 
@@ -2293,31 +2313,34 @@ static int sp_try_start(int trig)
 /* -1: not a silent-picture key; else 0 = taken, 1 = passed to Canon */
 static int sp_keys(int p)
 {
-    int dn = sp_trig_sel ? SP_KEY_AFON : SP_KEY_FULL, up = sp_trig_sel ? SP_KEY_UNAFON : SP_KEY_UNFULL;
+    uint32_t now = get_ms_clock();
+    if (p == SP_KEY_TICK)
+    {
+        if (sp_half)
+        {
+            sp_n85 = (sp_n85 && now - sp_t85 < SP_TICK_GAP_MS) ? sp_n85 + 1 : 1;
+            sp_t85 = now;
+            if (sp_n85 >= 2)            /* full press held */
+            {
+                if (sp_active) { if (!sp_end && !sp_trig) { sp_mark_press(); sp_trig = 1; } }
+                else if (sp_mode && !rt_busy && !sp_wait_rel && sp_movie_lv()) sp_try_start(1);
+            }
+        }
+        return 1;
+    }
+    sp_n85 = 0;                         /* the 0x85 before this one belonged to this key */
     if (p == SP_KEY_HALF)
     {
+        sp_half = 1;
         if (sp_mode && sp_arm_sel == 0 && !sp_active && !rt_busy && sp_movie_lv()) sp_try_start(0);
         return 1;
     }
     if (p == SP_KEY_UNHALF)
     {
-        if (sp_active && !sp_trig && !sp_sim && sp_arm_sel == 0) sp_end = 1;    /* released without a picture */
+        sp_half = 0; sp_wait_rel = 0;
+        if (sp_active && sp_trig && !sp_sim) sp_rel = 1;                       /* sp_frame ends it after >= 1 kept frame */
+        else if (sp_active && !sp_trig && !sp_sim && sp_arm_sel == 0) sp_end = 1;   /* released without a picture */
         return 1;
-    }
-    if (p == dn)
-    {
-        if (sp_active)
-        {
-            if (!sp_end && !sp_trig) { sp_mark_press(); sp_trig = 1; }
-            return 0;                   /* also while the last burst is still being written: ignored, not Canon's */
-        }
-        if (sp_mode && !rt_busy && sp_movie_lv()) { sp_try_start(1); return 0; }
-        return 1;
-    }
-    if (p == up)
-    {
-        if (sp_active && sp_trig && !sp_sim) sp_rel = 1;   /* sp_frame ends it after >= 1 kept frame */
-        return sp_active ? 0 : 1;
     }
     if (sp_active && p == RR_KEY_REC_PRESS)
     {
@@ -2345,6 +2368,9 @@ static void sp_watch_task(void *unused)
     {
         msleep(200);
         int mlv = sp_movie_lv() && DISPLAY_IS_ON;
+        sp_check_tick_end();
+        if (!mlv) sp_half = 0;          /* a release may have gone to the ML menu or Canon's */
+        if (sp_wait_rel && (!sp_half || get_ms_clock() - sp_t85 > SP_TICK_GAP_MS)) sp_wait_rel = 0;
         if (sp_active && !sp_trig && !sp_end && (!mlv || (!sp_mode && !sp_sim))) sp_end = 1;
         if (sp_mode && sp_arm_sel == 1 && mlv && !rt_busy && !sp_active && !sp_sim) ok_ms += 200; else ok_ms = 0;
         if (ok_ms >= 1000)
@@ -2773,14 +2799,15 @@ static struct menu_entry sp_menu[] = {
         .choices  = CHOICES("OFF", "Burst", "Pre-capture"),
         .update   = sp_menu_update,
         .help     = "DNG stills from the live-view raw feed, no shutter. Movie mode, Canon size 4K: 4256x2214.",
-        .help2    = "Half-press arms (~2 s), full press = frames while held. Pre-capture keeps frames before it too.",
+        .help2    = "Half-press arms (~2 s), full press = frames while held (~12 max). Pre-capture: frames before too.",
         .children = (struct menu_entry[]) {
             {
                 .name    = "Bit depth",
                 .priv    = &sp_bits,
                 .max     = 1,
-                .choices = CHOICES("12-bit", "10-bit"),
-                .help    = "Same number of frames in memory either way at 4K; 10-bit copies faster (less tear risk).",
+                .choices = CHOICES("10-bit", "12-bit"),
+                .help    = "10-bit: whole 4K frame copied in ~20 ms, ahead of the sensor. 12-bit takes ~30 ms:",
+                .help2   = "as slow as the sensor readout, so 4K frames tear (camera-tested). 12-bit only for FHD.",
             },
             {
                 .name    = "Frames before press",
@@ -2796,13 +2823,7 @@ static struct menu_entry sp_menu[] = {
                 .max     = 1,
                 .choices = CHOICES("Half-press", "Always"),
                 .help    = "Always: armed whenever movie live view is up (ML overlays pause, REC raw is blocked).",
-            },
-            {
-                .name    = "Trigger",
-                .priv    = &sp_trig_sel,
-                .max     = 1,
-                .choices = CHOICES("Shutter", "AF-ON"),
-                .help    = "Button held = frames kept. AF-ON: Canon's AF-ON does nothing else while this is on.",
+                .help2   = "Pictures still need half + full press; Always only saves the ~2 s arming wait.",
             },
             {
                 .name    = "Timed test",
