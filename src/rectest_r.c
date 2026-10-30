@@ -909,11 +909,26 @@ static volatile int ra_meter_alive, ra_meter_stop;
 static uint32_t ra_madr, ra_msize;
 static uint32_t ra_m_updates, ra_m_bad, ra_m_clip[2], ra_m_maxpk[2], ra_m_ref0, ra_m_refus0, ra_m_ximr0;
 
-#define RA_M_X   8
-#define RA_M_Y   40
-#define RA_M_W   192                    /* 4 px per dB */
-#define RA_M_H   6
-#define RA_M_GAP 4
+/* v19.3: to the right of the REC status (riz), in the black band above the 16:9 movie image (rows 0-36 on the rear
+ * screen; v19.2's bars below the status covered the image top and ML's top info line). The bars start after the
+ * widest status text and run to the right edge; rr_meter_layout() computes x and the scale once (fonts loaded). */
+static int RA_M_X = 300, RA_M_W = 384, RA_M_PX = 8, rr_m_layout_done;
+#define RA_M_Y   10
+#define RA_M_H   8
+#define RA_M_GAP 2
+#define RA_M_CLIP_W 20
+#define RA_M_RIGHT 712
+static void rr_meter_layout(void)
+{
+    if (rr_m_layout_done) return;
+    int w = bmp_string_width(FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK), " REC 00:00 2880x1216 14b ");
+    int x = (8 + w + 10 + 3) & ~3;
+    if (x < 200 || x > 420) x = 300;                 /* font not measurable: fixed fallback */
+    int px = (RA_M_RIGHT - 4 - RA_M_CLIP_W - x) / 48;
+    if (px < 4) px = 4;
+    RA_M_X = x; RA_M_PX = px; RA_M_W = 48 * px;
+    rr_m_layout_done = 1;
+}
 
 static int ra_db_of(uint32_t pk)        /* 0 .. 48 = dB below full scale, 49 = below -48 dB */
 {
@@ -949,25 +964,26 @@ static int ra_meter_read(uint32_t *pl, uint32_t *pr)
 static void ra_meter_bar(int ch, int db, int hold_db, int clip_lit)
 {
     int y = RA_M_Y + ch * (RA_M_H + RA_M_GAP);
-    int len = db >= 48 ? 0 : (48 - db) * 4;            /* 0 .. 192 px */
-    int g = MIN(len, 36 * 4), yl = MIN(len, 45 * 4);   /* green to -12 dB, yellow to -3 dB, red above */
+    int len = db >= 48 ? 0 : (48 - db) * RA_M_PX;      /* 0 .. RA_M_W px */
+    int g = MIN(len, 36 * RA_M_PX), yl = MIN(len, 45 * RA_M_PX);   /* green to -12 dB, yellow to -3 dB, red above */
     if (g) bmp_fill(COLOR_GREEN1, RA_M_X, y, g, RA_M_H);
     if (yl > g) bmp_fill(COLOR_YELLOW, RA_M_X + g, y, yl - g, RA_M_H);
     if (len > yl) bmp_fill(COLOR_RED, RA_M_X + yl, y, len - yl, RA_M_H);
     if (len < RA_M_W) bmp_fill(COLOR_GRAY(20), RA_M_X + len, y, RA_M_W - len, RA_M_H);
     if (hold_db < 48)
     {
-        int hx = RA_M_X + (48 - hold_db) * 4 - 2;
+        int hx = RA_M_X + (48 - hold_db) * RA_M_PX - 3;
         if (hx < RA_M_X) hx = RA_M_X;
-        bmp_fill(COLOR_WHITE, hx, y, 2, RA_M_H);
+        bmp_fill(COLOR_WHITE, hx, y, 3, RA_M_H);
     }
-    bmp_fill(clip_lit ? COLOR_RED : COLOR_GRAY(20), RA_M_X + RA_M_W + 4, y, 12, RA_M_H);
+    bmp_fill(clip_lit ? COLOR_RED : COLOR_GRAY(20), RA_M_X + RA_M_W + 4, y, RA_M_CLIP_W, RA_M_H);
 }
 
 static void ra_meter_task(void *unused)
 {
     int hold[2] = { 49, 49 }, hold_ms[2] = { 0, 0 }, clip_ms[2] = { 0, 0 }, clip_on[2] = { 0, 0 }, drawn = 0;
     uint32_t last_clipn[2] = { ra_fclip_n[0], ra_fclip_n[1] };
+    rr_meter_layout();
     ra_m_updates = ra_m_bad = 0; ra_m_clip[0] = ra_m_clip[1] = ra_m_maxpk[0] = ra_m_maxpk[1] = 0;
     ra_m_ref0 = r_refresh_count; ra_m_refus0 = r_refresh_us_max; ra_m_ximr0 = r_ximr_us_max;
     while (!ra_meter_stop)
@@ -980,7 +996,7 @@ static void ra_meter_task(void *unused)
         int now = get_ms_clock();
         if (!drawn)
         {
-            bmp_fill(COLOR_BLACK, RA_M_X - 4, RA_M_Y - 3, RA_M_W + 24, 2 * RA_M_H + RA_M_GAP + 6);
+            bmp_fill(COLOR_BLACK, RA_M_X - 4, RA_M_Y - 1, RA_M_W + RA_M_CLIP_W + 12, 2 * RA_M_H + RA_M_GAP + 2);
             drawn = 1;
         }
         uint32_t fp[2] = { ra_fpk[0], ra_fpk[1] };      /* every sample since the last update (ra_task, <= 0.5 s late) */
@@ -1002,7 +1018,7 @@ static void ra_meter_task(void *unused)
         ra_m_updates++;
     }
     if (drawn && !gui_menu_shown())
-        bmp_fill(COLOR_EMPTY, RA_M_X - 4, RA_M_Y - 3, RA_M_W + 24, 2 * RA_M_H + RA_M_GAP + 6);
+        bmp_fill(COLOR_EMPTY, RA_M_X - 4, RA_M_Y - 1, RA_M_W + RA_M_CLIP_W + 12, 2 * RA_M_H + RA_M_GAP + 2);
     ra_meter_alive = 0;
 }
 
@@ -1736,6 +1752,8 @@ static void rr_task(void *unused)
 
 static void rr_key_flush(void);
 
+#define RR_STATUS_Y 8                   /* v19.3: meters sit to the right of it (RA_M_X) */
+#define RR_STATUS_CLEAR_W (RA_M_X - 12)   /* clearing the status never touches the meters */
 static void rr_status_task(void *unused)
 {
     /* on-screen status while a REC-button run is active. v16 redrew every 250 ms and that run wrote
@@ -1748,7 +1766,7 @@ static void rr_status_task(void *unused)
         msleep(250);
         if (++tick % 4 == 0 && !rr_active && !rt_osd_run && rr_diag) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics */
         int on = rr_active || rt_osd_run;
-        if (!on) { if (shown) { bmp_fill(COLOR_EMPTY, 8, 8, 400, 30); shown = 0; last[0] = 0; } continue; }
+        if (!on) { if (shown) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); shown = 0; last[0] = 0; } continue; }
         if (gui_menu_shown() || tick % 4) continue;
         char t[40];
         uint32_t s_rec = !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
@@ -1756,8 +1774,8 @@ static void rr_status_task(void *unused)
         else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
         else snprintf(t, sizeof(t), " REC %02d:%02d %dx%d %db ", s_rec / 60, s_rec % 60, c_cw, c_ch, c_bpp);   /* v18: + size */
         if (shown && !strcmp(t, last)) continue;
-        if (shown && strlen(t) != strlen(last)) bmp_fill(COLOR_EMPTY, 8, 8, 400, 30);
-        bmp_printf(FONT(FONT_MED, COLOR_WHITE, rr_t0_ms && !rr_stop ? COLOR_RED : COLOR_BLACK), 8, 8, "%s", t);
+        if (shown && strlen(t) != strlen(last)) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); }
+        bmp_printf(FONT(FONT_MED, COLOR_WHITE, rr_t0_ms && !rr_stop ? COLOR_RED : COLOR_BLACK), 8, RR_STATUS_Y, "%s", t);
         snprintf(last, sizeof(last), "%s", t);
         shown = 1;
     }
@@ -2145,7 +2163,7 @@ static struct menu_entry rr_menu[] = {
                 .name    = "Audio meters",
                 .priv    = &rr_meter,
                 .max     = 1,
-                .help    = "L/R level bars while a clip with audio records: -48..0 dBFS, peak hold, CLIP box.",
+                .help    = "L/R level bars next to the REC status while a clip with audio records: -48..0 dBFS, peak, CLIP.",
                 .help2   = "Red from -3 dB; CLIP lights for 2 s after a sample hits full scale.",
             },
             {
