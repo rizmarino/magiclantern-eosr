@@ -230,6 +230,10 @@ int should_draw_bottom_bar()
 {
     if (gui_menu_shown()) return 1;
     if (!get_global_draw()) return 0;
+    #ifdef CONFIG_R
+    extern int r_evf_bottombar_ok(void);
+    if (!r_evf_bottombar_ok()) return 0;   /* riz: viewfinder, "EVF shot info bar" OFF */
+    #endif
     //~ if (EXT_MONITOR_CONNECTED) return 1;
     if (canon_gui_front_buffer_disabled()) return 1;
     if (is_canon_bottom_bar_dirty())

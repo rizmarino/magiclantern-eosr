@@ -162,6 +162,10 @@ static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, -80);
 static CONFIG_INT("r.evf.ovl.w",  r_evf_w,  720);
 static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  495);
 static int r_img_x0 = 0, r_img_y0 = 0, r_img_w = 720, r_img_h = 480;
+/* riz 2026-10-30: ML's bottom info bar (shot info) in the viewfinder; Canon shows its own below the EVF image.
+ * Default OFF there; lens.c should_draw_bottom_bar() asks r_evf_bottombar_ok(). */
+static CONFIG_INT("r.evf.bottombar", r_evf_bottombar, 0);
+int r_evf_bottombar_ok(void) { return r_evf_bottombar || !R_LV_ON_EVF(); }
 /* riz 2026-10-30: the R stays in shooting_mode 3 (M) in movie mode, so is_movie_mode() is false there;
  * PROP_LV_MOVIE_SELECT does follow the photo/movie switch (1 = photo, 2 = movie, camera-verified). Used only for the
  * overlay geometry below, so the rest of ML keeps its current (photo) behaviour. */
@@ -977,6 +981,14 @@ static struct menu_entry r_evf_menus[] = {
               .help = "Image height in overlay pixels (calibrated default 495)." },
             MENU_EOL,
         },
+    },
+    {
+        .name    = "EVF shot info bar",
+        .priv    = &r_evf_bottombar,
+        .max     = 1,
+        .choices = CHOICES("OFF", "ON"),
+        .help    = "ML's bottom info bar (mode, lens, aperture, shutter, ISO...) in the viewfinder.",
+        .help2   = "OFF: Canon's own info line below the image is enough. Rear screen unaffected.",
     },
 };
 
