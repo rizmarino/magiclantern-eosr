@@ -804,6 +804,7 @@ static int ra_sync_code(void)
  * timestamp 0 as missing, and AUDF must sort after WAVI). */
 #define RA_PAYLOAD 96000                /* 0.5 s of 48 kHz 16-bit stereo */
 static int ra_fill_idx, ra_fill_n;      /* block being filled, bytes in it */
+static volatile uint32_t ra_fpk[2], ra_fclip_n[2];   /* v19.2: peak / full-scale samples over EVERY sample (ra_task) */
 
 /* close the block being filled (pad with silence to RA_PAYLOAD), hand it to the writer */
 static void ra_finish_block(void)
@@ -849,6 +850,22 @@ static void ra_consume(struct ra_q *q)
                 for (uint32_t i = 0; i < take; i += 2) { d[i] = src[i + 1]; d[i + 1] = src[i]; }
             else
                 memcpy(d, src, take);
+            {   /* v19.2: meter peaks and clips from every sample (the live meter reads only 20 ms per 125 ms and
+                 * missed claps on the camera); d is frame-aligned (skip, take and ra_fill_n are multiples of 4) */
+                const int16_t *sm = (const int16_t *)d;
+                uint32_t p0 = ra_fpk[0], p1 = ra_fpk[1], c0 = 0, c1 = 0;
+                for (uint32_t i = 0; i < take / 2; i += 2)
+                {
+                    int l = sm[i], r = sm[i + 1];
+                    if (l < 0) l = -l;
+                    if (r < 0) r = -r;
+                    if ((uint32_t)l > p0) p0 = l;
+                    if ((uint32_t)r > p1) p1 = r;
+                    if (l >= 32767) c0++;
+                    if (r >= 32767) c1++;
+                }
+                ra_fpk[0] = p0; ra_fpk[1] = p1; ra_fclip_n[0] += c0; ra_fclip_n[1] += c1;
+            }
             ra_fill_n += take; a += take; sz -= take;
             if (ra_fill_n == RA_PAYLOAD) ra_finish_block();
         }
@@ -950,6 +967,7 @@ static void ra_meter_bar(int ch, int db, int hold_db, int clip_lit)
 static void ra_meter_task(void *unused)
 {
     int hold[2] = { 49, 49 }, hold_ms[2] = { 0, 0 }, clip_ms[2] = { 0, 0 }, clip_on[2] = { 0, 0 }, drawn = 0;
+    uint32_t last_clipn[2] = { ra_fclip_n[0], ra_fclip_n[1] };
     ra_m_updates = ra_m_bad = 0; ra_m_clip[0] = ra_m_clip[1] = ra_m_maxpk[0] = ra_m_maxpk[1] = 0;
     ra_m_ref0 = r_refresh_count; ra_m_refus0 = r_refresh_us_max; ra_m_ximr0 = r_ximr_us_max;
     while (!ra_meter_stop)
@@ -965,13 +983,20 @@ static void ra_meter_task(void *unused)
             bmp_fill(COLOR_BLACK, RA_M_X - 4, RA_M_Y - 3, RA_M_W + 24, 2 * RA_M_H + RA_M_GAP + 6);
             drawn = 1;
         }
+        uint32_t fp[2] = { ra_fpk[0], ra_fpk[1] };      /* every sample since the last update (ra_task, <= 0.5 s late) */
+        ra_fpk[0] = ra_fpk[1] = 0;
         for (int c = 0; c < 2; c++)
         {
-            int db = ra_db_of(pk[c]);
-            if (pk[c] > ra_m_maxpk[c]) ra_m_maxpk[c] = pk[c];
+            int db = ra_db_of(pk[c]);                     /* bar: live 20 ms */
+            uint32_t eff = MAX(pk[c], fp[c]);             /* hold / peak / clip: nothing missed */
+            int edb = ra_db_of(eff);
+            uint32_t cn = ra_fclip_n[c];
+            int new_clip = cn != last_clipn[c] || pk[c] >= 32767;
+            last_clipn[c] = cn;
+            if (eff > ra_m_maxpk[c]) ra_m_maxpk[c] = eff;
             if (clip_on[c] && now - clip_ms[c] >= 2000) clip_on[c] = 0;
-            if (pk[c] >= 32767) { if (!clip_on[c]) ra_m_clip[c]++; clip_on[c] = 1; clip_ms[c] = now; }   /* flags, not time 0: robust to clock wrap */
-            if (db <= hold[c] || now - hold_ms[c] > 1500) { hold[c] = db; hold_ms[c] = now; }
+            if (new_clip) { if (!clip_on[c]) ra_m_clip[c]++; clip_on[c] = 1; clip_ms[c] = now; }   /* flags, not time 0: robust to clock wrap */
+            if (edb <= hold[c] || now - hold_ms[c] > 1500) { hold[c] = edb; hold_ms[c] = now; }
             ra_meter_bar(c, db, hold[c], clip_on[c]);
         }
         ra_m_updates++;
@@ -995,10 +1020,10 @@ static void ra_meter_end(void)
     if (!ra_meter_alive) return;
     ra_meter_stop = 1;
     for (int t = 0; t < 1000 && ra_meter_alive; t += 10) msleep(10);
-    rt_printf("meters: %d updates (%d bad write pointer), peak L/R -%d/-%d dBFS, clip events L/R %d/%d; "
+    rt_printf("meters: %d updates (%d bad write pointer), peak L/R -%d/-%d dBFS, clip events L/R %d/%d (full-scale samples %d/%d); "
               "screen refreshes %d, refresh max %d us, Ximr max %d us\n",
               (int)ra_m_updates, (int)ra_m_bad, ra_db_of(ra_m_maxpk[0]), ra_db_of(ra_m_maxpk[1]),
-              (int)ra_m_clip[0], (int)ra_m_clip[1], (int)(r_refresh_count - ra_m_ref0), (int)r_refresh_us_max, (int)r_ximr_us_max);
+              (int)ra_m_clip[0], (int)ra_m_clip[1], (int)ra_fclip_n[0], (int)ra_fclip_n[1], (int)(r_refresh_count - ra_m_ref0), (int)r_refresh_us_max, (int)r_ximr_us_max);
 }
 
 /* writer side: one prepared block, if any; returns bytes written, < 0 on error */
@@ -1022,6 +1047,7 @@ static int ra_start(void)
     ra_qhead = ra_qtail = ra_qover = 0; ra_widx = 0; ra_count = ra_samples = ra_lost = ra_bytes_written = 0;
     ra_part_count = 0; ra_skip = 0xFFFFFFFF; ra_skip_d = 0; ra_skip_logged = 0;
     ra_fill_idx = 0; ra_fill_n = 0;
+    ra_fpk[0] = ra_fpk[1] = 0; ra_fclip_n[0] = ra_fclip_n[1] = 0;
     first_t = 0;                        /* ra_task waits for this clip's first frame, not the last clip's */
     for (int i = 0; i < RA_NBUF; i++) ra_ready[i] = 0;
     if (!ra_buf) return 1;
