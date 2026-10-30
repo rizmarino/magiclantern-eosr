@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.1"
+#define ST_VER              "v2.2"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -360,25 +360,40 @@ static void st_end(int run)
  * on). Returns 0 if still busy after 3 minutes; the caller then skips the write. */
 static int st_wait_card_idle(int min_ms)
 {
-    uint32_t t0 = get_ms_clock(), job_q = t0, led_q = t0;
-    int led_seen = 0;
+    uint32_t t0 = get_ms_clock(), job_q = t0, led_q = t0, box = 0;
+    int led_on = 0, led_off = 0;
     while ((int)(get_ms_clock() - t0) < 180000)
     {
         uint32_t now = get_ms_clock();
         if (ST_JOB() != 0) job_q = now;
+        int led = 0;
 #if defined(CARD_LED_ADDRESS) && !defined(ST_HOST)
-        if (*(volatile uint32_t *)CARD_LED_ADDRESS == LEDON) { led_seen = 1; led_q = now; }
+        led = *(volatile uint32_t *)CARD_LED_ADDRESS == LEDON;
 #endif
+        if (led) { led_on = 1; led_q = now; } else led_off = 1;
+        /* v2.2: the LED only counts if it was seen both on and off (proves it tracks card access) */
+        int led_ok = !(led_on && led_off) || (int)(now - led_q) >= 3000;
         int frame_ok = (int)(now - st_last_frame_ms) >= min_ms;
         int buf_ok = !st_cnt[P_BURST] || st_cur[P_BURST] >= st_bc_start;
-        if (frame_ok && buf_ok && (int)(now - job_q) >= 3000 && (!led_seen || (int)(now - led_q) >= 3000))
+        int job_ok = (int)(now - job_q) >= 3000;
+        if (frame_ok && buf_ok && job_ok && led_ok)
         {
-            st_printf("card idle after %d ms (BURST %d, start %d, LED seen %d)\n", (int)(now - t0), (int)st_cur[P_BURST],
-                      (int)st_bc_start, led_seen);
+            st_printf("card idle after %d ms (BURST %d, start %d, LED on/off seen %d/%d)\n", (int)(now - t0),
+                      (int)st_cur[P_BURST], (int)st_bc_start, led_on, led_off);
             return 1;
+        }
+        if ((int)(now - box) >= 2000)
+        {
+            box = now;
+            NotifyBox(2500, "Silent test: waiting for the card before saving the log (%d s)%s%s%s%s",
+                      (int)(now - t0) / 1000, frame_ok ? "" : ", last frame", buf_ok ? "" : ", buffer",
+                      job_ok ? "" : ", camera busy", led_ok ? "" : ", card light");
         }
         msleep(50);
     }
+    st_printf("card still busy after 3 min: frame %d buffer %d/%d job %d LED on/off %d/%d\n",
+              (int)(get_ms_clock() - st_last_frame_ms) >= min_ms, (int)st_cur[P_BURST], (int)st_bc_start,
+              (int)(get_ms_clock() - job_q) >= 3000, led_on, led_off);
     return 0;
 }
 
@@ -789,8 +804,8 @@ static int st_remap_set(int v)
  * <= 3 and still froze (unknown whether it fired). v2.0 also counts frames: after "Fast frames" frames of one burst,
  * Canon's 500 goes back for the rest of it; the patched value returns when the burst has ended (no new frame for
  * 800 ms). Plain memory writes into the RAM page; events kept in RAM and printed by Burst log. */
-static int st_fb_sel = 1;               /* menu: buffer-count trigger ON */
-static int st_fast_sel = 2;             /* menu: fast frames per burst: All / 10 / 15 / 20 */
+static int st_fb_sel = 0;               /* menu: buffer-count trigger; v2.2 default OFF (the freezes were Burst log) */
+static int st_fast_sel = 0;             /* menu: fast frames per burst: All / 10 / 15 / 20; v2.2 default All */
 static const int st_fast_n[] = { 0, 10, 15, 20 };
 static volatile int st_fb_active, st_fb_count, st_fb_min = 999;
 #define ST_FBE_MAX 32
@@ -1031,7 +1046,7 @@ static void st_burst_task(void *unused)
 
 static void st_start(void (*task)(void *), const char *name)
 {
-    if (st_busy) return;
+    if (st_busy) { NotifyBox(3000, "Silent test: previous run still busy (waiting for the card?)"); return; }
     if (!st_ev) st_ev = malloc(ST_EV_MAX * sizeof(struct st_ev));     /* kept for the session: handlers may hold the pointer */
     if (!st_log) st_log = malloc(ST_LOG_MAX);
     if (!st_ev || !st_log) { snprintf(st_last, sizeof(st_last), "no memory"); return; }
@@ -1145,8 +1160,8 @@ static struct menu_entry st_menu[] = {
                 .priv    = &st_fast_sel,
                 .max     = 3,
                 .choices = CHOICES("All", "10", "15", "20"),
-                .help    = "While patched: frames per burst at the patched rate,",
-                .help2   = "then Canon 5.0 until the burst ends (avoids the full-buffer freeze).",
+                .help    = "Optional: frames per burst at the patched rate, then Canon 5.0",
+                .help2   = "until you let go. All = whole burst (tested OK with a full buffer).",
             },
             {
                 .name    = "Full buffer -> 5.0",
@@ -1154,8 +1169,8 @@ static struct menu_entry st_menu[] = {
                 .max     = 1,
                 .choices = CHOICES("OFF", "ON"),
                 .update  = st_fb_update,
-                .help    = "While patched: back to Canon 5.0 when <= 3 shots fit in the buffer,",
-                .help2   = "patched rate again when >= 8 fit.",
+                .help    = "Optional: back to Canon 5.0 when <= 3 shots fit in the buffer,",
+                .help2   = "patched rate again at >= 8. Not needed (tested OK without).",
             },
 #endif
             {
