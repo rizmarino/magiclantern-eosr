@@ -165,7 +165,22 @@ static int r_img_x0 = 0, r_img_y0 = 0, r_img_w = 720, r_img_h = 480;
 /* riz 2026-10-30: ML's bottom info bar (shot info) in the viewfinder; Canon shows its own below the EVF image.
  * Default OFF there; lens.c should_draw_bottom_bar() asks r_evf_bottombar_ok(). */
 static CONFIG_INT("r.evf.bottombar", r_evf_bottombar, 0);
-int r_evf_bottombar_ok(void) { return r_evf_bottombar || !R_LV_ON_EVF(); }
+/* riz 2026-10-30: same switch for the rear screen (Overlay > Shot info bar, default ON = unchanged). When the bar
+ * stops being allowed (switched off, or panel -> EVF with the EVF one off), wipe its area once so no stale bar stays. */
+static CONFIG_INT("r.panel.bottombar", r_panel_bottombar, 1);
+int r_evf_bottombar_ok(void)
+{
+    static int last_ok = 1;
+    int ok = R_LV_ON_EVF() ? r_evf_bottombar : r_panel_bottombar;
+    if (last_ok && !ok)
+    {
+        extern int get_ml_bottombar_pos(void);
+        int y = get_ml_bottombar_pos();
+        if (y >= 0 && y <= 480 - 34) bmp_fill(COLOR_EMPTY, 0, y, 720, 34);
+    }
+    last_ok = ok;
+    return ok;
+}
 /* riz 2026-10-30: the R stays in shooting_mode 3 (M) in movie mode, so is_movie_mode() is false there;
  * PROP_LV_MOVIE_SELECT does follow the photo/movie switch (1 = photo, 2 = movie, camera-verified). Used only for the
  * overlay geometry below, so the rest of ML keeps its current (photo) behaviour. */
@@ -983,12 +998,20 @@ static struct menu_entry r_evf_menus[] = {
         },
     },
     {
+        .name    = "Shot info bar",
+        .priv    = &r_panel_bottombar,
+        .max     = 1,
+        .choices = CHOICES("OFF", "ON"),
+        .help    = "ML's bottom info bar (mode, lens, aperture, shutter, ISO, WB...) on the rear screen.",
+        .help2   = "Always shown inside the ML menu. Viewfinder: EVF shot info bar.",
+    },
+    {
         .name    = "EVF shot info bar",
         .priv    = &r_evf_bottombar,
         .max     = 1,
         .choices = CHOICES("OFF", "ON"),
         .help    = "ML's bottom info bar (mode, lens, aperture, shutter, ISO...) in the viewfinder.",
-        .help2   = "OFF: Canon's own info line below the image is enough. Rear screen unaffected.",
+        .help2   = "OFF: Canon's own info line below the image is enough. Rear screen: Shot info bar.",
     },
 };
 
