@@ -875,6 +875,132 @@ static void ra_task(void *unused)
     ra_task_alive = 0;
 }
 
+/* ---- v19.1 audio meters while recording (Movie > RAW video > Audio meters) ----
+ * Canon hands chunks over only every ~0.5 s, too slow for a meter, so ra_meter_task reads the newest 20 ms of
+ * samples straight from Canon's MEM2 ring behind its write pointer (AprocCtrl_GetWriteAdr: MMIO read, polled
+ * every 0.5 s by the camera-verified audio probe) ~8x/s, takes the peak per channel and draws two bars on ML's layer
+ * under the REC status: -48..0 dBFS, green / yellow from -12 / red from -3, a peak-hold tick (1.5 s) and a CLIP box
+ * per channel (lit for 2 s after a sample at full scale). Read-only; drawing uses bmp_fill only. The clip log gets
+ * update count, peak levels, clip counts and the screen-refresh cost during the clip (A/B against meters off). */
+#ifndef RT_HOST
+static uint32_t (*const AprocCtrl_GetWriteAdr)(void)                                = (void *)0xE0293BBB;
+#endif
+extern uint32_t r_refresh_count, r_refresh_us_max, r_ximr_us_max;
+static CONFIG_INT("r.rawrec.meter", rr_meter, 1);
+static const uint16_t ra_db_tbl[49] = { 32767, 29205, 26029, 23198, 20675, 18427, 16423, 14637, 13045, 11627, 10362, 9235, 8231, 7336, 6538, 5827, 5193, 4629, 4125, 3677, 3277, 2920, 2603, 2320, 2068, 1843, 1642, 1464, 1305, 1163, 1036, 924, 823, 734, 654, 583, 519, 463, 413, 368, 328, 292, 260, 232, 207, 184, 164, 146, 130 };   /* 32768 x 10^(-k/20) */
+static volatile int ra_meter_alive, ra_meter_stop;
+static uint32_t ra_madr, ra_msize;
+static uint32_t ra_m_updates, ra_m_bad, ra_m_clip[2], ra_m_maxpk[2], ra_m_ref0, ra_m_refus0, ra_m_ximr0;
+
+#define RA_M_X   8
+#define RA_M_Y   40
+#define RA_M_W   192                    /* 4 px per dB */
+#define RA_M_H   6
+#define RA_M_GAP 4
+
+static int ra_db_of(uint32_t pk)        /* 0 .. 48 = dB below full scale, 49 = below -48 dB */
+{
+    for (int k = 0; k < 49; k++) if (pk >= ra_db_tbl[k]) return k;
+    return 49;
+}
+
+/* peaks of the newest ~20 ms in Canon's ring; 0 if the write pointer looks wrong */
+static int ra_meter_read(uint32_t *pl, uint32_t *pr)
+{
+    uint32_t w = AprocCtrl_GetWriteAdr();
+    if (w < ra_madr || w >= ra_madr + ra_msize) { ra_m_bad++; return 0; }
+    uint32_t off = (w - ra_madr) & ~3;
+    uint32_t back = 256 + 960 * 4;        /* skip the last 256 B (may be in flight), then 960 frames = 20 ms */
+    off = (off + ra_msize - back) % ra_msize;
+    const uint8_t *ring = UNCACHEABLE(ra_madr);
+    uint32_t L = 0, R = 0;
+    for (int i = 0; i < 960; i++)
+    {
+        const uint8_t *p = ring + off;
+        int16_t l, r;
+        if (ra_endian == 1) { l = (int16_t)(p[0] << 8 | p[1]); r = (int16_t)(p[2] << 8 | p[3]); }
+        else { l = (int16_t)(p[1] << 8 | p[0]); r = (int16_t)(p[3] << 8 | p[2]); }
+        uint32_t al = l < 0 ? -(int)l : l, ar = r < 0 ? -(int)r : r;
+        if (al > L) L = al;
+        if (ar > R) R = ar;
+        off += 4; if (off >= ra_msize) off = 0;
+    }
+    *pl = L; *pr = R;
+    return 1;
+}
+
+static void ra_meter_bar(int ch, int db, int hold_db, int clip_lit)
+{
+    int y = RA_M_Y + ch * (RA_M_H + RA_M_GAP);
+    int len = db >= 48 ? 0 : (48 - db) * 4;            /* 0 .. 192 px */
+    int g = MIN(len, 36 * 4), yl = MIN(len, 45 * 4);   /* green to -12 dB, yellow to -3 dB, red above */
+    if (g) bmp_fill(COLOR_GREEN1, RA_M_X, y, g, RA_M_H);
+    if (yl > g) bmp_fill(COLOR_YELLOW, RA_M_X + g, y, yl - g, RA_M_H);
+    if (len > yl) bmp_fill(COLOR_RED, RA_M_X + yl, y, len - yl, RA_M_H);
+    if (len < RA_M_W) bmp_fill(COLOR_GRAY(20), RA_M_X + len, y, RA_M_W - len, RA_M_H);
+    if (hold_db < 48)
+    {
+        int hx = RA_M_X + (48 - hold_db) * 4 - 2;
+        if (hx < RA_M_X) hx = RA_M_X;
+        bmp_fill(COLOR_WHITE, hx, y, 2, RA_M_H);
+    }
+    bmp_fill(clip_lit ? COLOR_RED : COLOR_GRAY(20), RA_M_X + RA_M_W + 4, y, 12, RA_M_H);
+}
+
+static void ra_meter_task(void *unused)
+{
+    int hold[2] = { 49, 49 }, hold_ms[2] = { 0, 0 }, clip_ms[2] = { 0, 0 }, clip_on[2] = { 0, 0 }, drawn = 0;
+    ra_m_updates = ra_m_bad = 0; ra_m_clip[0] = ra_m_clip[1] = ra_m_maxpk[0] = ra_m_maxpk[1] = 0;
+    ra_m_ref0 = r_refresh_count; ra_m_refus0 = r_refresh_us_max; ra_m_ximr0 = r_ximr_us_max;
+    while (!ra_meter_stop)
+    {
+        msleep(125);
+        if (ra_meter_stop) break;
+        if (gui_menu_shown()) { drawn = 0; continue; }
+        uint32_t pk[2];
+        if (!ra_meter_read(&pk[0], &pk[1])) continue;
+        int now = get_ms_clock();
+        if (!drawn)
+        {
+            bmp_fill(COLOR_BLACK, RA_M_X - 4, RA_M_Y - 3, RA_M_W + 24, 2 * RA_M_H + RA_M_GAP + 6);
+            drawn = 1;
+        }
+        for (int c = 0; c < 2; c++)
+        {
+            int db = ra_db_of(pk[c]);
+            if (pk[c] > ra_m_maxpk[c]) ra_m_maxpk[c] = pk[c];
+            if (clip_on[c] && now - clip_ms[c] >= 2000) clip_on[c] = 0;
+            if (pk[c] >= 32767) { if (!clip_on[c]) ra_m_clip[c]++; clip_on[c] = 1; clip_ms[c] = now; }   /* flags, not time 0: robust to clock wrap */
+            if (db <= hold[c] || now - hold_ms[c] > 1500) { hold[c] = db; hold_ms[c] = now; }
+            ra_meter_bar(c, db, hold[c], clip_on[c]);
+        }
+        ra_m_updates++;
+    }
+    if (drawn && !gui_menu_shown())
+        bmp_fill(COLOR_EMPTY, RA_M_X - 4, RA_M_Y - 3, RA_M_W + 24, 2 * RA_M_H + RA_M_GAP + 6);
+    ra_meter_alive = 0;
+}
+
+static void ra_meter_start(uint32_t madr, uint32_t msize)
+{
+    ra_meter_stop = 0;
+    if (!rr_meter || !rr_active || ra_meter_alive) return;    /* REC-button clips only (timed tests: no overlay) */
+    ra_madr = madr; ra_msize = msize;
+    ra_meter_alive = 1;
+    task_create("ra_meter", 0x1f, 0x1000, ra_meter_task, 0);
+}
+
+static void ra_meter_end(void)
+{
+    if (!ra_meter_alive) return;
+    ra_meter_stop = 1;
+    for (int t = 0; t < 1000 && ra_meter_alive; t += 10) msleep(10);
+    rt_printf("meters: %d updates (%d bad write pointer), peak L/R -%d/-%d dBFS, clip events L/R %d/%d; "
+              "screen refreshes %d, refresh max %d us, Ximr max %d us\n",
+              (int)ra_m_updates, (int)ra_m_bad, ra_db_of(ra_m_maxpk[0]), ra_db_of(ra_m_maxpk[1]),
+              (int)ra_m_clip[0], (int)ra_m_clip[1], (int)(r_refresh_count - ra_m_ref0), (int)r_refresh_us_max, (int)r_ximr_us_max);
+}
+
 /* writer side: one prepared block, if any; returns bytes written, < 0 on error */
 static int ra_write_one(FILE *f)
 {
@@ -923,6 +1049,7 @@ static int ra_start(void)
     task_create("ra_task", 0x1d, 0x1000, ra_task, 0);
     ra_on = 1;
     rt_printf("audio: on, sync %d, endian %d, ring %08x+%x, StartCBR %d\n", ra_sync, (int)ra_endian, (int)madr, (int)msize, ra_start_cb);
+    ra_meter_start(madr, msize);
     return 0;
 }
 
@@ -930,6 +1057,7 @@ static int ra_start(void)
 static void ra_stop(void)
 {
     if (!ra_started) return;
+    ra_meter_end();                     /* v19.1: before Canon's audio stops */
     SoundDev_SetMovieStop(3);
     for (int t = 0; t < 3000 && !ra_stop_cb; t += 10) msleep(10);
     ra_stop_req = 1;
@@ -1985,7 +2113,14 @@ static struct menu_entry rr_menu[] = {
                 .priv    = &rr_audio,
                 .max     = 1,
                 .help    = "Records the camera's mic into the MLV (48 kHz stereo, MLV App plays it).",
-                .help2   = "Needs Canon Sound recording Auto or Manual. New: check sync with a clap.",
+                .help2   = "Needs Canon Sound recording Auto or Manual. Camera-verified: sync within a frame.",
+            },
+            {
+                .name    = "Audio meters",
+                .priv    = &rr_meter,
+                .max     = 1,
+                .help    = "L/R level bars while a clip with audio records: -48..0 dBFS, peak hold, CLIP box.",
+                .help2   = "Red from -3 dB; CLIP lights for 2 s after a sample hits full scale.",
             },
             {
                 .name    = "Crop marker",
