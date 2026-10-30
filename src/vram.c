@@ -186,6 +186,26 @@ int r_evf_bottombar_ok(void)
     last_ok = ok;
     return ok;
 }
+/* riz 2026-10-30: ML's top info bar (clock, image quality, free space, picture style) on the rear screen: OFF / ON /
+ * Auto-hide (same 3 s hide as the bottom bar, lens.c r_bbar_task). Viewfinder: unchanged (always ON). */
+static CONFIG_INT("r.panel.topbar", r_panel_topbar, 2);
+int r_topbar_mode(void) { return R_LV_ON_EVF() ? 1 : r_panel_topbar; }
+void r_topbar_wipe(void)
+{
+    extern int get_ml_topbar_pos(void);
+    int y = get_ml_topbar_pos();
+    if (y >= 0 && y <= 480 - 34) bmp_fill(COLOR_EMPTY, 0, y, 720, 34);
+}
+int r_topbar_ok(void)
+{
+    extern int r_bbar_hidden(void);
+    static int last_ok = 1;
+    int mode = r_topbar_mode();
+    int ok = mode == 1 || (mode == 2 && !r_bbar_hidden());
+    if (last_ok && !ok) r_topbar_wipe();
+    last_ok = ok;
+    return ok;
+}
 /* riz 2026-10-30: the R stays in shooting_mode 3 (M) in movie mode, so is_movie_mode() is false there;
  * PROP_LV_MOVIE_SELECT does follow the photo/movie switch (1 = photo, 2 = movie, camera-verified). Used only for the
  * overlay geometry below, so the rest of ML keeps its current (photo) behaviour. */
@@ -1009,6 +1029,14 @@ static struct menu_entry r_evf_menus[] = {
         .choices = CHOICES("OFF", "ON", "Auto-hide"),
         .help    = "ML's bottom info bar (mode, lens, aperture, shutter, ISO, WB...) on the rear screen.",
         .help2   = "Auto-hide: hidden ~3 s after a setting changes, while Canon shows its own info there.",
+    },
+    {
+        .name    = "Top info bar",
+        .priv    = &r_panel_topbar,
+        .max     = 2,
+        .choices = CHOICES("OFF", "ON", "Auto-hide"),
+        .help    = "ML's top info bar (clock, image quality, free space, picture style) on the rear screen.",
+        .help2   = "Auto-hide: hidden ~3 s after a setting changes, like Shot info bar. Viewfinder: always on.",
     },
     {
         .name    = "EVF shot info bar",

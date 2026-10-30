@@ -227,7 +227,7 @@ update_lens_display(int top, int bottom)
 }
 
 #ifdef CONFIG_R
-/* riz 2026-10-30: Auto-hide for ML's bottom bar. Canon draws its own info line over it for a few seconds whenever a
+/* riz 2026-10-30: Auto-hide for ML's bottom bar (and top bar, rear screen). Canon draws its own info line over it for a few seconds whenever a
  * shooting setting changes (unreadable overlap). r_bbar_task polls the settings every 50 ms; on a change it wipes
  * ML's bar at once and keeps it hidden for R_BBAR_HIDE_MS, then asks for a redraw. Only values the user sets count:
  * shutter in M/Tv, aperture in M/Av (Canon changes the other one itself), ISO only when not auto, exp. comp., WB,
@@ -246,21 +246,22 @@ static uint32_t r_bbar_sig(void)
 }
 static void r_bbar_task(void *unused)
 {
-    extern int r_bottombar_mode(void);
-    extern void r_bottombar_wipe(void);
+    extern int r_bottombar_mode(void), r_topbar_mode(void);
+    extern void r_bottombar_wipe(void), r_topbar_wipe(void);
     uint32_t last = r_bbar_sig();
     TASK_LOOP
     {
         msleep(50);
         uint32_t sig = r_bbar_sig();
         int now = get_ms_clock();
-        if (sig != last && lv && !gui_menu_shown() && r_bottombar_mode() == 2)
+        int autob = r_bottombar_mode() == 2, autot = r_topbar_mode() == 2;   /* bars on Auto-hide */
+        if (sig != last && lv && !gui_menu_shown() && (autob || autot))
         {
-            if (!r_bbar_hide) BMP_LOCK( r_bottombar_wipe(); );
+            if (!r_bbar_hide) BMP_LOCK( if (autob) r_bottombar_wipe(); if (autot) r_topbar_wipe(); );
             r_bbar_hide = 1; r_bbar_t0 = now;
         }
         last = sig;
-        if (r_bbar_hide && (now - r_bbar_t0 >= R_BBAR_HIDE_MS || now - r_bbar_t0 < 0 || r_bottombar_mode() != 2))
+        if (r_bbar_hide && (now - r_bbar_t0 >= R_BBAR_HIDE_MS || now - r_bbar_t0 < 0 || !(autob || autot)))
         {
             r_bbar_hide = 0;
             lens_display_set_dirty();          /* bring ML's bar back */
@@ -714,6 +715,10 @@ void free_space_show_photomode()
 void draw_ml_topbar()
 {
     if (!get_global_draw()) return;
+    #ifdef CONFIG_R
+    extern int r_topbar_ok(void);
+    if (!gui_menu_shown() && !r_topbar_ok()) return;   /* riz: rear screen Top info bar OFF / auto-hidden */
+    #endif
     
     lvinfo_display(1,0);
 }
