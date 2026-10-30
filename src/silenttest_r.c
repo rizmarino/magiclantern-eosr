@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.5-diag"
+#define ST_VER              "v2.5"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 

@@ -162,6 +162,10 @@ static CONFIG_INT("r.evf.ovl.y0", r_evf_y0, -80);
 static CONFIG_INT("r.evf.ovl.w",  r_evf_w,  720);
 static CONFIG_INT("r.evf.ovl.h",  r_evf_h,  495);
 static int r_img_x0 = 0, r_img_y0 = 0, r_img_w = 720, r_img_h = 480;
+/* riz 2026-10-30: the R stays in shooting_mode 3 (M) in movie mode, so is_movie_mode() is false there;
+ * PROP_LV_MOVIE_SELECT does follow the photo/movie switch (1 = photo, 2 = movie, camera-verified). Used only for the
+ * overlay geometry below, so the rest of ML keeps its current (photo) behaviour. */
+#define R_MOVIE_LV() (lv_movie_select == LVMS_ENABLE_MOVIE)
 #endif
 
 static void vram_params_update_if_dirty()
@@ -178,12 +182,14 @@ static void vram_params_update_if_dirty()
     #ifdef R_LV_ON_EVF
     // EOS R: Panel (1024x682) and EVF (1280x720) use different LV buffer sizes;
     // recompute geometry when the active output or the EVF alignment changes.
-    static int prev_on_evf = -1;
+    static int prev_on_evf = -1, prev_movie = -1;
     static int prev_cal[4] = { -1, -1, -1, -1 };
     int on_evf = R_LV_ON_EVF();
+    int movie = R_MOVIE_LV();
     int cal[4] = { r_evf_x0, r_evf_y0, r_evf_w, r_evf_h };
-    if (on_evf != prev_on_evf || memcmp(cal, prev_cal, sizeof(cal)) != 0) vram_params_dirty = 1;
+    if (on_evf != prev_on_evf || movie != prev_movie || memcmp(cal, prev_cal, sizeof(cal)) != 0) vram_params_dirty = 1;
     prev_on_evf = on_evf;
+    prev_movie = movie;
     memcpy(prev_cal, cal, sizeof(cal));
     #endif
     
@@ -362,6 +368,21 @@ void _update_vram_params()
         os.y0 = MAX(r_img_y0, BMP_H_MINUS);
         os.x_ex = MIN(r_img_x0 + r_img_w, BMP_W_PLUS) - os.x0;
         os.y_ex = MIN(r_img_y0 + r_img_h, BMP_H_PLUS) - os.y0;
+    }
+    else if (R_MOVIE_LV())
+    {
+        /* Panel, movie mode (ZEBDIAG + screen photo, 2026-10-30): the LV buffer keeps its 1024x682 layout but holds
+         * a 1024x576 16:9 image in rows 0-575; rows 576+ are padding with Y = 255, which drew a zebra band at the
+         * bottom. Canon shows the image full-width, centred vertically: overlay rows ~37-441 of 480. */
+        vram_lv.width = 1024;
+        vram_lv.height = 576;
+        r_img_x0 = 0; r_img_w = 720;
+        r_img_h = 405;                  /* 720 * 9 / 16 */
+        r_img_y0 = (480 - 405) / 2;     /* 37 */
+        os.x0 = 0;
+        os.y0 = r_img_y0;
+        os.x_ex = 720;
+        os.y_ex = r_img_h;
     }
     else
     {
