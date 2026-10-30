@@ -79,7 +79,7 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define M1_PORT         3
 #define M1_CBR_CANON    0xE0638681      /* Mem1Path's complete CBR: bx lr */
 
-#define RT_MAXCH      10
+#define RT_MAXCH      16                /* v20: silent pictures take up to 16 one-frame chunks; video stays at 10 */
 #define RT_CHUNK_TGT  (16 * 1024 * 1024)
 #define RT_SPLIT      0x7F000000u       /* new part file before ~2.1 GB */
 #define RT_MAXFR      3000
@@ -98,6 +98,8 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define F_TOPCHG 8                      /* top crop row changed during the copy (informational) */
 #define F_BOTCHG 16                     /* bottom crop row changed before the copy ended: torn */
 #define F_DUP    32                     /* same bottom row as the last saved frame: skipped */
+#define F_MIDTEAR 64                    /* v20: a sampled row of the copy differs from the source at copy start */
+#define F_TORN   (F_TEAR | F_BOTCHG | F_MIDTEAR)
 
 enum { SYNC_AUTO = 0, SYNC_IRQ, SYNC_TIMER };
 static CONFIG_INT("r.rawrec.crop", rt_crop_sel, 0);             /* index into rt_crop_wh; v16.6: 3 = full MEM1 frame */
@@ -128,7 +130,24 @@ static CONFIG_INT("r.rawrec.diag", rr_diag, 0);
 static CONFIG_INT("r.rawrec.card10", rr_card10, 1060);       /* card write speed of the last clip, MiB/s x10 */
 static char rr_base[16];                /* clip name without extension */
 static volatile int rr_full;            /* last clip stopped because the card was nearly full */
-static inline int rt_diag(void) { return !rr_active || rr_diag; }
+/* v20: LV silent pictures (Shoot > LV silent pictures). A session is one rt_task run with sp_active set: it arms the
+ * engine (MEM1 tap, pack unit in ML order, IRQ hook, chunks), copies whole MEM1 frames (4K movie LV: 4256x2214 1:1)
+ * while the trigger is held (Burst) or all the time into a short ring (Pre-capture), and sp_writer turns each kept
+ * frame into a DNG (4096-byte header in the slot, pixels byte-swapped to DNG's MSB-first order). Keys: see sp_keys. */
+static CONFIG_INT("r.silent.lv", sp_mode, 0);            /* 0 OFF, 1 Burst, 2 Pre-capture */
+static CONFIG_INT("r.silent.lv.bits", sp_bits, 0);       /* 0 = 12-bit, 1 = 10-bit */
+static CONFIG_INT("r.silent.lv.pre", sp_pre_sel, 1);     /* frames kept before the press: sp_pre_n[] */
+static CONFIG_INT("r.silent.lv.arm", sp_arm_sel, 0);     /* 0 half-press, 1 always (movie LV, ML menu closed) */
+static CONFIG_INT("r.silent.lv.trig", sp_trig_sel, 0);   /* 0 shutter button, 1 AF-ON button */
+static const int sp_pre_n[] = { 3, 5, 7, 9 };
+static volatile int sp_active;          /* the current rt_task run is a silent-picture session */
+static volatile int sp_ready;           /* armed: capture loop running */
+static volatile int sp_trig;            /* trigger held (may come while arming: saving starts once armed) */
+static volatile int sp_end;             /* end the session (released, cancelled, LV gone) */
+static volatile int sp_rel;             /* trigger released: end once at least one frame is kept (quick taps)  */
+static volatile int sp_sim;             /* Debug timed test running */
+static volatile int sp_kept, sp_saved, sp_pre_kept;   /* frames kept for DNG, DNGs written, of them before the press */
+static inline int rt_diag(void) { return !(rr_active || sp_active) || rr_diag; }
 static volatile int rt_osd_run;         /* auto-run "osd": show the REC status during a timed run (A/B cost test) */
 static volatile uint32_t rr_t0_ms;
 static int rt_runs = 0;
@@ -260,8 +279,10 @@ static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_
 }
 
 /* ---- buffers: contiguous shoot_malloc chunks ---- */
-struct rt_chunk { struct memSuite *suite; uint32_t base; volatile int state; volatile int n; };
-enum { CH_FREE = 0, CH_FILL, CH_FULL };
+struct rt_chunk { struct memSuite *suite; uint32_t base; volatile int state; volatile int n;
+                  uint32_t seq, t_us; int fl; };   /* v20 silent pictures (1 frame per chunk): frame event no., time, flags */
+enum { CH_FREE = 0, CH_FILL, CH_FULL, CH_RING };   /* v20: CH_RING = pre-capture frame, not (yet) to be written */
+#define RT_MAXCH_VIDEO 10                   /* raw video: as before v20 */
 static struct rt_chunk ch[RT_MAXCH];
 static int nch, kslots;
 static uint32_t slot_bytes, frame_bytes;
@@ -273,10 +294,10 @@ static void rt_free_chunks(void)
     nch = 0;
 }
 
-static void rt_alloc_chunks(void)
+static void rt_alloc_chunks(int maxch)
 {
     uint32_t want = kslots * slot_bytes + 4096;
-    for (int i = 0; i < RT_MAXCH; i++)
+    for (int i = 0; i < MIN(maxch, RT_MAXCH); i++)
     {
         struct memSuite *s = shoot_malloc_suite_contig(want);
         if (!s) { rt_printf("chunk %d: shoot_malloc_suite_contig(%d) failed\n", i, want); break; }
@@ -552,7 +573,7 @@ struct __attribute__((packed)) rt_vidf
     char type[4]; uint32_t size; uint64_t ts; uint32_t frame; uint16_t crop_x, crop_y, pan_x, pan_y; uint32_t space;
 };
 struct __attribute__((packed)) rt_blk { char type[4]; uint32_t size; uint64_t ts; };
-static int c_bpp = 14, c_mlv, pk_applied;
+static int c_bpp = 14, c_mlv, c_dng, pk_applied;   /* v20: c_dng = silent-picture session (DNG per frame) */
 static uint32_t c_rb, c_ch;
 static uint32_t slot_pre, slot_null, c_x0, c_y0, c_cw, mlv_fps_nom, mlv_fps_den;
 static uint64_t mlv_guid;
@@ -1238,10 +1259,328 @@ static void rt_timeline(uint32_t now)
     next_tl += 250000;
 }
 
+/* ---- v20: LV silent pictures -> one DNG per kept frame ----
+ * Slot = 4096-byte DNG header + frame (pack unit in ML order: 16-bit LE words, MSB-first bits). DNG wants the bits
+ * MSB-first in byte order, so the writer swaps the bytes of every 16-bit word in place (cached reads after a line
+ * invalidate, uncached writes: no dirty lines can land on later EDMAC data), then writes header + frame in one
+ * 4 KiB-aligned write. 64 sampled words per frame are checked against the swap of their old value. */
+#define SP_HDR       4096
+#define SP_SWAP_BLK  16384
+#define SP_NCHK      64
+#define SP_MAXREC    400
+static char sp_dir[16];
+static uint8_t *sp_hdr;                 /* SP_HDR, malloc'd per session (cached; copied into the slot) */
+static struct tm sp_tm;                 /* RTC at the press */
+static volatile uint32_t sp_press_us;   /* rt_us() at the press (key handler) */
+static int sp_run_mode, sp_ring_n, sp_ring_max, sp_trig_cap;
+static volatile uint32_t sp_swap_us_sum, sp_swap_us_max, sp_wr_us_sum, sp_wr_us_max, sp_chk_bad, sp_torn;
+struct sp_rec { uint32_t seq, t_us, swap_us, wr_us; int fl; };
+static struct sp_rec *sp_recs;          /* per written DNG (main task logs them; the writer never calls rt_printf) */
+
+static inline uint32_t sp_sw16(uint32_t v)
+{
+#ifndef RT_HOST
+    uint32_t r;
+    asm ("rev16 %0, %1" : "=r" (r) : "r" (v));
+    return r;
+#else
+    return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+#endif
+}
+static int sp_pick_dir(void);
+
+/* invalidate L1 D-cache lines of [p, p+n) (DCIMVAC; same as zebra.c lv_dcache_invalidate, camera-proven) */
+static void sp_dcache_inval(uint32_t p, uint32_t n)
+{
+#ifndef RT_HOST
+    uint32_t ctr;
+    asm volatile ("mrc p15, 0, %0, c0, c0, 1" : "=r" (ctr));
+    uint32_t line = 4 << ((ctr >> 16) & 0xF);
+    if (line < 16) line = 16;
+    asm volatile ("dsb sy");
+    for (uint32_t a = p & ~(line - 1); a < p + n; a += line)
+        asm volatile ("mcr p15, 0, %0, c7, c6, 1" : : "r" (a));
+    asm volatile ("dsb sy");
+#endif
+}
+
+/* swap the bytes of every 16-bit word of [unc, unc+n) in place; returns self-check mismatches */
+static uint32_t sp_swap(uint32_t unc, uint32_t n)
+{
+    uint32_t step = (n / SP_NCHK) & ~3u, orig[SP_NCHK];
+    for (int j = 0; j < SP_NCHK; j++) orig[j] = MEM(unc + j * step);
+    uint32_t cac = unc & ~RT_UNC;
+    for (uint32_t off = 0; off < n; off += SP_SWAP_BLK)
+    {
+        uint32_t len = MIN(SP_SWAP_BLK, n - off);
+        sp_dcache_inval(cac + off, len);
+        const uint32_t *s = (const uint32_t *)(cac + off);
+        uint32_t *d = (uint32_t *)(unc + off);
+        for (uint32_t i = 0; i < len / 4; i++) d[i] = sp_sw16(s[i]);
+    }
+    RT_DMB();
+    uint32_t bad = 0;
+    for (int j = 0; j < SP_NCHK; j++) if (MEM(unc + j * step) != sp_sw16(orig[j])) bad++;
+    return bad;
+}
+
+/* ---- minimal DNG 1.4 header (little-endian TIFF, one raw CFA IFD, strip at SP_HDR) ---- */
+struct sp_tag { uint16_t tag, type; uint32_t count; const void *data; uint32_t v; };
+#define SP_MAXTAG 32
+static struct sp_tag sp_tags[SP_MAXTAG];
+static int sp_ntag;
+static void sp_add(uint16_t tag, uint16_t type, uint32_t count, const void *data, uint32_t v)
+{
+    if (sp_ntag >= SP_MAXTAG) return;
+    struct sp_tag *t = &sp_tags[sp_ntag++];
+    t->tag = tag; t->type = type; t->count = count; t->data = data; t->v = v;
+}
+static int sp_type_size(int type) { return type == 3 ? 2 : type == 4 ? 4 : type == 5 || type == 10 ? 8 : 1; }
+
+/* returns the header length (<= SP_HDR) or -1 */
+static int sp_dng_header(uint8_t *h, const char *desc, const char *dt)
+{
+    static const int32_t cm[18] = { 6446, 10000, -366, 10000, -864, 10000, -4436, 10000, 12204, 10000, 2513, 10000,
+                                    -952, 10000, 2496, 10000, 6348, 10000 };   /* Adobe EOS R D65 (as the MLV RAWI) */
+    static const uint16_t cfa_dim[2] = { 2, 2 };
+    static const uint8_t cfa[4] = { 0, 1, 1, 2 }, dngv[4] = { 1, 4, 0, 0 };
+    uint32_t obl = 0, obt = 0;
+    if (m1_w == 2304 && m1_h == 1290) { obl = RT_OB_LEFT; obt = RT_OB_TOP; }
+    if (m1_w == 4256 && m1_h == 2214) { obl = 144; obt = 46; }
+    uint32_t ax = c_x0 < obl ? obl - c_x0 : 0, ay = c_y0 < obt ? obt - c_y0 : 0;
+    uint32_t area[4] = { ay, ax, c_ch, c_cw }, corg[2] = { 0, 0 }, csz[2] = { c_cw - ax, c_ch - ay };
+    int lsh = 14 - c_bpp;
+    uint32_t black = (RT_BLACK14 + (lsh ? 1 << (lsh - 1) : 0)) >> lsh, white = RT_WHITE14 >> lsh;
+    sp_ntag = 0;
+    sp_add(0x00FE, 4, 1, 0, 0);                          /* NewSubFileType: main image */
+    sp_add(0x0100, 4, 1, 0, c_cw);
+    sp_add(0x0101, 4, 1, 0, c_ch);
+    sp_add(0x0102, 3, 1, 0, c_bpp);
+    sp_add(0x0103, 3, 1, 0, 1);                          /* uncompressed */
+    sp_add(0x0106, 3, 1, 0, 32803);                      /* CFA */
+    sp_add(0x010E, 2, strlen(desc) + 1, desc, 0);
+    sp_add(0x010F, 2, 6, "Canon", 0);
+    sp_add(0x0110, 2, 12, "Canon EOS R", 0);
+    sp_add(0x0111, 4, 1, 0, SP_HDR);                     /* StripOffsets */
+    sp_add(0x0112, 3, 1, 0, 1);
+    sp_add(0x0115, 3, 1, 0, 1);
+    sp_add(0x0116, 4, 1, 0, c_ch);
+    sp_add(0x0117, 4, 1, 0, frame_bytes);
+    sp_add(0x011C, 3, 1, 0, 1);
+    sp_add(0x0131, 2, 30, "Magic Lantern LV silent (riz)", 0);
+    sp_add(0x0132, 2, 20, dt, 0);
+    sp_add(0x828D, 3, 2, cfa_dim, 0);
+    sp_add(0x828E, 1, 4, cfa, 0);                        /* RGGB */
+    sp_add(0xC612, 1, 4, dngv, 0);
+    sp_add(0xC614, 2, 12, "Canon EOS R", 0);
+    sp_add(0xC61A, 4, 1, 0, black);
+    sp_add(0xC61D, 4, 1, 0, white);
+    sp_add(0xC61F, 4, 2, corg, 0);
+    sp_add(0xC620, 4, 2, csz, 0);
+    sp_add(0xC621, 10, 9, cm, 0);
+    sp_add(0xC65A, 3, 1, 0, 21);                         /* D65 */
+    sp_add(0xC68D, 4, 4, area, 0);                       /* ActiveArea: top, left, bottom, right */
+    memset(h, 0, SP_HDR);
+    h[0] = 'I'; h[1] = 'I'; h[2] = 42; h[4] = 8;
+    uint32_t ifd = 8, x = ifd + 2 + sp_ntag * 12 + 4;    /* x: extra data */
+    h[ifd] = sp_ntag; h[ifd + 1] = sp_ntag >> 8;
+    for (int i = 0; i < sp_ntag; i++)
+    {
+        struct sp_tag *t = &sp_tags[i];
+        uint8_t *e = h + ifd + 2 + i * 12;
+        uint32_t sz = t->count * sp_type_size(t->type);
+        memcpy(e, &t->tag, 2); memcpy(e + 2, &t->type, 2); memcpy(e + 4, &t->count, 4);
+        if (!t->data) { if (t->type == 3) { uint16_t s = t->v; memcpy(e + 8, &s, 2); } else memcpy(e + 8, &t->v, 4); }
+        else if (sz <= 4) memcpy(e + 8, t->data, sz);
+        else
+        {
+            if (x + sz > SP_HDR) return -1;
+            memcpy(h + x, t->data, sz); memcpy(e + 8, &x, 4);
+            x = (x + sz + 1) & ~1u;
+        }
+    }
+    return x;
+}
+
+/* writer: oldest kept frame first (chunks are a ring in pre-capture mode, so not in index order) */
+static int sp_write_dng(int k)
+{
+    struct rt_chunk *c = &ch[k];
+    char name[40], desc[96], dt[24];
+    if (!sp_dir[0] && sp_pick_dir()) { sp_dir[0] = 0; return -5; }
+    int32_t ms = (int32_t)(c->t_us - sp_press_us) / 1000;
+    snprintf(name, sizeof(name), "%s/F%04d.DNG", sp_dir, sp_saved);
+    snprintf(desc, sizeof(desc), "LV silent picture F%04d, %s%d ms from the press, %d-bit%s", sp_saved, ms < 0 ? "-" : "+",
+             ms < 0 ? -ms : ms, c_bpp, (c->fl & F_TORN) ? ", may be torn" : "");
+    snprintf(dt, sizeof(dt), "%04d:%02d:%02d %02d:%02d:%02d", sp_tm.tm_year + 1900, sp_tm.tm_mon + 1, sp_tm.tm_mday,
+             sp_tm.tm_hour, sp_tm.tm_min, sp_tm.tm_sec);
+    if (sp_dng_header(sp_hdr, desc, dt) < 0) return -4;
+    memcpy((void *)c->base, sp_hdr, SP_HDR);
+    uint32_t t0 = rt_us();
+    uint32_t bad = sp_swap(c->base + SP_HDR, frame_bytes);
+    uint32_t t1 = rt_us();
+    FILE *f = FIO_CreateFile(name);
+    if (!f) return -2;
+    int r = FIO_WriteFile(f, (void *)c->base, SP_HDR + frame_bytes);
+    FIO_CloseFile(f);
+    uint32_t t2 = rt_us();
+    if (r != (int)(SP_HDR + frame_bytes)) return r < 0 ? r : -1;
+    sp_chk_bad += bad;
+    if (c->fl & F_TORN) sp_torn++;
+    sp_swap_us_sum += t1 - t0; if (t1 - t0 > sp_swap_us_max) sp_swap_us_max = t1 - t0;
+    sp_wr_us_sum += t2 - t1; if (t2 - t1 > sp_wr_us_max) sp_wr_us_max = t2 - t1;
+    if (sp_recs && sp_saved < SP_MAXREC)
+    {
+        struct sp_rec *q = &sp_recs[sp_saved];
+        q->seq = c->seq; q->t_us = c->t_us; q->swap_us = t1 - t0; q->wr_us = t2 - t1; q->fl = c->fl | (bad ? 0x100 : 0);
+    }
+    w_bytes += SP_HDR + frame_bytes; w_n++; w_us_sum += t2 - t1;
+    if (t2 - t1 < w_us_min) w_us_min = t2 - t1;
+    if (t2 - t1 > w_us_max) w_us_max = t2 - t1;
+    sp_saved++;
+    return 0;
+}
+
+static void sp_writer(void *unused)
+{
+    for (;;)
+    {
+        int k = -1;
+        uint32_t best = 0xFFFFFFFF;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_FULL && ch[i].seq < best) { best = ch[i].seq; k = i; }
+        if (k >= 0)
+        {
+            int r = sp_write_dng(k);
+            if (r) { w_err = r; break; }
+            ch[k].state = CH_FREE;
+            continue;
+        }
+        if (w_stop) break;
+        take_semaphore(rt_wsem, 50);
+    }
+    w_done = 1;
+}
+
+/* burst folder S<day><hh><mm> at the card root, A..Z appended on a clash (8.3) */
+static int sp_pick_dir(void)
+{
+    struct tm now;
+    memset(&now, 0, sizeof(now));
+    LoadCalendarFromRTC(&now);
+    static const char sfx[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (int i = 0; sfx[i]; i++)
+    {
+        snprintf(sp_dir, sizeof(sp_dir), "S%02d%02d%02d ", now.tm_mday % 100, now.tm_hour % 100, now.tm_min % 100);
+        sp_dir[7] = sfx[i];
+        if (!i) sp_dir[7] = 0;
+        if (!is_dir(sp_dir)) { FIO_CreateDirectory(sp_dir); return is_dir(sp_dir) ? 0 : -1; }
+    }
+    return -1;
+}
+
+/* same sampling as rt_probe, on a copied frame (full-frame copy: same pitch as MEM1) */
+#define SP_NPROBE 32
+static uint32_t sp_midtear;
+static uint32_t sp_rowhash(uint32_t base, uint32_t row)
+{
+    uint32_t h = 0x811C9DC5;
+    for (int s = 1; s <= 3; s++)
+    {
+        const volatile uint32_t *p = (const volatile uint32_t *)(base + row * pitch + ((pitch * s / 4) & ~3));
+        for (int i = 0; i < 4; i++) h = (h ^ p[i]) * 0x01000193;
+    }
+    return h;
+}
+
+/* one LV frame event in a silent-picture session (capture task) */
+static int sp_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
+{
+    if (!first_t) { first_t = td; next_tl = 0; }
+    uint32_t us = 0;
+    int trig = sp_trig;
+    if (trig && !sp_trig_cap)           /* press: the ring frames become kept frames */
+    {
+        sp_trig_cap = 1;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING) { ch[i].state = CH_FULL; sp_pre_kept++; sp_kept++; }
+        sp_ring_n = 0;
+        give_semaphore(rt_wsem);
+    }
+    int want = trig || (sp_run_mode == 2 && !sp_trig_cap);
+    if (!want) goto out;
+    if (frames && bot_ref == last_rec_bot) { flags |= F_DUP; dups++; goto out; }
+    int k = -1;
+    for (int i = 0; i < nch; i++) if (ch[i].state == CH_FREE) { k = i; break; }
+    if (!trig && (k < 0 || sp_ring_n >= sp_ring_max))     /* ring full: reuse the oldest ring frame */
+    {
+        int o = -1;
+        uint32_t best = 0xFFFFFFFF;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING && ch[i].seq < best) { best = ch[i].seq; o = i; }
+        if (o >= 0) { k = o; sp_ring_n--; }
+    }
+    if (k < 0)
+    {
+        flags |= F_DROP; drops++;
+        if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+        goto out;
+    }
+    ch[k].state = CH_FILL;
+    uint32_t top0 = rt_probe(r_top);
+    if (top0 != top_ref) { flags |= F_TEAR; tears++; }
+    /* v20: 32 rows between the probes, hashed in MEM1 just before the copy and in the copy after it: a copy that fell
+     * behind the next frame mid-way (only the top/bottom probes are checked otherwise) shows as a mismatch */
+    uint32_t ph[SP_NPROBE], prow[SP_NPROBE], dst = ch[k].base + slot_pre;
+    for (int j = 0; j < SP_NPROBE; j++)
+    {
+        prow[j] = r_top + 1 + (uint32_t)j * (r_bot - r_top - 2) / (SP_NPROBE - 1);
+        ph[j] = rt_probe(prow[j]);
+    }
+    if (rt_copy(c_src, pitch, dst, c_rb, c_ch, &us))
+    {
+        rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
+        ch[k].state = CH_FREE;
+        rt_fail();
+        return -1;
+    }
+    if (rt_probe(r_top) != top0) { flags |= F_TOPCHG; topchg++; }
+    if (rt_probe(r_bot) != bot_ref) { flags |= F_BOTCHG; botchg++; }
+    {
+        int mb = 0;
+        for (int j = 0; j < SP_NPROBE; j++) if (sp_rowhash(dst, prow[j]) != ph[j]) mb++;
+        /* rows below the bottom probe may still be written at the frame event: compare them with MEM1 after the
+         * copy instead (the next frame reaches them only ~30 ms after the event) */
+        uint32_t h1 = c_ch - 1;
+        for (int j = 0; j < 6 && r_bot + 1 < h1; j++)
+        {
+            uint32_t row = r_bot + 1 + (uint32_t)j * (h1 - r_bot - 1) / 5;
+            if (sp_rowhash(dst, row) != rt_probe(row)) mb++;
+        }
+        if (mb) { flags |= F_MIDTEAR; sp_midtear++; }
+    }
+    frames++; dsum += us; if (us > dmax) dmax = us;
+    last_rec_bot = bot_ref;
+    ch[k].seq = nfr; ch[k].t_us = td; ch[k].fl = flags;
+    if (trig) { sp_kept++; ch[k].state = CH_FULL; give_semaphore(rt_wsem); }
+    else { ch[k].state = CH_RING; sp_ring_n++; }
+out:
+    if (sp_rel && sp_kept) { sp_trig = 0; sp_end = 1; }  /* released: done once something is kept */
+    if (flags & F_LATE) late++;
+    if (nfr < RT_MAXFR)
+    {
+        fl[nfr].t_us = td - first_t; fl[nfr].dma_us = MIN(us, 65535);
+        fl[nfr].lat = MIN(lat_us / 100, 255); fl[nfr].flags = flags;
+    }
+    nfr++;
+    int used = 0;
+    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used++;
+    if ((uint32_t)used > max_used) max_used = used;
+    return 0;
+}
+
 /* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
  * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
 static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
 {
+    if (c_dng) return sp_frame(td, lat_us, flags, top_ref, bot_ref);
     if (!first_t) { first_t = td; next_tl = 0; }
     uint32_t us = 0;
     if (frames && bot_ref == last_rec_bot)
@@ -1307,6 +1646,7 @@ static void rt_capture_irq(void)
         uint32_t now = rt_us();
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
+        if (sp_active && sp_end) break;                                     /* v20: silent session ends */
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
         rt_timeline(now);
@@ -1339,6 +1679,7 @@ static void rt_capture_timer(uint32_t est)
         uint32_t now = rt_us();
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
+        if (sp_active && sp_end) break;                                     /* v20: silent session ends */
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
         if (now - (t_prev ? t_prev : t0) > 1000000) { rt_printf("no new frame for 1 s, stopping\n"); break; }
@@ -1427,9 +1768,9 @@ static void rt_task(void *unused)
     if (!rt_csem) rt_csem = create_named_semaphore("rt_cap", SEM_CREATE_LOCKED);
 
     if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
-    int full = rt_crop_sel == RT_CROP_FULL;
+    int full = rt_crop_sel == RT_CROP_FULL || sp_active;    /* v20: silent pictures take the whole MEM1 frame */
     uint32_t crop_w = rt_crop_wh[rt_crop_sel][0], crop_h = rt_crop_wh[rt_crop_sel][1];   /* full: set from MEM1 below */
-    int dur_s = rr_active ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
+    int dur_s = (rr_active || sp_active) ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
     {
         char n[32], m[32], x[32];
@@ -1441,16 +1782,30 @@ static void rt_task(void *unused)
     if (rr_active) rr_pick_name();
     rr_full = 0;
     c_free0 = (uint64_t)get_free_space_32k(get_shooting_card()) * 32768;
-    c_mlv = rt_fmt_sel != 0;
-    c_bpp = rt_fmt_bpp[rt_fmt_sel];
+    c_dng = sp_active ? 1 : 0;          /* v20 */
+    c_mlv = rt_fmt_sel != 0 && !c_dng;
+    c_bpp = c_dng ? (sp_bits ? 10 : 12) : rt_fmt_bpp[rt_fmt_sel];
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
     if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
     rt_printf("start v17 record test run %d: crop %dx%d%s, %d s%s%s, sync %s, format %s, t=%d lv=%d shooting_mode=%d movie=%d, card free %d MB\n", rt_run_id,
               crop_w, crop_h, full ? " (full frame)" : "", dur_s, rr_active ? " (REC button, until stopped)" : "", rt_osd_run ? " (status shown)" : "", rt_sync_name[rt_sync_sel],
-              rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
+              c_dng ? (c_bpp == 10 ? "DNG 10-bit" : "DNG 12-bit") : rt_fmt_name[rt_fmt_sel], get_ms_clock(), lv ? 1 : 0, shooting_mode, is_movie_mode() ? 1 : 0,
               get_free_space_32k(get_shooting_card()) / 32);
     if (rr_active) rt_printf("v18 clip %s.MLV, diagnostics %s\n", rr_base, rr_diag ? "on" : "off");
+    if (c_dng)
+    {
+        sp_run_mode = sp_mode == 2 ? 2 : 1;
+        sp_ready = 0; sp_kept = sp_saved = sp_pre_kept = 0; sp_ring_n = 0; sp_trig_cap = 0;
+        sp_swap_us_sum = sp_swap_us_max = sp_wr_us_sum = sp_wr_us_max = sp_chk_bad = sp_torn = sp_midtear = 0;
+        sp_dir[0] = 0;
+        rt_printf("v20 silent session: %s, %d-bit, arm %s, trigger %s, keep %d before the press%s, lv_movie_select %d\n",
+                  sp_run_mode == 2 ? "pre-capture" : "burst", c_bpp, sp_arm_sel ? "always" : "half-press",
+                  sp_trig_sel ? "AF-ON" : "shutter", sp_pre_n[sp_pre_sel & 3], sp_sim ? ", timed test" : "", lv_movie_select);
+        if (!sp_hdr) sp_hdr = malloc(SP_HDR);
+        if (!sp_recs) sp_recs = malloc(sizeof(*sp_recs) * SP_MAXREC);
+        if (!sp_hdr || !sp_recs) { snprintf(rt_last, sizeof(rt_last), "no memory"); goto done; }
+    }
 
     /* HPTimer self-check: one 2 ms timer */
     {
@@ -1478,7 +1833,7 @@ static void rt_task(void *unused)
     rt_printf("M1 path: mode %d, alt %d, width src %dx%d, w/h %dx%d, pack cfg {%d,%d,%d,%d,%d}\n", MEM(RT_PATH),
               MEM(RT_PATH + 0x28), MEM(RT_PATH + 0x18), MEM(RT_PATH + 0x1c), m1_w, m1_h, MEM(RT_PATH + 0x64),
               MEM(RT_PATH + 0x68), MEM(RT_PATH + 0x6C), MEM(RT_PATH + 0x70), MEM(RT_PATH + 0x74));
-    if (c_mlv && m1_w && m1_h)
+    if ((c_mlv || c_dng) && m1_w && m1_h)
     {
         if (rt_pack_apply(c_bpp, 1))
         { snprintf(rt_last, sizeof(rt_last), "RT%02d: pack cfg unexpected", rt_run_id); NotifyBox(6000, "Record test: %s", rt_last); goto done; }
@@ -1507,10 +1862,10 @@ static void rt_task(void *unused)
     if (r_bot != y0 + crop_h - 1) rt_printf("probe rows: top %d, bottom %d (crop bottom %d too close to the frame end)\n",
                                             r_top, r_bot, y0 + crop_h - 1);
     frame_bytes = c_rb * crop_h;
-    slot_pre = c_mlv ? RT_VIDF_PRE : 0;
+    slot_pre = c_dng ? SP_HDR : c_mlv ? RT_VIDF_PRE : 0;
     slot_bytes = (frame_bytes + slot_pre + 4095) & ~4095;
     slot_null = c_mlv ? slot_bytes - slot_pre - frame_bytes : 0;   /* 0 or >= 16 (frame_bytes is a multiple of 16) */
-    kslots = MAX(1, RT_CHUNK_TGT / slot_bytes);
+    kslots = c_dng ? 1 : MAX(1, RT_CHUNK_TGT / slot_bytes);       /* v20: one frame per chunk (ring, DNG per slot) */
     rt_printf("crop %dx%d at (%d,%d), %d bytes/frame, slot %d, %d slots/chunk (%d bytes per write)\n",
               crop_w, crop_h, x0, y0, frame_bytes, slot_bytes, kslots, kslots * slot_bytes);
     if (c_mlv) rt_printf("MLV: VIDF %d + frameSpace %d before each frame, NULL block %d after\n", (int)sizeof(struct rt_vidf),
@@ -1540,7 +1895,7 @@ static void rt_task(void *unused)
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
     }
-    rt_alloc_chunks();
+    rt_alloc_chunks(c_dng ? RT_MAXCH : RT_MAXCH_VIDEO);
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
@@ -1566,9 +1921,19 @@ static void rt_task(void *unused)
         rt_printf("first copy: dma %d us\n", us);
     }
 
-    rt_part_name(w_name, rt_run_id, 0);
-    w_file = FIO_CreateFile(w_name);
-    if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
+    if (c_dng)                          /* v20: a folder per session, the writer makes one DNG per kept frame */
+    {
+        w_file = 0;
+        sp_dir[0] = 0;                  /* folder made by the writer at the first DNG: no empty folders */
+        sp_ring_max = MAX(1, MIN(sp_pre_n[sp_pre_sel & 3], nch - 2));
+        rt_printf("v20: %d frames fit in memory, pre-capture ring %d\n", nch, sp_ring_max);
+    }
+    else
+    {
+        rt_part_name(w_name, rt_run_id, 0);
+        w_file = FIO_CreateFile(w_name);
+        if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
+    }
     w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_us_sum = 0; w_us_min = 0xFFFFFFFF; w_us_max = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
     ra_bytes_written = 0;               /* v19: also when this clip has no audio */
     if (c_mlv && !mlv_hdr) mlv_hdr = malloc(RT_HDR_BYTES);
@@ -1585,7 +1950,8 @@ static void rt_task(void *unused)
         rt_printf("MLV: %d/%d fps, guid %08x%08x\n", mlv_fps_nom, mlv_fps_den, (uint32_t)(mlv_guid >> 32), (uint32_t)mlv_guid);
     }
     rt_t0 = rt_us();
-    task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
+    if (c_dng) task_create("sp_writer", 0x1c, 0x2000, sp_writer, 0);
+    else task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
     rt_flush();
 
     /* capture in a high-priority task that blocks between frames */
@@ -1597,6 +1963,7 @@ static void rt_task(void *unused)
     rt_drain(rt_csem);
     rr_t0_ms = get_ms_clock();
     task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);   /* (rr_t0_ms: on-screen timer) */
+    if (c_dng) sp_ready = 1;            /* v20: armed (status shows READY) */
     if (dur_s > 0)
     {
         take_semaphore(rt_csem, (dur_s + 10) * 1000);
@@ -1608,6 +1975,18 @@ static void rt_task(void *unused)
 
     /* hand over the partial chunk, stop the writer */
     if (cur >= 0) { if (ch[cur].n) ch[cur].state = CH_FULL; else ch[cur].state = CH_FREE; }
+    if (c_dng)                              /* v20: drop unused ring frames; free the DMA engine before the slow DNG writes */
+    {
+        sp_ready = 0;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING || ch[i].state == CH_FILL) ch[i].state = CH_FREE;
+        if (!c_abort) rt_end();
+        rt_unhook();
+        rt_pack_restore();
+        if (lv_raw) { call("lv_save_raw", 0); lv_raw = 0; }
+        rt_unlock();
+        rt_printf("v20 capture ended: %d kept (%d before the press), writing DNGs\n", sp_kept, sp_pre_kept);
+        rt_flush();
+    }
     if (ra_started)                         /* v19: last audio chunks, written before the writer stops */
     {
         ra_stop();
@@ -1623,16 +2002,16 @@ static void rt_task(void *unused)
     uint32_t ts = rt_us();
     w_stop = 1;
     give_semaphore(rt_wsem);
-    for (int i = 0; i < 3000 && !w_done; i++) msleep(10);
+    for (int i = 0; i < (c_dng ? 60000 : 3000) && !w_done; i++) msleep(10);   /* v20: DNGs take ~1-2 s each */
     uint32_t drain_ms = (rt_us() - ts) / 1000;
-    if (w_done)
+    if (w_done && !c_dng)
     {
         if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
         else FIO_CloseFile(w_file);
         w_file = 0;
         if (!w_bytes && !w_part) { FIO_RemoveFile(w_name); rt_printf("no frames written: %s removed\n", w_name); }
     }
-    else rt_printf("writer still busy after 30 s; file left open, buffers kept\n");
+    else if (!w_done) rt_printf("writer still busy after %d s; file left open, buffers kept\n", c_dng ? 600 : 30);
     if (!c_abort) rt_end();
     rt_unhook();
 
@@ -1676,7 +2055,7 @@ static void rt_task(void *unused)
               "topchg %d, botchg(torn) %d; IRQs during capture %d, IRQ timeouts %d; writer err %d\n",
               frames ? dsum / frames : 0, dmax, l50 / 10, l50 % 10, l90 / 10, l90 % 10, lmax / 10, lmax % 10,
               late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
-    rt_printf("files: %s (last part %d), %d MB total, format %s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
+    if (!c_dng) rt_printf("files: %s (last part %d), %d MB total, format %s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
               rt_fmt_name[rt_fmt_sel], RECORDING ? 1 : 0);
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
@@ -1686,6 +2065,43 @@ static void rt_task(void *unused)
                  missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
         if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
         if (w_n >= 20 && !w_err && card10 > 300) rr_card10 = card10;   /* menu's card speed */
+    }
+    if (c_dng)                          /* v20: silent session summary, per-frame list, INFO.TXT in the folder */
+    {
+        int n = sp_saved, nr = MIN(n, SP_MAXREC);
+        rt_printf("SP RESULT: %s %dx%d %d-bit, %d kept (%d before the press), %d DNGs written, %d dropped (memory full), "
+                  "torn %d (mid-copy %d), swap check bad %d; swap avg %d max %d ms, card write avg %d max %d ms per DNG; writer err %d\n",
+                  sp_dir[0] ? sp_dir : "(no folder)", crop_w, crop_h, c_bpp, sp_kept, sp_pre_kept, n, drops, sp_torn,
+                  sp_midtear, sp_chk_bad, n ? sp_swap_us_sum / n / 1000 : 0, sp_swap_us_max / 1000, n ? sp_wr_us_sum / n / 1000 : 0,
+                  sp_wr_us_max / 1000, w_err);
+        const int cap = 160 + nr * 96;
+        char *b = malloc(cap);
+        if (b && sp_dir[0])
+        {
+            int len = snprintf(b, cap, "LV silent pictures %s: %dx%d %d-bit, %s, %d DNGs (%d before the press), %d dropped\n"
+                               "name     ms from press  dma us  swap ms  write ms  flags\n", sp_dir, crop_w, crop_h, c_bpp,
+                               sp_run_mode == 2 ? "pre-capture" : "burst", n, sp_pre_kept, drops);
+            for (int i = 0; i < nr && len < cap - 96; i++)
+            {
+                struct sp_rec *q = &sp_recs[i];
+                int32_t ms = (int32_t)(q->t_us - sp_press_us) / 1000;
+                int w = snprintf(b + len, cap - len, "F%04d.DNG %s%5d  %6d  %7d  %8d  %s%s%s\n", i, ms < 0 ? "-" : "+",
+                                 ms < 0 ? -ms : ms, q->seq < RT_MAXFR ? fl[q->seq].dma_us : 0, q->swap_us / 1000,
+                                 q->wr_us / 1000, (q->fl & F_TORN) ? "TORN? " : "",
+                                 (q->fl & F_LATE) ? "late " : "", (q->fl & 0x100) ? "SWAP-CHECK-BAD" : "");
+                if (w > 0) len += MIN(w, cap - len - 1);
+            }
+            char nm[32];
+            snprintf(nm, sizeof(nm), "%s/INFO.TXT", sp_dir);
+            FILE *f = FIO_CreateFile(nm);
+            if (f) { FIO_WriteFile(f, b, len); FIO_CloseFile(f); }
+            rt_printf("%s", b);
+        }
+        if (b) free(b);
+        if (n || sp_kept || w_err)
+            snprintf(rt_last, sizeof(rt_last), "%s: %d DNG (%d before press)%s%s", sp_dir[0] ? sp_dir : "-", n, sp_pre_kept,
+                     drops ? ", some frames dropped" : "", w_err ? ", WRITE ERROR" : "");
+        else rt_last[0] = 0;
     }
     rt_flush();
     if (rt_diag())
@@ -1717,7 +2133,8 @@ done:
     rt_flush();
     if (rt_diag()) rt_export(rt_run_id);
     rt_runs++;
-    if (rr_active) NotifyBox(8000, "RAW: %s%s", strncmp(rt_last, rr_base, strlen(rr_base)) ? "NOT recorded: " : "", rt_last);
+    if (c_dng) { if (rt_last[0]) NotifyBox(4000, "Silent: %s", rt_last); }   /* v20: nothing for a cancelled session */
+    else if (rr_active) NotifyBox(8000, "RAW: %s%s", strncmp(rt_last, rr_base, strlen(rr_base)) ? "NOT recorded: " : "", rt_last);
     else NotifyBox(8000, "Record test: DONE %s", rt_last);
 out:
     if (rt_logbuf) free(rt_logbuf);
@@ -1726,7 +2143,7 @@ out:
     if (tl) free(tl);
     if (smp) free(smp);
     rt_logbuf = 0; fl = 0; wl = 0; tl = 0; smp = 0;
-    info_led_blink(3, 100, 100);
+    if (!c_dng || rt_last[0]) info_led_blink(3, 100, 100);
     rt_busy = 0;
 }
 
@@ -1764,18 +2181,27 @@ static void rr_status_task(void *unused)
     for (;;)
     {
         msleep(250);
-        if (++tick % 4 == 0 && !rr_active && !rt_osd_run && rr_diag) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics */
-        int on = rr_active || rt_osd_run;
+        if (++tick % 4 == 0 && !rr_active && !rt_osd_run && !rt_busy && (rr_diag || sp_mode)) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics; v20: or silent pictures on */
+        int on = rr_active || rt_osd_run || sp_active;
         if (!on) { if (shown) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); shown = 0; last[0] = 0; } continue; }
-        if (gui_menu_shown() || tick % 4) continue;
+        if (gui_menu_shown() || (tick % 4 && !sp_active)) continue;   /* v20: silent status every 250 ms */
         char t[40];
         uint32_t s_rec = !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
-        if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
+        int red = rr_t0_ms && !rr_stop;
+        if (sp_active)
+        {
+            red = sp_ready && sp_trig;
+            if (sp_ready && sp_trig) snprintf(t, sizeof(t), " SILENT %d ", sp_kept);
+            else if (sp_ready) snprintf(t, sizeof(t), " SILENT ready %db ", c_bpp);
+            else if (sp_kept) snprintf(t, sizeof(t), " saving %d/%d ", sp_saved, sp_kept);
+            else snprintf(t, sizeof(t), " SILENT arming ");
+        }
+        else if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
         else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
         else snprintf(t, sizeof(t), " REC %02d:%02d %dx%d %db ", s_rec / 60, s_rec % 60, c_cw, c_ch, c_bpp);   /* v18: + size */
         if (shown && !strcmp(t, last)) continue;
         if (shown && strlen(t) != strlen(last)) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); }
-        bmp_printf(FONT(FONT_MED, COLOR_WHITE, rr_t0_ms && !rr_stop ? COLOR_RED : COLOR_BLACK), 8, RR_STATUS_Y, "%s", t);
+        bmp_printf(FONT(FONT_MED, COLOR_WHITE, red ? COLOR_RED : COLOR_BLACK), 8, RR_STATUS_Y, "%s", t);
         snprintf(last, sizeof(last), "%s", t);
         shown = 1;
     }
@@ -1784,7 +2210,7 @@ static void rr_status_task(void *unused)
 /* v16.1 key log: v16 on the camera let REC through to Canon. is_movie_mode() looks wrong on the R
  * (shooting_mode == 0x14; v10 logged movie=0 in movie mode), so the movie check is gone; and every
  * button event (not Canon's 0x9D info events) is logged with the state, flushed to ML/RRKEYS.TXT. */
-struct rr_key { uint32_t t_ms; int16_t param; uint8_t lv, menu, movie, taken; uint16_t smode; uint8_t rec; };
+struct rr_key { uint32_t t_ms; int16_t param; uint8_t lv, menu, movie, taken; uint16_t smode; uint8_t rec, sp; };   /* v20: sp = silent session bits */
 #define RR_NKEY 64
 static struct rr_key rr_keys[RR_NKEY];
 static volatile uint32_t rr_nkey;       /* total logged; ring index = n % RR_NKEY */
@@ -1796,6 +2222,7 @@ static int rr_key_log(int param, int taken)
     struct rr_key *k = &rr_keys[n % RR_NKEY];
     k->t_ms = get_ms_clock(); k->param = param; k->lv = lv ? 1 : 0; k->menu = gui_menu_shown() ? 1 : 0;
     k->movie = is_movie_mode() ? 1 : 0; k->taken = taken; k->smode = shooting_mode; k->rec = RECORDING ? 1 : 0;
+    k->sp = (sp_active ? 1 : 0) | (sp_ready ? 2 : 0) | (sp_trig ? 4 : 0) | (lv_movie_select == LVMS_ENABLE_MOVIE ? 8 : 0);
     rr_nkey = n + 1;
     return taken ? 0 : 1;
 }
@@ -1812,8 +2239,8 @@ static void rr_key_flush(void)
     for (; rr_nkey_flushed < n && len < cap - 128; rr_nkey_flushed++)
     {
         struct rr_key *k = &rr_keys[rr_nkey_flushed % RR_NKEY];
-        int w = snprintf(b + len, cap - len, "t=%d ev=%02x lv=%d menu=%d movie=%d shooting_mode=%d canon_rec=%d rec_switch=%d -> %s\n",
-                         k->t_ms, k->param & 0xFFFF, k->lv, k->menu, k->movie, k->smode, k->rec, rr_on, k->taken ? "TAKEN" : "passed");
+        int w = snprintf(b + len, cap - len, "t=%d ev=%02x lv=%d menu=%d movie=%d shooting_mode=%d canon_rec=%d rec_switch=%d silent=%d sp=%x -> %s\n",
+                         k->t_ms, k->param & 0xFFFF, k->lv, k->menu, k->movie, k->smode, k->rec, rr_on, sp_mode, k->sp, k->taken ? "TAKEN" : "passed");
         if (w > 0) len += MIN(w, cap - len - 1);
     }
     FILE *f = FIO_CreateFileOrAppend("ML/RRKEYS.TXT");
@@ -1821,8 +2248,151 @@ static void rr_key_flush(void)
     free(b);
 }
 
+/* ---- v20: LV silent pictures: keys, session start, watcher, timed test ----
+ * Shutter codes are ML's convention for the R (gui.h 0x7D half-press; release/full/full-release = +1/+2/+3), NOT yet
+ * seen on this camera: the key log (ML/RRKEYS.TXT, written after each session and every second while idle) shows
+ * what really arrives. AF-ON 0x81/0x82 (kitor's list) is the alternative trigger.
+ * Half-press arms a session (~2 s: LV raw on, survey, memory), the trigger held = frames kept, its release ends the
+ * session (then the DNGs are written); a half release without a trigger cancels. Canon still gets the half-press
+ * (AF); the trigger press/release are taken. REC is taken during a session (no Canon recording on our memory). */
+#define SP_KEY_HALF     0x7D
+#define SP_KEY_UNHALF   0x7E
+#define SP_KEY_FULL     0x7F
+#define SP_KEY_UNFULL   0x80
+#define SP_KEY_AFON     0x81
+#define SP_KEY_UNAFON   0x82
+#define SP_PND          "ML/SETTINGS/SPARM.PND"   /* Arm = Always session running (see sp_watch_task) */
+
+static int sp_movie_lv(void) { return lv && lv_movie_select == LVMS_ENABLE_MOVIE && !gui_menu_shown(); }
+
+static void sp_task(void *unused)
+{
+    rt_task(0);                         /* synchronous; clears rt_busy */
+    if (is_file(SP_PND)) FIO_RemoveFile(SP_PND);     /* session finished normally */
+    sp_active = 0; sp_ready = 0; sp_trig = 0; sp_end = 0; sp_rel = 0;   /* key log: rr_status_task flushes it once idle */
+}
+
+static void sp_mark_press(void) { sp_press_us = rt_us(); LoadCalendarFromRTC(&sp_tm); }
+
+/* claim the engine and start a session; trig = the trigger is already held */
+static int sp_try_start(int trig)
+{
+    uint32_t old = cli();
+    int ok = !rt_busy && !sp_active;    /* sp_active: the last session's task is still finishing */
+    if (ok) rt_busy = 1;
+    sei(old);
+    if (!ok) return 0;
+    sp_end = 0; sp_rel = 0; sp_ready = 0; sp_trig = 0; sp_kept = sp_saved = sp_pre_kept = 0;   /* status: no stale counts */
+    if (trig) { sp_mark_press(); sp_trig = 1; }
+    sp_active = 1;
+    rt_last[0] = 0;
+    task_create("sp_task", 0x1e, 0x2000, sp_task, 0);
+    return 1;
+}
+
+/* -1: not a silent-picture key; else 0 = taken, 1 = passed to Canon */
+static int sp_keys(int p)
+{
+    int dn = sp_trig_sel ? SP_KEY_AFON : SP_KEY_FULL, up = sp_trig_sel ? SP_KEY_UNAFON : SP_KEY_UNFULL;
+    if (p == SP_KEY_HALF)
+    {
+        if (sp_mode && sp_arm_sel == 0 && !sp_active && !rt_busy && sp_movie_lv()) sp_try_start(0);
+        return 1;
+    }
+    if (p == SP_KEY_UNHALF)
+    {
+        if (sp_active && !sp_trig && !sp_sim && sp_arm_sel == 0) sp_end = 1;    /* released without a picture */
+        return 1;
+    }
+    if (p == dn)
+    {
+        if (sp_active)
+        {
+            if (!sp_end && !sp_trig) { sp_mark_press(); sp_trig = 1; }
+            return 0;                   /* also while the last burst is still being written: ignored, not Canon's */
+        }
+        if (sp_mode && !rt_busy && sp_movie_lv()) { sp_try_start(1); return 0; }
+        return 1;
+    }
+    if (p == up)
+    {
+        if (sp_active && sp_trig && !sp_sim) sp_rel = 1;   /* sp_frame ends it after >= 1 kept frame */
+        return sp_active ? 0 : 1;
+    }
+    if (sp_active && p == RR_KEY_REC_PRESS)
+    {
+        if (!sp_trig) sp_end = 1;
+        return 0;
+    }
+    return -1;
+}
+
+/* every 200 ms: cancel an armed session when live view / movie mode / the closed ML menu is gone; Arm = Always
+ * starts a session after 1 s of movie LV with nothing else running. Always-armed sessions leave a marker file while
+ * they run: if one is still there at boot, the last one never finished (freeze?), so Arm goes back to Half-press. */
+static void sp_watch_task(void *unused)
+{
+    extern int ml_started;
+    int ok_ms = 0;
+    while (!ml_started) msleep(100);
+    msleep(3000);                       /* config loaded by now */
+    if (is_file(SP_PND))
+    {
+        FIO_RemoveFile(SP_PND);
+        if (sp_arm_sel) { sp_arm_sel = 0; NotifyBox(6000, "LV silent: last armed session did not finish; Arm = Half-press"); }
+    }
+    for (;;)
+    {
+        msleep(200);
+        int mlv = sp_movie_lv() && DISPLAY_IS_ON;
+        if (sp_active && !sp_trig && !sp_end && (!mlv || (!sp_mode && !sp_sim))) sp_end = 1;
+        if (sp_mode && sp_arm_sel == 1 && mlv && !rt_busy && !sp_active && !sp_sim) ok_ms += 200; else ok_ms = 0;
+        if (ok_ms >= 1000)
+        {
+            ok_ms = 0;
+            FILE *f = FIO_CreateFile(SP_PND);
+            if (f) FIO_CloseFile(f);
+            if (!sp_try_start(0)) FIO_RemoveFile(SP_PND);
+        }
+    }
+}
+
+/* Debug: timed test without any key (arm, ~1-2 s, trigger held 1 s, release). Opening the ML menu cancels it. */
+static void sp_sim_task(void *unused)
+{
+    for (int i = 0; i < 300 && gui_menu_shown(); i++) msleep(100);
+    msleep(1000);
+    if (!sp_movie_lv() || !sp_try_start(0)) { NotifyBox(4000, "Silent test: needs movie-mode live view, ML menu closed"); sp_sim = 0; return; }
+    for (int i = 0; i < 150 && sp_active && !sp_ready && !sp_end; i++) msleep(100);
+    if (sp_active && sp_ready && !sp_end)
+    {
+        msleep(sp_mode == 2 ? 2000 : 1000);
+        if (sp_active && !sp_end) { sp_mark_press(); sp_trig = 1; }
+        msleep(1000);
+        sp_trig = 0; sp_end = 1;
+    }
+    else sp_end = 1;
+    while (sp_active) msleep(100);
+    sp_sim = 0;
+}
+
+static void sp_sim_select(void *priv, int delta)
+{
+    if (sp_sim || rt_busy) return;
+    if (!sp_mode) { NotifyBox(3000, "Set LV silent pictures to Burst or Pre-capture first"); return; }
+    sp_sim = 1;
+    task_create("sp_sim", 0x1e, 0x1000, sp_sim_task, 0);
+}
+
 int handle_rawrec_keys(struct event *event)
 {
+    int p0 = event->param;
+    if ((sp_mode || sp_active) && p0 != 0x9D)  /* v20: silent-picture keys first; every key is logged while it's on */
+    {
+        int r = sp_keys(p0);
+        if (r >= 0) return rr_key_log(p0, !r);
+        if (!rr_on) return rr_key_log(p0, 0);
+    }
     if (!rr_on) return 1;
     int p = event->param;
     if (p == 0x9D) return 1;            /* GMT_OLC_INFO_CHANGED: Canon-internal, frequent */
@@ -2185,6 +2755,66 @@ static struct menu_entry rr_menu[] = {
     },
 };
 
+/* v20: Shoot > LV silent pictures */
+static MENU_UPDATE_FUNC(sp_menu_update)
+{
+    if (!sp_mode) return;
+    if (lv_movie_select != LVMS_ENABLE_MOVIE)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Movie mode only. Canon movie size 4K gives 4256x2214 (1:1, ~1.7x crop).");
+    else if (rr_on)
+        MENU_SET_WARNING(MENU_WARN_INFO, "RAW video is ON too: REC records raw only while no silent session is armed.");
+}
+
+static struct menu_entry sp_menu[] = {
+    {
+        .name     = "LV silent pictures",
+        .priv     = &sp_mode,
+        .max      = 2,
+        .choices  = CHOICES("OFF", "Burst", "Pre-capture"),
+        .update   = sp_menu_update,
+        .help     = "DNG stills from the live-view raw feed, no shutter. Movie mode, Canon size 4K: 4256x2214.",
+        .help2    = "Half-press arms (~2 s), full press = frames while held. Pre-capture keeps frames before it too.",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "Bit depth",
+                .priv    = &sp_bits,
+                .max     = 1,
+                .choices = CHOICES("12-bit", "10-bit"),
+                .help    = "Same number of frames in memory either way at 4K; 10-bit copies faster (less tear risk).",
+            },
+            {
+                .name    = "Frames before press",
+                .priv    = &sp_pre_sel,
+                .max     = 3,
+                .choices = CHOICES("3", "5", "7", "9"),
+                .help    = "Pre-capture: frames kept from before the full press (30 fps: 5 = ~0.17 s).",
+                .help2   = "At most all frames in memory minus 2 (~8-10 at 4K).",
+            },
+            {
+                .name    = "Arm",
+                .priv    = &sp_arm_sel,
+                .max     = 1,
+                .choices = CHOICES("Half-press", "Always"),
+                .help    = "Always: armed whenever movie live view is up (ML overlays pause, REC raw is blocked).",
+            },
+            {
+                .name    = "Trigger",
+                .priv    = &sp_trig_sel,
+                .max     = 1,
+                .choices = CHOICES("Shutter", "AF-ON"),
+                .help    = "Button held = frames kept. AF-ON: Canon's AF-ON does nothing else while this is on.",
+            },
+            {
+                .name    = "Timed test",
+                .select  = sp_sim_select,
+                .help    = "No buttons: close the menu, it arms, then 'presses' for 1 s. Opening the menu cancels.",
+                .help2   = "Pictures go to S<day><hhmm>/ at the card root; log ML/RECTEST.TXT.",
+            },
+            MENU_EOL,
+        },
+    },
+};
+
 static struct menu_entry rt_menu[] = {
     {
         .name   = "LV record test",
@@ -2486,6 +3116,8 @@ static void rt_init(void *unused)
     task_create("rr_mark", 0x1f, 0x1000, rr_mark_task, 0);
     menu_add("Movie", rr_menu, COUNT(rr_menu));       /* v18: user front end */
     menu_add("Debug", rt_menu, COUNT(rt_menu));
+    menu_add("Shoot", sp_menu, COUNT(sp_menu));     /* v20 */
+    task_create("sp_watch", 0x1f, 0x1000, sp_watch_task, 0);
     task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
 }
 
