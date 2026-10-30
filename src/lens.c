@@ -226,6 +226,50 @@ update_lens_display(int top, int bottom)
     //~ info_print_screen();
 }
 
+#ifdef CONFIG_R
+/* riz 2026-10-30: Auto-hide for ML's bottom bar. Canon draws its own info line over it for a few seconds whenever a
+ * shooting setting changes (unreadable overlap). r_bbar_task polls the settings every 50 ms; on a change it wipes
+ * ML's bar at once and keeps it hidden for R_BBAR_HIDE_MS, then asks for a redraw. Only values the user sets count:
+ * shutter in M/Tv, aperture in M/Av (Canon changes the other one itself), ISO only when not auto, exp. comp., WB,
+ * picture style. */
+#define R_BBAR_HIDE_MS 3000
+static volatile int r_bbar_hide, r_bbar_t0;
+int r_bbar_hidden(void) { return r_bbar_hide; }
+static uint32_t r_bbar_sig(void)
+{
+    int m = shooting_mode;
+    uint32_t sh = (m == SHOOTMODE_M || m == SHOOTMODE_TV) ? lens_info.raw_shutter : 0;
+    uint32_t ap = (m == SHOOTMODE_M || m == SHOOTMODE_AV) ? lens_info.raw_aperture : 0;
+    uint32_t sig = sh | ap << 8 | (uint32_t)lens_info.raw_iso << 16 | ((uint32_t)lens_info.ae & 0xFF) << 24;
+    sig ^= lens_info.wb_mode * 2654435761u ^ lens_info.kelvin * 40503u ^ lens_info.picstyle * 9973u;
+    return sig;
+}
+static void r_bbar_task(void *unused)
+{
+    extern int r_bottombar_mode(void);
+    extern void r_bottombar_wipe(void);
+    uint32_t last = r_bbar_sig();
+    TASK_LOOP
+    {
+        msleep(50);
+        uint32_t sig = r_bbar_sig();
+        int now = get_ms_clock();
+        if (sig != last && lv && !gui_menu_shown() && r_bottombar_mode() == 2)
+        {
+            if (!r_bbar_hide) BMP_LOCK( r_bottombar_wipe(); );
+            r_bbar_hide = 1; r_bbar_t0 = now;
+        }
+        last = sig;
+        if (r_bbar_hide && (now - r_bbar_t0 >= R_BBAR_HIDE_MS || now - r_bbar_t0 < 0 || r_bottombar_mode() != 2))
+        {
+            r_bbar_hide = 0;
+            lens_display_set_dirty();          /* bring ML's bar back */
+        }
+    }
+}
+TASK_CREATE("r_bbar_task", r_bbar_task, 0, 0x1f, 0x1000);
+#endif
+
 int should_draw_bottom_bar()
 {
     if (gui_menu_shown()) return 1;
