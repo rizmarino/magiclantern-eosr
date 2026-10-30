@@ -642,7 +642,9 @@ static void rt_fps_of(uint32_t period_us, uint32_t *nom, uint32_t *den)
     }
 }
 
-/* MLVI + RAWI + IDNT + RTCI for one file */
+/* MLVI + RAWI + IDNT + RTCI (+ WAVI with audio, v19) for one file */
+static volatile int ra_on;              /* v19 audio (see below) */
+static volatile uint32_t ra_part_count;
 static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
 {
     memset(mlv_hdr, 0, RT_HDR_BYTES);
@@ -650,6 +652,7 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     memcpy(m->magic, "MLVI", 4); m->size = 52; memcpy(m->ver, "v2.0", 5); m->guid = mlv_guid;
     m->file_num = file_num; m->file_count = 0; m->vclass = 1; m->vframes = vframes;
     m->fps_nom = mlv_fps_nom; m->fps_den = mlv_fps_den;
+    if (ra_on) { m->aclass = 1; m->aframes = ra_part_count; }
     uint8_t *p = mlv_hdr + 52;
     struct rt_blk *b = (struct rt_blk *)p;                       /* RAWI */
     memcpy(b->type, "RAWI", 4); b->size = 180;
@@ -687,8 +690,19 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     t[0] = now.tm_sec; t[1] = now.tm_min; t[2] = now.tm_hour; t[3] = now.tm_mday; t[4] = now.tm_mon;
     t[5] = now.tm_year; t[6] = now.tm_wday; t[7] = now.tm_yday; t[8] = now.tm_isdst;
     p += 44;
+    int wavi = 0;
+    if (ra_on)                                                   /* v19: WAVI, 48 kHz 16-bit stereo PCM */
+    {
+        b = (struct rt_blk *)p;
+        memcpy(b->type, "WAVI", 4); b->size = 32; b->ts = 1;         /* non-zero: mlv_dump ignores a WAVI at 0 */
+        uint16_t *w16 = (uint16_t *)(p + 16); uint32_t *w32 = (uint32_t *)(p + 20);
+        w16[0] = 1; w16[1] = 2;                                  /* format PCM, channels */
+        w32[0] = 48000; w32[1] = 192000;                         /* sampling rate, bytes per second */
+        uint16_t *w16b = (uint16_t *)(p + 28); w16b[0] = 4; w16b[1] = 16;   /* block align, bits per sample */
+        p += 32; wavi = 32;
+    }
     b = (struct rt_blk *)p;                                      /* NULL padding to RT_HDR_BYTES */
-    memcpy(b->type, "NULL", 4); b->size = RT_HDR_BYTES - RT_HDR_INFO;
+    memcpy(b->type, "NULL", 4); b->size = RT_HDR_BYTES - RT_HDR_INFO - wavi;
 }
 
 /* rewrite this file's MLVI with its frame count, then close it */
@@ -716,6 +730,219 @@ static void rt_mlv_slot(uint32_t slot, uint32_t frame_no, uint32_t ts_us)
 }
 
 static struct semaphore *rt_wsem;
+static uint32_t first_t;     /* v19: forward (capture section) */
+
+/* ---- v19 audio: the camera's microphone into the MLV (48 kHz, 16-bit, stereo) ----
+ * Canon's SoundDev API (stage 2 probe, camera-verified 2026-10-30: clean start/stop, 0.5 s chunks of 96096 B at
+ * 29.97p in a 5 s ring, samples big-endian). Canon's callbacks only queue chunk addresses; ra_task copies each chunk
+ * (uncached, byte-swapped to little-endian) into a prepared AUDF block (padded with a NULL block to a 4 KiB multiple,
+ * so the video writes stay 4 KiB-aligned); the writer task writes prepared blocks between video chunks.
+ * Audio starts (SetInStart) just before video capture; the samples before the first video frame are dropped, so
+ * audio and video start together (within about a frame). Needs Canon's live-view audio already on (Sound recording
+ * Auto/Manual): ML never lets Canon allocate its audio area while the recorder holds the shoot memory. */
+#ifndef RT_HOST                         /* host test: fakes in tests/rectest_host */
+static int      (*const SoundDev_SetAudioInit)(int mode, int z, int sync, int fmt) = (void *)0xE05EDAF7;
+static int      (*const SoundDev_SetRecParam)(int *p)                               = (void *)0xE05EE3F9;
+static int      (*const SoundDev_SetMovieStart)(int mode)                           = (void *)0xE05EDB95;
+static int      (*const SoundDev_SetInStart)(void)                                  = (void *)0xE05EDDF7;
+static int      (*const SoundDev_SetMovieStop)(int mode)                            = (void *)0xE05EDD73;
+static int      (*const SoundDev_SetAudioEnd)(int mode)                             = (void *)0xE05EDDAF;
+static uint32_t (*const AprocCtrl_GetMovieAdr)(void)                                = (void *)0xE0293C4F;
+static uint32_t (*const AprocCtrl_GetMovieSize)(void)                               = (void *)0xE0293C81;
+static uint32_t (*const AprocCtrl_GetRecEndian)(void)                               = (void *)0xE0293DA9;
+static int      (*const ACTRL_IsActiveState)(int mask, int lock)                    = (void *)0xE024D0FD;
+#endif
+
+static CONFIG_INT("r.rawrec.audio", rr_audio, 0);
+
+#define RA_NBUF   4
+#define RA_BLK    98304                 /* AUDF 24 + RA_PAYLOAD 96000 + NULL padding, a multiple of 4096 */
+#define RA_QMAX   32
+struct __attribute__((packed)) rt_audf { char type[4]; uint32_t size; uint64_t ts; uint32_t frame, space; };
+struct ra_q { uint32_t adr1, size1, adr2, size2; };
+static struct ra_q ra_q[RA_QMAX];
+static volatile int ra_qhead, ra_qtail, ra_qover;
+static uint8_t *ra_buf;                 /* RA_NBUF x RA_BLK, fio_malloc'd before the video chunks */
+static volatile int ra_ready[RA_NBUF];  /* 0 free, else bytes ready to write */
+static int ra_widx;                     /* writer side */
+static volatile int ra_started, ra_start_cb, ra_stop_cb, ra_err_cb, ra_stop_req, ra_task_done, ra_task_alive;   /* ra_on, ra_part_count: above */
+static volatile int ra_skip_d, ra_skip_logged;
+static int ra_stuck;                    /* Canon never confirmed a stop: no audio until power-cycle */   /* first frame - audio start (us); logged by the main task */
+static uint32_t ra_count, ra_samples, ra_skip, ra_lost, ra_t_in, ra_endian, ra_bytes_written;
+static int ra_sync;
+static int ra_p[19];
+
+static void ra_queue(int *info)
+{
+    int h = ra_qhead, n = (h + 1) % RA_QMAX;
+    if (!info) return;
+    if (n == ra_qtail) { ra_qover++; return; }
+    ra_q[h].adr1 = info[0x35]; ra_q[h].size1 = info[0x36]; ra_q[h].adr2 = info[0x37]; ra_q[h].size2 = info[0x38];
+    ra_qhead = n;
+}
+static void ra_cb_start(int inst, int err) { ra_start_cb = 1; }
+static void ra_cb_rec(int inst, int *info) { ra_queue(info); }
+static void ra_cb_stop(int inst, int *info) { ra_queue(info); ra_stop_cb = 1; }
+static void ra_cb_err(int inst, int code) { ra_err_cb++; }
+static void ra_cb_pause(int inst, int *info) { }
+
+static int ra_sync_code(void)
+{
+    if (mlv_fps_nom == 30000 && mlv_fps_den == 1001) return 4;
+    if (mlv_fps_nom == 24000 && mlv_fps_den == 1001) return 7;
+    if (mlv_fps_nom == 25000) return 5;
+    if (mlv_fps_nom == 24000) return 6;
+    if (mlv_fps_nom == 60000 && mlv_fps_den == 1001) return 1;
+    if (mlv_fps_nom == 50000) return 2;
+    return -1;
+}
+
+/* Audio goes into the MLV in fixed 0.5 s AUDF blocks (RA_PAYLOAD bytes each, the last one padded with silence):
+ * mlv_dump places each AUDF at frameNumber x its own payload size, so a short block (the trimmed first chunk, the
+ * stop chunk) left gaps or overwrote audio in its WAV. Canon's chunks (~0.5 s, size depends on the sync code) are
+ * re-cut into these blocks. Timestamps: WAVI 1 us, AUDF n = 2 us + n x 0.5 s (non-zero: mlv_dump treats a WAVI with
+ * timestamp 0 as missing, and AUDF must sort after WAVI). */
+#define RA_PAYLOAD 96000                /* 0.5 s of 48 kHz 16-bit stereo */
+static int ra_fill_idx, ra_fill_n;      /* block being filled, bytes in it */
+
+/* close the block being filled (pad with silence to RA_PAYLOAD), hand it to the writer */
+static void ra_finish_block(void)
+{
+    if (!ra_fill_n) return;
+    uint8_t *blk = ra_buf + ra_fill_idx * RA_BLK;
+    if (ra_fill_n < RA_PAYLOAD) memset(blk + 24 + ra_fill_n, 0, RA_PAYLOAD - ra_fill_n);
+    struct rt_audf *h = (struct rt_audf *)blk;
+    memcpy(h->type, "AUDF", 4); h->size = 24 + RA_PAYLOAD; h->frame = ra_count; h->space = 0;
+    h->ts = 2 + (uint64_t)ra_count * 500000;
+    ra_count++;
+    ra_samples += ra_fill_n / 4;            /* real samples (padding not counted) */
+    uint32_t used = 24 + RA_PAYLOAD, total = (used + 16 + 4095) & ~4095;
+    struct rt_blk *nb = (struct rt_blk *)(blk + used);
+    memcpy(nb->type, "NULL", 4); nb->size = total - used; nb->ts = h->ts;
+    ra_ready[ra_fill_idx] = total;
+    ra_fill_idx = (ra_fill_idx + 1) % RA_NBUF;
+    ra_fill_n = 0;
+    give_semaphore(rt_wsem);
+}
+
+/* append one Canon chunk (skip applied, byte-swapped) to the AUDF blocks */
+static void ra_consume(struct ra_q *q)
+{
+    uint32_t parts[2][2] = { { q->adr1, q->size1 }, { q->adr2, q->size2 } };
+    for (int k = 0; k < 2; k++)
+    {
+        uint32_t a = parts[k][0], sz = parts[k][1] & ~3;
+        if (!a || !sz) continue;
+        if (ra_skip) { uint32_t s = MIN(ra_skip, sz); a += s; sz -= s; ra_skip -= s; }
+        while (sz)
+        {
+            if (!ra_fill_n)                     /* new block: wait for the writer to free this buffer */
+            {
+                int waited = 0;
+                while (ra_ready[ra_fill_idx] && waited < 3000) { msleep(10); waited += 10; }
+                if (ra_ready[ra_fill_idx]) { ra_lost++; return; }   /* writer stuck: drop the rest of this chunk */
+            }
+            uint32_t take = MIN(sz, (uint32_t)(RA_PAYLOAD - ra_fill_n));
+            const uint8_t *src = UNCACHEABLE(a);
+            uint8_t *d = ra_buf + ra_fill_idx * RA_BLK + 24 + ra_fill_n;
+            if (ra_endian == 1)
+                for (uint32_t i = 0; i < take; i += 2) { d[i] = src[i + 1]; d[i + 1] = src[i]; }
+            else
+                memcpy(d, src, take);
+            ra_fill_n += take; a += take; sz -= take;
+            if (ra_fill_n == RA_PAYLOAD) ra_finish_block();
+        }
+    }
+}
+
+static void ra_task(void *unused)
+{
+    for (;;)
+    {
+        if (ra_qtail == ra_qhead) { if (ra_stop_req) break; msleep(20); continue; }
+        if (!first_t) { if (ra_stop_req) break; msleep(10); continue; }   /* skip is known once the first frame is in */
+        if (ra_skip == 0xFFFFFFFF)
+        {
+            int32_t d = (int32_t)(first_t - ra_t_in);
+            ra_skip = d > 0 ? ((uint32_t)((uint64_t)d * 48000 / 1000000) * 4) : 0;
+            ra_skip_d = d; ra_skip_logged = 1;    /* printed by the main task (rt_printf is not task-safe) */
+        }
+        ra_consume(&ra_q[ra_qtail]);
+        ra_qtail = (ra_qtail + 1) % RA_QMAX;
+    }
+    if (first_t) ra_finish_block();          /* last partial block, padded with silence */
+    ra_task_done = 1;
+    ra_task_alive = 0;
+}
+
+/* writer side: one prepared block, if any; returns bytes written, < 0 on error */
+static int ra_write_one(FILE *f)
+{
+    int n = ra_ready[ra_widx];
+    if (!n) return 0;
+    int r = FIO_WriteFile(f, ra_buf + ra_widx * RA_BLK, n);
+    if (r != n) return r ? r : -1;
+    ra_ready[ra_widx] = 0;
+    ra_widx = (ra_widx + 1) % RA_NBUF;
+    ra_part_count++;
+    ra_bytes_written += n;
+    return n;
+}
+
+/* start Canon's audio (before the video capture). 0 = running, else why not */
+static int ra_start(void)
+{
+    ra_on = ra_started = ra_start_cb = ra_stop_cb = ra_err_cb = ra_stop_req = ra_task_done = 0;
+    ra_qhead = ra_qtail = ra_qover = 0; ra_widx = 0; ra_count = ra_samples = ra_lost = ra_bytes_written = 0;
+    ra_part_count = 0; ra_skip = 0xFFFFFFFF; ra_skip_d = 0; ra_skip_logged = 0;
+    ra_fill_idx = 0; ra_fill_n = 0;
+    first_t = 0;                        /* ra_task waits for this clip's first frame, not the last clip's */
+    for (int i = 0; i < RA_NBUF; i++) ra_ready[i] = 0;
+    if (!ra_buf) return 1;
+    if (ra_stuck) { rt_printf("audio: off until power-cycle (Canon didn't confirm the last audio stop), no audio\n"); return 7; }
+    ra_sync = ra_sync_code();
+    if (ra_sync < 0) { rt_printf("audio: no sync code for %d/%d fps, no audio\n", mlv_fps_nom, mlv_fps_den); return 2; }
+    uint32_t madr = AprocCtrl_GetMovieAdr(), msize = AprocCtrl_GetMovieSize();
+    if (!madr || !msize) { rt_printf("audio: Canon's audio is off (Sound recording disabled?), no audio\n"); return 3; }
+    if (ACTRL_IsActiveState(0x11, 0)) { rt_printf("audio: Canon audio busy (playback), no audio\n"); return 4; }
+    int rc = SoundDev_SetAudioInit(1, 0, ra_sync, 1);
+    if (rc) { rt_printf("audio: SetAudioInit = %d, no audio\n", rc); return 5; }
+    ra_endian = AprocCtrl_GetRecEndian();
+    memset(ra_p, 0, sizeof(ra_p));
+    ra_p[0] = 48000; ra_p[1] = 16; ra_p[2] = 2; ra_p[5] = 1; ra_p[8] = ra_sync;
+    ra_p[9] = (int)ra_cb_start; ra_p[10] = (int)ra_cb_rec; ra_p[11] = (int)ra_cb_stop; ra_p[13] = (int)ra_cb_err;
+    ra_p[15] = (int)ra_cb_pause;
+    rc = SoundDev_SetRecParam(ra_p);
+    if (!rc) rc = SoundDev_SetMovieStart(2) ? 100 : 0;
+    if (rc) { rt_printf("audio: SetRecParam/SetMovieStart failed (%d), no audio\n", rc); SoundDev_SetAudioEnd(4); return 6; }
+    ra_started = 1;
+    for (int t = 0; t < 1000 && !ra_start_cb; t += 10) msleep(10);
+    SoundDev_SetInStart();
+    ra_t_in = rt_us();
+    ra_task_alive = 1;
+    task_create("ra_task", 0x1d, 0x1000, ra_task, 0);
+    ra_on = 1;
+    rt_printf("audio: on, sync %d, endian %d, ring %08x+%x, StartCBR %d\n", ra_sync, (int)ra_endian, (int)madr, (int)msize, ra_start_cb);
+    return 0;
+}
+
+/* stop Canon's audio and let ra_task finish preparing; the writer still has to write the rest */
+static void ra_stop(void)
+{
+    if (!ra_started) return;
+    SoundDev_SetMovieStop(3);
+    for (int t = 0; t < 3000 && !ra_stop_cb; t += 10) msleep(10);
+    ra_stop_req = 1;
+    for (int t = 0; t < 5000 && ra_on && !ra_task_done; t += 10) msleep(10);
+    if (ra_stop_cb) SoundDev_SetAudioEnd(4);
+    else { ra_stuck = 1; rt_printf("audio: no stop confirmation from Canon: audio left on; power-cycle before the next clip\n"); }
+    if (ra_skip_logged) rt_printf("audio: first frame %d us after audio start, %d bytes skipped\n", ra_skip_d, (int)(((uint32_t)(ra_skip_d > 0 ? ra_skip_d : 0) * 48ULL / 1000) * 4));
+    if (ra_task_alive) rt_printf("audio: ra_task still running after stop (audio blocks kept allocated)\n");
+    rt_printf("audio: %d blocks, %d.%03d s, %d chunks lost (queue %d), err CBR %d\n", (int)ra_count,
+              (int)(ra_samples / 48000), (int)(ra_samples % 48000 / 48), (int)ra_lost, (int)ra_qover, ra_err_cb);
+    ra_started = 0;
+}
+
 static volatile int w_stop, w_done, w_err;
 static volatile uint64_t w_bytes;      /* > 4 GB in a 40 s run */
 static int w_part, w_n;
@@ -770,6 +997,13 @@ static void rt_writer(void *unused)
     int wi = 0;
     for (;;)
     {
+        if (ra_on && ra_ready[ra_widx])        /* v19: prepared audio block first (small, keeps the A/V order) */
+        {
+            int r = ra_write_one(w_file);
+            if (r < 0) { w_err = r; break; }
+            w_fsize += r; w_bytes += r;
+            continue;
+        }
         if (ch[wi].state == CH_FULL)
         {
             uint32_t bytes = ch[wi].n * slot_bytes;
@@ -777,6 +1011,7 @@ static void rt_writer(void *unused)
             {
                 if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
                 else FIO_CloseFile(w_file);
+                ra_part_count = 0;
                 rt_part_name(w_name, rt_run_id, ++w_part);
                 w_file = FIO_CreateFile(w_name);
                 w_fsize = 0; w_part_frames = 0;
@@ -819,7 +1054,7 @@ static int c_mode, c_dur_s;
 static uint32_t c_src, c_est;
 static int nfr, frames, drops, dups, missed, late, tears, topchg, botchg, ntl, irq_timeouts;
 static int cur, next_fill, first_drop_ms, c_abort;
-static uint32_t first_t, next_tl, max_used, dmax, dsum, last_rec_bot, t_last_ev;
+static uint32_t next_tl, max_used, dmax, dsum, last_rec_bot, t_last_ev;   /* first_t: declared above (v19) */
 static volatile int c_done;
 static struct semaphore *rt_csem;
 
@@ -1130,6 +1365,11 @@ static void rt_task(void *unused)
     if (mode < 0) { snprintf(rt_last, sizeof(rt_last), "RT%02d: no frame sync", rt_run_id); goto done; }
     if (mode == SYNC_TIMER) rt_unhook();
 
+    if (rr_audio && c_mlv && !ra_buf)       /* v19: audio blocks before the video chunks take the memory */
+    {
+        ra_buf = fio_malloc(RA_NBUF * RA_BLK);
+        if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
+    }
     rt_alloc_chunks();
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
@@ -1160,12 +1400,14 @@ static void rt_task(void *unused)
     w_file = FIO_CreateFile(w_name);
     if (!w_file) { rt_printf("cannot create %s\n", w_name); goto done; }
     w_part = 0; w_fsize = 0; w_bytes = 0; w_n = 0; w_us_sum = 0; w_us_min = 0xFFFFFFFF; w_us_max = 0; w_stop = 0; w_err = 0; w_done = 0; w_part_frames = 0;
+    ra_bytes_written = 0;               /* v19: also when this clip has no audio */
     if (c_mlv && !mlv_hdr) mlv_hdr = malloc(RT_HDR_BYTES);
     if (c_mlv && !mlv_hdr) { rt_printf("no memory for the MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
     if (c_mlv)
     {
         rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
         mlv_guid = ((uint64_t)rt_us() << 32) ^ (uint64_t)get_ms_clock() * 2654435761u ^ rt_run_id;
+        if (rr_audio && ra_buf) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
         rt_mlv_build_hdr(0, 0);
         if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES)
         { rt_printf("cannot write MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
@@ -1196,6 +1438,18 @@ static void rt_task(void *unused)
 
     /* hand over the partial chunk, stop the writer */
     if (cur >= 0) { if (ch[cur].n) ch[cur].state = CH_FULL; else ch[cur].state = CH_FREE; }
+    if (ra_started)                         /* v19: last audio chunks, written before the writer stops */
+    {
+        ra_stop();
+        give_semaphore(rt_wsem);
+        for (int i = 0; i < 500; i++)
+        {
+            int pending = 0;
+            for (int k = 0; k < RA_NBUF; k++) pending += ra_ready[k] != 0;
+            if (!pending || w_done) break;
+            msleep(10);
+        }
+    }
     uint32_t ts = rt_us();
     w_stop = 1;
     give_semaphore(rt_wsem);
@@ -1215,7 +1469,7 @@ static void rt_task(void *unused)
     /* summary */
     uint64_t wus = w_us_sum;
     uint32_t wmax = w_us_max, wmin = w_n ? w_us_min : 0;
-    uint64_t wb = w_bytes;
+    uint64_t wb = w_bytes - ra_bytes_written;   /* v19: video only (audio writes are not timed, nor frames) */
     uint32_t est = mode == SYNC_IRQ ? sv_irq_med : c_est;
     /* v17.1: data rate from the nominal frame rate when the measured period is near one (timer mode's adaptive
      * estimate drifted on 4K runs: "needed 111.6" for 1080 14-bit at 29.97p, really 103.7) */
@@ -1279,6 +1533,10 @@ static void rt_task(void *unused)
     }
 
 done:
+    if (ra_started) ra_stop();              /* v19: error paths */
+    if (ra_on) rt_printf("audio: %d blocks written (%d KB)\n", (int)ra_count, (int)(ra_bytes_written >> 10));
+    ra_on = 0;
+    if (ra_buf && w_done && !ra_task_alive) { fio_free(ra_buf); ra_buf = 0; }   /* never under a live ra_task */
     rt_unhook();
     rt_pack_restore();
     if (lv_raw) call("lv_save_raw", 0);
@@ -1721,6 +1979,13 @@ static struct menu_entry rr_menu[] = {
                 .max     = 3,
                 .choices = CHOICES("14-bit", "12-bit", "10-bit"),   /* v18.1: ML shows choices[value - min] */
                 .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
+            },
+            {
+                .name    = "Audio",
+                .priv    = &rr_audio,
+                .max     = 1,
+                .help    = "Records the camera's mic into the MLV (48 kHz stereo, MLV App plays it).",
+                .help2   = "Needs Canon Sound recording Auto or Manual. New: check sync with a clap.",
             },
             {
                 .name    = "Crop marker",
