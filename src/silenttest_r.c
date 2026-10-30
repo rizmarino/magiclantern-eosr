@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.4"
+#define ST_VER              "v2.5-diag"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -71,9 +71,12 @@ struct st_ev {
 static const uint32_t st_props[] = {
     PROP_SILENT_SHUTTER, PROP_DRIVE, PROP_LAST_JOB_STATE, PROP_RELEASE_COUNTER,
     PROP_MECHA_COUNTER, PROP_FILE_NUMBER_A, PROP_SHOOTING_MODE, PROP_SHUTTER, PROP_BURST_COUNT,
+    PROP_LV_MOVIE_SELECT, PROP_SHOOTING_TYPE, PROP_VIDEO_MODE,
 };
-static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV", "BURST" };
-enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_BURST, P_N };
+static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV", "BURST",
+                                  "MVSEL", "STYPE", "VMODE" };
+enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_BURST,
+       P_MVSEL, P_STYPE, P_VMODE, P_N };
 
 static volatile uint32_t st_cur[P_N];   /* latest value (first word), kept even when not armed */
 static volatile uint16_t st_cur_len[P_N];
@@ -143,6 +146,11 @@ REGISTER_PROP_HANDLER(PROP_FILE_NUMBER_A,   st_prop);
 REGISTER_PROP_HANDLER(PROP_SHOOTING_MODE,   st_prop);
 REGISTER_PROP_HANDLER(PROP_SHUTTER,         st_prop);
 REGISTER_PROP_HANDLER(PROP_BURST_COUNT,     st_prop);     /* v1.9: free shots in the buffer (viewfinder counter) */
+/* v2.5-diag: which property tells photo from movie on the R? (shooting_mode stays 3 in movie mode, so ML's
+ * is_movie_mode() is always false there and the 16:9 overlay offsets are never used) */
+REGISTER_PROP_HANDLER(PROP_LV_MOVIE_SELECT, st_prop);
+REGISTER_PROP_HANDLER(PROP_SHOOTING_TYPE,   st_prop);
+REGISTER_PROP_HANDLER(PROP_VIDEO_MODE,      st_prop);
 #endif
 
 /* ---- Canon capture-control struct, sampled by the run task ---- */
