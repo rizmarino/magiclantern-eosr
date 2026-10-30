@@ -4309,6 +4309,15 @@ static void zdiag_tick(void)
         }
         ZD("\n dispvram");
         for (int i = 0; i < 0xC4; i += 4) ZD(" %x", *(uint32_t *)(DISP_VRAM_STRUCT_PTR + i));
+        /* riz 2026-10-30: pitch-independent profile for the EVF movie layout: avg Y of 16 pixels every 16 KB over
+         * the whole buffer as ML sizes it (1280x720x2 on the EVF), so padding (Y=255) shows wherever it is */
+        ZD("\n lvlinear(kB:avgY) evf=%d", R_LV_ON_EVF());
+        for (int off = 0; off < vram_lv.height * vram_lv.pitch; off += 16384)
+        {
+            int s = 0;
+            for (int k = 0; k < 16; k++) s += (((uint32_t *)(lvram + off))[k] >> 8) & 0xFF;
+            ZD(" %d:%d", off >> 10, s / 16);
+        }
         ZD("\n");
     }
 
