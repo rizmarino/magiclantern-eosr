@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v2.3"
+#define ST_VER              "v2.4"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -717,18 +717,11 @@ static void st_fps_table(uint32_t *o)
 }
 
 #ifdef ST_REMAP
-/* every step of the first-use setup is appended to ML/MMUTEST.TXT (file closed after each line) */
+/* v2.4: the first-use setup records its last step in RAM only (shown with an error); no card I/O */
+static char st_mmu_stage[64];
 static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
 {
-    /* v2.1: skip the line rather than touch the card while a burst may still be writing */
-    if (st_last_frame_ms && (int)(get_ms_clock() - st_last_frame_ms) < 30000) return;
-#ifdef CARD_LED_ADDRESS
-    if (*(volatile uint32_t *)CARD_LED_ADDRESS == LEDON) return;
-#endif
-    char line[96];
-    int n = snprintf(line, sizeof(line), "%d ms %s %x %x\n", (int)get_ms_clock(), stage, (unsigned)a, (unsigned)b);
-    FILE *f = FIO_CreateFileOrAppend("ML/MMUTEST.TXT");
-    if (f) { FIO_WriteFile(f, line, n); FIO_CloseFile(f); }
+    snprintf(st_mmu_stage, sizeof(st_mmu_stage), "%s %x %x", stage, (unsigned)a, (unsigned)b);
 }
 
 #define ST_ROMPAGE  0xE0F16000          /* 4 KB page holding both tables' seq 61/62 entries */
@@ -799,23 +792,24 @@ static int st_remap_set(int v)
     return bad ? -8 : 0;
 }
 
-/* v1.9/v2.0: full-buffer fallback. v1.8 froze when a long 7 fps burst filled the buffer and it started to clear
- * (short bursts, and full buffers at Canon's 5.0 even with the remap on, are fine). v1.9 switched on PROP_BURST_COUNT
- * <= 3 and still froze (unknown whether it fired). v2.0 also counts frames: after "Fast frames" frames of one burst,
- * Canon's 500 goes back for the rest of it; the patched value returns when the burst has ended (no new frame for
- * 800 ms). Plain memory writes into the RAM page; events kept in RAM and printed by Burst log. */
-static int st_fb_sel = 0;               /* menu: buffer-count trigger; v2.2 default OFF (the freezes were Burst log) */
-static int st_fast_sel = 0;             /* menu: fast frames per burst: All / 10 / 15 / 20; v2.2 default All */
+/* Fast frames (optional): after N frames of one burst, Canon's 500 goes back for the rest of it; the patched value
+ * returns when the burst has ended (no new frame for 800 ms). Plain memory writes into the RAM page. Default All.
+ * (v1.9's buffer-count trigger was removed in v2.4: the freezes it targeted were Burst log's early card write.) */
+#ifdef ST_HOST
+static int st_fast_sel;
+#else
+static CONFIG_INT("silent.burst.fast", st_fast_sel, 0);
+#endif
 static const int st_fast_n[] = { 0, 10, 15, 20 };
-static volatile int st_fb_active, st_fb_count, st_fb_min = 999;
+static volatile int st_fb_active, st_fb_count;
 #define ST_FBE_MAX 32
-static struct { uint32_t ms; uint16_t on, why; uint32_t rel, bc; } st_fbe[ST_FBE_MAX];
+static struct { uint32_t ms; uint16_t on; uint32_t rel; } st_fbe[ST_FBE_MAX];
 static volatile int st_fbe_n;
-static void st_fb_note(int on, int why, uint32_t rel, int bc)
+static void st_fb_note(int on, uint32_t rel)
 {
     int i = st_fbe_n;
     if (i >= ST_FBE_MAX) return;
-    st_fbe[i].ms = get_ms_clock(); st_fbe[i].on = on; st_fbe[i].why = why; st_fbe[i].rel = rel; st_fbe[i].bc = bc;
+    st_fbe[i].ms = get_ms_clock(); st_fbe[i].on = on; st_fbe[i].rel = rel;
     st_fbe_n = i + 1;
 }
 static void st_fb_task(void *unused)
@@ -828,8 +822,6 @@ static void st_fb_task(void *unused)
         if (!st_mmu_on) continue;
         uint32_t now = get_ms_clock(), rel = st_cur[P_RELCNT];
         if (!primed) { last_rel = rel; primed = 1; continue; }
-        int have_bc = st_cnt[P_BURST] != 0, bc = (int)st_cur[P_BURST];
-        if (have_bc && bc < st_fb_min) st_fb_min = bc;
         if (rel != last_rel)
         {
             if (!in_burst || (int)(now - last_change) > 800) { in_burst = 1; burst_rel0 = last_rel; }
@@ -838,22 +830,21 @@ static void st_fb_task(void *unused)
         }
         else if (in_burst && (int)(now - last_change) > 800)
             in_burst = 0;
+        if (st_fast_sel < 0 || st_fast_sel >= COUNT(st_fast_n)) st_fast_sel = 0;
         int nfast = st_fast_n[st_fast_sel];
         int frames = in_burst ? (int)(rel - burst_rel0) : 0;
-        int want_slow = st_fps_applied && ((nfast && frames >= nfast) || (st_fb_sel && have_bc && bc <= 3));
-        int want_fast = st_fps_applied && !in_burst && (!have_bc || bc >= 8 || !st_fb_sel);
-        if (!st_fb_active && want_slow)
+        if (!st_fb_active && st_fps_applied && nfast && frames >= nfast)
         {
             st_remap_write(500);
             st_fb_active = 1;
             st_fb_count++;
-            st_fb_note(1, (nfast && frames >= nfast) ? 1 : 2, rel, bc);
+            st_fb_note(1, rel);
         }
-        else if (st_fb_active && (want_fast || !st_fps_applied))
+        else if (st_fb_active && (!in_burst || !st_fps_applied))
         {
             st_remap_write(st_fps_val[st_fps_applied]);
             st_fb_active = 0;
-            st_fb_note(0, 0, rel, bc);
+            st_fb_note(0, rel);
         }
     }
 }
@@ -893,7 +884,7 @@ static void st_fps_boot_task(void *unused)
         FIO_RemoveFile(ST_FPS_MARKER);
         st_fps_saved = 0;
         snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-apply skipped (last one didn't finish)");
-        NotifyBox(5000, "Silent H fps: auto-apply skipped, back to Canon 5.0");
+        NotifyBox(5000, "Silent burst: auto-apply skipped, back to Canon 5.0");
         return;
     }
     FILE *f = FIO_CreateFile(ST_FPS_MARKER);
@@ -906,7 +897,7 @@ static void st_fps_boot_task(void *unused)
         snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-apply ERROR %x", st_fps_err);
     else
         snprintf(st_fps_boot, sizeof(st_fps_boot), "auto-applied at boot");
-    NotifyBox(4000, "Silent H fps %d.%d %s", v / 100, (v / 10) % 10, st_fps_err ? "FAILED" : "applied");
+    NotifyBox(4000, "Silent burst %d.%d fps %s", v / 100, (v / 10) % 10, st_fps_err ? "FAILED" : "applied");
 }
 #endif
 
@@ -965,12 +956,10 @@ static void st_burst_task(void *unused)
 
     int total = (int)(st_cur[P_RELCNT] - rel0);
 #ifdef ST_REMAP
-    st_printf("v2.0 fallback: fast frames %d (0 = all), buffer trigger %s; switched to 5.0 %d time(s), lowest BURST %d\n",
-              st_fast_n[st_fast_sel], st_fb_sel ? "ON" : "OFF", st_fb_count, st_fb_min);
+    st_printf("fast frames %d (0 = all): switched to 5.0 %d time(s) so far\n", st_fast_n[st_fast_sel], st_fb_count);
     for (int i = 0; i < st_fbe_n; i++)
-        st_printf("  fallback %d ms: %s (%s), RELCNT %d, BURST %d\n", (int)(st_fbe[i].ms - st_t0),
-                  st_fbe[i].on ? "-> 5.0" : "-> patched", st_fbe[i].why == 1 ? "frame count" : st_fbe[i].why == 2 ? "buffer" : "burst ended",
-                  (int)st_fbe[i].rel, (int)st_fbe[i].bc);
+        st_printf("  %d ms: %s, RELCNT %d\n", (int)(st_fbe[i].ms - st_t0), st_fbe[i].on ? "-> 5.0" : "-> patched",
+                  (int)st_fbe[i].rel);
     st_fbe_n = 0;
 #endif
     st_printf("summary: %s; %d frames in the log window, %d in total; MECHA +%d; SILENT=%x DRIVE=%x; final idle %s\n",
@@ -1066,31 +1055,35 @@ static MENU_SELECT_FUNC(st_fps_select)
     st_fps_apply(st_fps_sel);
 }
 
-#ifdef ST_REMAP
-static MENU_UPDATE_FUNC(st_fb_update)
-{
-    MENU_SET_WARNING(MENU_WARN_INFO, "Switched %d time(s), now %s, lowest buffer count %d%s", st_fb_count,
-                     st_fb_active ? "5.0" : "patched", st_fb_min, st_cnt[P_BURST] ? "" : " (no buffer data yet)");
-}
-#endif
 
 static MENU_UPDATE_FUNC(st_fps_update)
 {
-    uint32_t tb[ST_FPS_N];
-    st_fps_table(tb);
     int v = st_fps_val[st_fps_applied];
     if (st_fps_err)
     {
         MENU_SET_VALUE("ERROR %x", st_fps_err);
-        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Patch failed (%x); table %d %d %d %d. Power cycle.", st_fps_err,
-                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3]);
+#ifdef ST_REMAP
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Setup failed (%x, %s). Power cycle.", st_fps_err, st_mmu_stage);
+#else
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Not available in this build.");
+#endif
+        return;
     }
-    else
-    {
-        MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
-        MENU_SET_WARNING(MENU_WARN_INFO, "Table %d %d %d %d. Saved, re-applied at boot. %s",
-                         (int)tb[0], (int)tb[1], (int)tb[2], (int)tb[3], st_fps_boot);
-    }
+    MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
+    /* PROP_SILENT_SHUTTER 1 = on, PROP_DRIVE 4 = High-speed continuous */
+    if (st_cnt[P_SILENT] && st_cur[P_SILENT] != 1)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Canon Silent shutter is off: this only affects silent bursts.");
+    else if (st_cnt[P_DRIVE] && st_cur[P_DRIVE] != 4)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Set Canon drive to High-speed continuous.");
+    else if (st_fps_applied)
+        MENU_SET_WARNING(MENU_WARN_INFO, "Saved. C-RAW: avoid holding 10 s+ past a full buffer.");
+}
+
+static MENU_UPDATE_FUNC(st_burst_update)
+{
+    int v = st_fps_val[st_fps_applied];
+    if (st_fps_err) MENU_SET_VALUE("ERROR");
+    else MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
 }
 
 static MENU_UPDATE_FUNC(st_update)
@@ -1107,7 +1100,7 @@ static struct menu_entry st_menu[] = {
     {
         .name   = "Silent shutter test",
         .select = menu_open_submenu,
-        .help   = "Read-only diagnostics for Canon's electronic (silent) shutter.",
+        .help   = "Test tools for Canon's electronic (silent) shutter (speed: Shoot > Silent burst).",
         .help2  = "Logs to ML/SILENT.TXT; Canon log to LOGnnn.LOG on the card root.",
         .children = (struct menu_entry[]) {
             {
@@ -1145,35 +1138,6 @@ static struct menu_entry st_menu[] = {
                 .choices = CHOICES("5", "10", "20", "200"),
             },
             {
-                .name    = "Silent H fps",
-                .priv    = &st_fps_sel,
-                .max     = 8,
-                .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5", "8.0", "9.0", "10.0"),
-                .select  = st_fps_select,
-                .update  = st_fps_update,
-                .help    = "Patches Canon's silent High-speed burst rate (RAM copy of ROM).",
-                .help2   = "Saved; re-applied ~5 s after boot. Canon 5.0 = off.",
-            },
-#ifdef ST_REMAP
-            {
-                .name    = "Fast frames",
-                .priv    = &st_fast_sel,
-                .max     = 3,
-                .choices = CHOICES("All", "10", "15", "20"),
-                .help    = "Optional: frames per burst at the patched rate, then Canon 5.0",
-                .help2   = "until you let go. All = whole burst (tested OK with a full buffer).",
-            },
-            {
-                .name    = "Full buffer -> 5.0",
-                .priv    = &st_fb_sel,
-                .max     = 1,
-                .choices = CHOICES("OFF", "ON"),
-                .update  = st_fb_update,
-                .help    = "Optional: back to Canon 5.0 when <= 3 shots fit in the buffer,",
-                .help2   = "patched rate again at >= 8. Not needed (tested OK without).",
-            },
-#endif
-            {
                 .name   = "Burst log",
                 .select = st_burst_select,
                 .update = st_update,
@@ -1192,8 +1156,42 @@ static struct menu_entry st_menu[] = {
     },
 };
 
+static struct menu_entry st_shoot_menu[] = {
+    {
+        .name   = "Silent burst",
+        .select = menu_open_submenu,
+        .update = st_burst_update,
+        .help   = "Faster burst for Canon's Silent shutter + High-speed continuous.",
+        .help2  = "Canon's own limit is 5 fps; ~7 fps is the camera's real maximum.",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "Burst rate",
+                .priv    = &st_fps_sel,
+                .max     = 8,
+                .choices = CHOICES("Canon 5.0", "5.5", "6.0", "6.5", "7.0", "7.5", "8.0", "9.0", "10.0"),
+                .select  = st_fps_select,
+                .update  = st_fps_update,
+                .help    = "Frames per second for silent H bursts. 7.0 = practical max;",
+                .help2   = "7.5-10 just run at ~7. RAM only; Canon 5.0 = off. Saved.",
+            },
+#ifdef ST_REMAP
+            {
+                .name    = "Fast frames",
+                .priv    = &st_fast_sel,
+                .max     = 3,
+                .choices = CHOICES("All", "10", "15", "20"),
+                .help    = "Frames per burst at the faster rate, then Canon 5.0 until",
+                .help2   = "you let go. All = whole burst. 15/20 for long C-RAW holds.",
+            },
+#endif
+            MENU_EOL
+        },
+    },
+};
+
 static void st_init(void *unused)
 {
+    menu_add("Shoot", st_shoot_menu, COUNT(st_shoot_menu));
     menu_add("Debug", st_menu, COUNT(st_menu));
 #ifdef ST_REMAP
     task_create("st_fps_boot", 0x1e, 0x1000, st_fps_boot_task, 0);
