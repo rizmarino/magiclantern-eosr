@@ -50,7 +50,7 @@ extern void dm_set_store_level(uint32_t class, uint32_t level); /* stubs.S 0xE05
 #include "st_host.h"
 #endif
 
-#define ST_VER              "v1.8"
+#define ST_VER              "v1.9"
 #define PROP_SILENT_SHUTTER 0x8004007A  /* GUI_SetSilentShutter -> prop_request_change(0x80040032 + 0x48) */
 #define ST_SCS              0x7368      /* Warp/CaptureState struct (RAM .data) */
 
@@ -70,10 +70,10 @@ struct st_ev {
 /* properties logged (all read-only) */
 static const uint32_t st_props[] = {
     PROP_SILENT_SHUTTER, PROP_DRIVE, PROP_LAST_JOB_STATE, PROP_RELEASE_COUNTER,
-    PROP_MECHA_COUNTER, PROP_FILE_NUMBER_A, PROP_SHOOTING_MODE, PROP_SHUTTER,
+    PROP_MECHA_COUNTER, PROP_FILE_NUMBER_A, PROP_SHOOTING_MODE, PROP_SHUTTER, PROP_BURST_COUNT,
 };
-static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV" };
-enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_N };
+static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV", "BURST" };
+enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_BURST, P_N };
 
 static volatile uint32_t st_cur[P_N];   /* latest value (first word), kept even when not armed */
 static volatile uint16_t st_cur_len[P_N];
@@ -139,6 +139,7 @@ REGISTER_PROP_HANDLER(PROP_MECHA_COUNTER,   st_prop);
 REGISTER_PROP_HANDLER(PROP_FILE_NUMBER_A,   st_prop);
 REGISTER_PROP_HANDLER(PROP_SHOOTING_MODE,   st_prop);
 REGISTER_PROP_HANDLER(PROP_SHUTTER,         st_prop);
+REGISTER_PROP_HANDLER(PROP_BURST_COUNT,     st_prop);     /* v1.9: free shots in the buffer (viewfinder counter) */
 #endif
 
 /* ---- Canon capture-control struct, sampled by the run task ---- */
@@ -255,7 +256,7 @@ static const char *st_note_name(uint32_t id)
     }
 }
 
-static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO; }   /* counters in decimal */
+static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO || k == P_BURST; }   /* counters in decimal */
 
 static void st_dump_state(const char *tag)
 {
@@ -724,15 +725,49 @@ static int st_remap_init(void)
 }
 
 /* write fps100 for seq 61/62 into both tables through the RAM page; read back through the ROM address */
-static int st_remap_set(int v)
+static int st_remap_write(int v)
 {
     for (int i = 0; i < ST_FPS_N; i++)
         *(volatile uint32_t *)(st_mmu_page + (st_fps_addr[i] - ST_ROMPAGE)) = v;
     dcache_clean((uint32_t)st_mmu_page, 0x1000);
     int bad = 0;
     for (int i = 0; i < ST_FPS_N; i++) bad += *(volatile uint32_t *)st_fps_addr[i] != (uint32_t)v;
+    return bad;
+}
+
+static int st_remap_set(int v)
+{
+    int bad = st_remap_write(v);
     st_mmu_log("set", v, bad);
     return bad ? -8 : 0;
+}
+
+/* v1.9: full-buffer fallback. v1.8 froze when a long 7 fps burst filled the buffer and it started to clear (short
+ * bursts and full buffers at Canon's 5.0 are fine). While the patch is on, a task watches PROP_BURST_COUNT (free
+ * shots in the buffer); at <= 3 it writes Canon's 500 back (plain memory write), and above 8 the patched value again. */
+static int st_fb_sel = 1;               /* menu: ON */
+static volatile int st_fb_active, st_fb_count, st_fb_min = 999;
+static void st_fb_task(void *unused)
+{
+    for (;;)
+    {
+        msleep(20);
+        if (!st_mmu_on) continue;
+        int bc = (int)st_cur[P_BURST];
+        if (st_cnt[P_BURST] == 0) continue;     /* property never delivered: no data, do nothing */
+        if (bc < st_fb_min) st_fb_min = bc;
+        if (!st_fb_active && st_fb_sel && st_fps_applied && bc <= 3)
+        {
+            st_remap_write(500);
+            st_fb_active = 1;
+            st_fb_count++;
+        }
+        else if (st_fb_active && (bc >= 8 || !st_fb_sel || !st_fps_applied))
+        {
+            st_remap_write(st_fps_val[st_fps_applied]);
+            st_fb_active = 0;
+        }
+    }
 }
 #endif
 
@@ -841,6 +876,10 @@ static void st_burst_task(void *unused)
     st_end(run);
 
     int total = (int)(st_cur[P_RELCNT] - rel0);
+#ifdef ST_REMAP
+    st_printf("full-buffer fallback: %s, switched to 5.0 %d time(s) so far, lowest BURST seen %d\n",
+              st_fb_sel ? "ON" : "OFF", st_fb_count, st_fb_min);
+#endif
     st_printf("summary: %s; %d frames in the log window, %d in total; MECHA +%d; SILENT=%x DRIVE=%x; final idle %s\n",
               why, win, total, (int)(st_cur[P_MECHA] - mech0), (unsigned)st_cur[P_SILENT], (unsigned)st_cur[P_DRIVE],
               idle > 0 ? "ok" : "TIMEOUT");
@@ -934,6 +973,14 @@ static MENU_SELECT_FUNC(st_fps_select)
     st_fps_apply(st_fps_sel);
 }
 
+#ifdef ST_REMAP
+static MENU_UPDATE_FUNC(st_fb_update)
+{
+    MENU_SET_WARNING(MENU_WARN_INFO, "Switched %d time(s), now %s, lowest buffer count %d%s", st_fb_count,
+                     st_fb_active ? "5.0" : "patched", st_fb_min, st_cnt[P_BURST] ? "" : " (no buffer data yet)");
+}
+#endif
+
 static MENU_UPDATE_FUNC(st_fps_update)
 {
     uint32_t tb[ST_FPS_N];
@@ -1014,6 +1061,17 @@ static struct menu_entry st_menu[] = {
                 .help    = "Patches Canon's silent High-speed burst rate (RAM copy of ROM).",
                 .help2   = "Saved; re-applied ~5 s after boot. Canon 5.0 = off.",
             },
+#ifdef ST_REMAP
+            {
+                .name    = "Full buffer -> 5.0",
+                .priv    = &st_fb_sel,
+                .max     = 1,
+                .choices = CHOICES("OFF", "ON"),
+                .update  = st_fb_update,
+                .help    = "While patched: back to Canon 5.0 when <= 3 shots fit in the buffer,",
+                .help2   = "patched rate again when >= 8 fit.",
+            },
+#endif
             {
                 .name   = "Burst log",
                 .select = st_burst_select,
@@ -1038,6 +1096,7 @@ static void st_init(void *unused)
     menu_add("Debug", st_menu, COUNT(st_menu));
 #ifdef ST_REMAP
     task_create("st_fps_boot", 0x1e, 0x1000, st_fps_boot_task, 0);
+    task_create("st_fb", 0x1d, 0x800, st_fb_task, 0);
 #endif
 }
 
