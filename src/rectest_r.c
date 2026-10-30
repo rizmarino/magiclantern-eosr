@@ -149,7 +149,12 @@ static volatile int sp_kept, sp_saved, sp_pre_kept;   /* frames kept for DNG, DN
 static volatile int sp_half;            /* v3.8: half-press held (0x7D seen, 0x7E not yet) */
 static volatile int sp_n85;             /* lone 0x85 events in a row (full press held: see sp_keys) */
 static volatile uint32_t sp_t85;        /* ms of the last 0x85 */
-static volatile int sp_wait_rel;        /* a session ended with the full press still held: no new one until it's let go */
+static volatile int sp_wait_rel;
+/* v3.9: bmp.c skips ML display refreshes while this is set. v3.8 camera test: copies 24-26 ms until the status text
+ * started changing (~0.05-0.25 s after the press), then 31-34 ms and torn: each refresh converts ML's whole layer
+ * (zebras are off while the engine runs) and competes for memory bandwidth with the EDMAC copy. */
+volatile int r_refresh_hold;
+static uint32_t sp_ref0, sp_ref_cap;   /* refreshes since the press / during capture */        /* a session ended with the full press still held: no new one until it's let go */
 #define SP_TICK_GAP_MS  250
 /* full press let go but the half-press still held: the 0x85 stream stops */
 static inline void sp_check_tick_end(void)
@@ -1490,7 +1495,7 @@ static int sp_pick_dir(void)
 }
 
 /* same sampling as rt_probe, on a copied frame (full-frame copy: same pitch as MEM1) */
-#define SP_NPROBE 32
+#define SP_NPROBE 64                    /* v3.9: camera tears were as narrow as 31 rows */
 static uint32_t sp_midtear;
 static uint32_t sp_rowhash(uint32_t base, uint32_t row)
 {
@@ -1513,6 +1518,8 @@ static int sp_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
     if (trig && !sp_trig_cap)           /* press: the ring frames become kept frames */
     {
         sp_trig_cap = 1;
+        r_refresh_hold = 1;             /* v3.9: no display refresh until capture ends */
+        sp_ref0 = r_refresh_count;
         for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING) { ch[i].state = CH_FULL; sp_pre_kept++; sp_kept++; }
         sp_ring_n = 0;
         give_semaphore(rt_wsem);
@@ -1990,6 +1997,8 @@ static void rt_task(void *unused)
     if (cur >= 0) { if (ch[cur].n) ch[cur].state = CH_FULL; else ch[cur].state = CH_FREE; }
     if (c_dng)                              /* v20: drop unused ring frames; free the DMA engine before the slow DNG writes */
     {
+        sp_ref_cap = sp_trig_cap ? r_refresh_count - sp_ref0 : 0;
+        r_refresh_hold = 0;
         sp_ready = 0;
         for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING || ch[i].state == CH_FILL) ch[i].state = CH_FREE;
         if (!c_abort) rt_end();
@@ -2083,9 +2092,9 @@ static void rt_task(void *unused)
     {
         int n = sp_saved, nr = MIN(n, SP_MAXREC);
         rt_printf("SP RESULT: %s %dx%d %d-bit, %d kept (%d before the press), %d DNGs written, %d dropped (memory full), "
-                  "torn %d (mid-copy %d), swap check bad %d; swap avg %d max %d ms, card write avg %d max %d ms per DNG; writer err %d\n",
+                  "torn %d (mid-copy %d), display refreshes during capture %d, swap check bad %d; swap avg %d max %d ms, card write avg %d max %d ms per DNG; writer err %d\n",
                   sp_dir[0] ? sp_dir : "(no folder)", crop_w, crop_h, c_bpp, sp_kept, sp_pre_kept, n, drops, sp_torn,
-                  sp_midtear, sp_chk_bad, n ? sp_swap_us_sum / n / 1000 : 0, sp_swap_us_max / 1000, n ? sp_wr_us_sum / n / 1000 : 0,
+                  sp_midtear, sp_ref_cap, sp_chk_bad, n ? sp_swap_us_sum / n / 1000 : 0, sp_swap_us_max / 1000, n ? sp_wr_us_sum / n / 1000 : 0,
                   sp_wr_us_max / 1000, w_err);
         const int cap = 160 + nr * 96;
         char *b = malloc(cap);
@@ -2287,6 +2296,7 @@ static int sp_movie_lv(void) { return lv && lv_movie_select == LVMS_ENABLE_MOVIE
 static void sp_task(void *unused)
 {
     rt_task(0);                         /* synchronous; clears rt_busy */
+    r_refresh_hold = 0;                 /* any exit path */
     if (is_file(SP_PND)) FIO_RemoveFile(SP_PND);     /* session finished normally */
     if (sp_half && get_ms_clock() - sp_t85 < SP_TICK_GAP_MS) sp_wait_rel = 1;   /* memory full while held */
     sp_active = 0; sp_ready = 0; sp_trig = 0; sp_end = 0; sp_rel = 0;   /* key log: rr_status_task flushes it once idle */

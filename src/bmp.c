@@ -368,7 +368,12 @@ void refresh_yuv_from_rgb_task(void *unused)
     #endif
     TASK_LOOP
     {
+        #if defined(CONFIG_R)
+        extern volatile int r_refresh_hold;     /* riz: LV silent pictures hold refreshes while frames are copied */
+        if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON && !r_refresh_hold)
+        #else
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
+        #endif
         {
             #if defined(CONFIG_R)
             uint64_t t0 = get_us_clock();
