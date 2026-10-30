@@ -4184,7 +4184,7 @@ uint8_t *lv_window(uint8_t *base, uint32_t off)
  * overlays) and writes ML/ZEBDIAG.TXT. Read-only apart from the file. */
 static volatile int zdiag_samples_left = 0;
 static int zdiag_next_ms = 0;
-static char zdiag_buf[8192];
+static char zdiag_buf[12288];   /* riz: +4 KB for the movie geometry block */
 static int zdiag_len = 0;
 
 void zebra_diag_start(void)
@@ -4276,6 +4276,40 @@ static void zdiag_tick(void)
     else
     {
         ZD(" scan skipped (null buffer)\n");
+    }
+
+    /* riz 2026-10-30: movie-mode geometry (zebra bar at the bottom of the movie LV screen). First sample only:
+     * lv_movie_select (R: 1 photo, 2 movie), LV luma profile down the buffer, overlay rows ML has drawn on,
+     * and the DispVram struct words. */
+    if (zdiag_samples_left == 12 && lvram && bvram)
+    {
+        ZD(" geo lv_movie_select=%d\n lvrows(r:avgY)", lv_movie_select);
+        for (int r = 0; r < vram_lv.height; r += 22)
+        {
+            int s = 0;
+            for (int i = 0; i < 32; i++)
+                s += (((uint32_t *)(lvram + r * vram_lv.pitch))[(i * vram_lv.width / 32) >> 1] >> 8) & 0xFF;
+            ZD(" %d:%d", r, s / 32);
+        }
+        ZD("\n lvcols@mid(x:avgY)");
+        for (int x = 0; x < vram_lv.width; x += 64)
+        {
+            int s = 0;
+            for (int k = 0; k < 16; k++)
+                s += (((uint32_t *)(lvram + (k * vram_lv.height / 16) * vram_lv.pitch))[x >> 1] >> 8) & 0xFF;
+            ZD(" %d:%d", x, s / 16);
+        }
+        ZD("\n bmprows-drawn(y:nonzero words of 180)");
+        for (int y = os.y0; y < os.y_max; y += 16)
+        {
+            uint32_t *b_row = (uint32_t *)(bvram + BM_R(y));
+            int nz = 0;
+            for (int x = os.x0; x < os.x_max; x += 4) nz += b_row[x >> 2] != 0;
+            ZD(" %d:%d", y, nz);
+        }
+        ZD("\n dispvram");
+        for (int i = 0; i < 0xC4; i += 4) ZD(" %x", *(uint32_t *)(DISP_VRAM_STRUCT_PTR + i));
+        ZD("\n");
     }
 
     if (--zdiag_samples_left == 0)
