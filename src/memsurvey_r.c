@@ -163,6 +163,69 @@ out:
     ms_busy = 0;
 }
 
+/* ---- v3.13: SRM probe. Canon's still-capture ("1st job") buffers, borrowed one at a time and handed back at once:
+ * how many, how big, where. Static RE: lv-survey.md "SRM 1st job buffers on the R". */
+static void (*const SRM_Alloc1st)(void (*cbr)(void *, void *, uint32_t), void *ctx) = (void *)0xE04E41BF;
+static void (*const SRM_Free1st)(void *buf, void *cbr, void *ctx)                    = (void *)0xE04E7591;
+#define MS_SRM_MAX 4
+static struct semaphore *ms_srm_sem;
+static void *volatile ms_srm_buf[MS_SRM_MAX + 1];
+static volatile uint32_t ms_srm_sz[MS_SRM_MAX + 1], ms_srm_cb;
+static void ms_srm_cbr(void *ctx, void *buf, uint32_t size)
+{
+    int i = (int)ctx;
+    if (i >= 0 && i <= MS_SRM_MAX) { ms_srm_buf[i] = buf; ms_srm_sz[i] = size; }
+    ms_srm_cb++;
+    give_semaphore(ms_srm_sem);
+}
+
+static void ms_srm_task(void *unused)
+{
+    for (int i = 0; i < 300 && gui_menu_shown(); i++) msleep(100);
+    msleep(1500);
+    ms_log = malloc(MS_LOG);
+    if (!ms_log) { ms_busy = 0; return; }
+    ms_len = 0;
+    if (rawrec_running()) { NotifyBox(4000, "SRM probe: recorder / silent session busy"); goto out; }
+    if (!ms_srm_sem) ms_srm_sem = create_named_semaphore("ms_srm", SEM_CREATE_LOCKED);
+    for (int i = 0; i <= MS_SRM_MAX; i++) { ms_srm_buf[i] = 0; ms_srm_sz[i] = 0; }
+    ms_srm_cb = 0;
+    ms_printf("=== SRM probe: lv=%d lv_movie_select=%d (2 = movie) video_mode res %d\n", lv ? 1 : 0, lv_movie_select,
+              video_mode_resolution);
+    int n = 0;
+    uint32_t total = 0;
+    for (int i = 0; i < MS_SRM_MAX; i++)
+    {
+        uint32_t t0 = get_ms_clock();
+        SRM_Alloc1st(ms_srm_cbr, (void *)i);
+        int r = take_semaphore(ms_srm_sem, 1000);
+        if (r) { ms_printf("  request %d: no buffer within 1 s (memory full or refused)\n", i); break; }
+        ms_printf("  buffer %d: %08x, %d KB (callback after %d ms)\n", i, (uint32_t)ms_srm_buf[i], ms_srm_sz[i] / 1024,
+                  get_ms_clock() - t0);
+        total += ms_srm_sz[i];
+        n++;
+    }
+    msleep(300);
+    for (int i = 0; i < n; i++) { SRM_Free1st(ms_srm_buf[i], 0, 0); msleep(50); }
+    msleep(500);
+    if (ms_srm_buf[n]) { ms_printf("  late buffer %d arrived after the timeout: %08x, freeing it\n", n, (uint32_t)ms_srm_buf[n]); SRM_Free1st(ms_srm_buf[n], 0, 0); }
+    ms_printf("SRM probe: %d buffers, %d KB total, %d callbacks; all freed\n", n, total / 1024, ms_srm_cb);
+    FILE *f = FIO_CreateFileOrAppend("ML/MEMSURV.TXT");
+    if (f) { FIO_WriteFile(f, ms_log, ms_len); FIO_CloseFile(f); }
+    NotifyBox(6000, "SRM probe: %d buffers x %d MB. ML/MEMSURV.TXT", n, n ? ms_srm_sz[0] >> 20 : 0);
+out:
+    free(ms_log);
+    ms_log = 0;
+    ms_busy = 0;
+}
+
+static void ms_srm_select(void *priv, int delta)
+{
+    if (ms_busy) return;
+    ms_busy = 1;
+    task_create("srm_probe", 0x1e, 0x2000, ms_srm_task, 0);
+}
+
 static void ms_select(void *priv, int delta)
 {
     if (ms_busy) return;
@@ -176,6 +239,12 @@ static struct menu_entry ms_menu[] = {
         .select = ms_select,
         .help   = "Read-only: shoot memory pieces, Canon heap, 1 GB usage map. SET, close menu, wait for the box.",
         .help2  = "Run once per mode (photo LV, movie FHD, movie 4K). Appends to ML/MEMSURV.TXT.",
+    },
+    {
+        .name   = "SRM probe",
+        .select = ms_srm_select,
+        .help   = "Borrows Canon's still-capture buffers (up to 4) and hands them back at once; logs size/address.",
+        .help2  = "SET, close menu, wait for the box (~2 s). Don't press the shutter meanwhile. ML/MEMSURV.TXT.",
     },
 };
 

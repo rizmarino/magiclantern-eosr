@@ -79,7 +79,7 @@ static void  (*const EdmacReset)(int port)                      = (void *)0xE053
 #define M1_PORT         3
 #define M1_CBR_CANON    0xE0638681      /* Mem1Path's complete CBR: bx lr */
 
-#define RT_MAXCH      16                /* v20: silent pictures take up to 16 one-frame chunks; video stays at 10 */
+#define RT_MAXCH      32                /* v20: silent pictures take one-frame chunks (v3.13: + SRM slots); video stays at 10 */
 #define RT_CHUNK_TGT  (16 * 1024 * 1024)
 #define RT_SPLIT      0x7F000000u       /* new part file before ~2.1 GB */
 #define RT_MAXFR      3000
@@ -306,6 +306,65 @@ static void rt_free_chunks(void)
     for (int i = 0; i < nch; i++) if (ch[i].suite) shoot_free_suite(ch[i].suite);
     memset(ch, 0, sizeof(ch));
     nch = 0;
+}
+
+/* ---- v3.13: Canon's still-capture (SRM "1st job") buffers as extra silent-picture memory (Shoot > LV silent
+ * pictures > Extra memory). Addresses from static RE (lv-survey.md "SRM 1st job buffers on the R"). Each buffer is
+ * carved into one-frame slots appended to ch[] (suite 0: not shoot memory). Freed in allocation order after the
+ * writer is done. Canon can't take a photo while they're held (Err 70 on other bodies); movie mode doesn't. */
+#ifndef RT_HOST
+static void (*const SRM_Alloc1st)(void (*cbr)(void *, void *, uint32_t), void *ctx) = (void *)0xE04E41BF;
+static void (*const SRM_Free1st)(void *buf, void *cbr, void *ctx)                    = (void *)0xE04E7591;
+#endif
+static CONFIG_INT("r.silent.lv.srm", sp_srm_sel, 0);    /* 0 OFF, 1 one buffer, 2 up to 4 */
+#define SP_SRM_MAX 4
+static void *volatile sp_srm_buf[SP_SRM_MAX + 1];
+static volatile uint32_t sp_srm_sz[SP_SRM_MAX + 1];
+static int sp_srm_n;
+static struct semaphore *sp_srm_sem;
+static void sp_srm_cbr(void *ctx, void *buf, uint32_t size)
+{
+    int i = (int)ctx;
+    if (i >= 0 && i <= SP_SRM_MAX) { sp_srm_buf[i] = buf; sp_srm_sz[i] = size; }
+    give_semaphore(sp_srm_sem);
+}
+static void sp_srm_alloc(int want)
+{
+    if (!sp_srm_sem) sp_srm_sem = create_named_semaphore("sp_srm", SEM_CREATE_LOCKED);
+    for (int i = 0; i <= SP_SRM_MAX; i++) { sp_srm_buf[i] = 0; sp_srm_sz[i] = 0; }
+    sp_srm_n = 0;
+    for (int i = 0; i < MIN(want, SP_SRM_MAX); i++)
+    {
+        SRM_Alloc1st(sp_srm_cbr, (void *)i);
+        if (take_semaphore(sp_srm_sem, 1000)) { rt_printf("SRM: request %d got no buffer within 1 s\n", i); break; }
+        rt_printf("SRM: buffer %d at %08x, %d KB\n", i, (uint32_t)sp_srm_buf[i], sp_srm_sz[i] / 1024);
+        sp_srm_n++;
+    }
+}
+static void sp_srm_free(void)
+{
+    for (int i = 0; i < sp_srm_n; i++) { SRM_Free1st(sp_srm_buf[i], 0, 0); msleep(20); }
+    if (sp_srm_n < SP_SRM_MAX && sp_srm_buf[sp_srm_n])        /* a request served after its timeout */
+    { rt_printf("SRM: late buffer %08x freed\n", (uint32_t)sp_srm_buf[sp_srm_n]); SRM_Free1st(sp_srm_buf[sp_srm_n], 0, 0); sp_srm_buf[sp_srm_n] = 0; }
+    if (sp_srm_n) rt_printf("SRM: %d buffers freed\n", sp_srm_n);
+    sp_srm_n = 0;
+}
+/* append each SRM buffer's whole slots to ch[] */
+static void sp_srm_carve(void)
+{
+    for (int b = 0; b < sp_srm_n; b++)
+    {
+        uint32_t a = (uint32_t)sp_srm_buf[b], base = ((uint32_t)UNCACHEABLE(a) + 4095) & ~4095;
+        uint32_t end = (uint32_t)UNCACHEABLE(a) + sp_srm_sz[b];
+        int k = 0;
+        for (uint32_t p = base; p + slot_bytes <= end && nch < RT_MAXCH; p += slot_bytes, k++)
+        {
+            memset(&ch[nch], 0, sizeof(ch[nch]));
+            ch[nch].base = p; ch[nch].state = CH_FREE;
+            nch++;
+        }
+        rt_printf("SRM buffer %d: %d frame slots\n", b, k);
+    }
 }
 
 static void rt_alloc_chunks(int maxch)
@@ -2047,7 +2106,9 @@ static void rt_task(void *unused)
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
     }
+    if (c_dng && sp_srm_sel) sp_srm_alloc(sp_srm_sel == 1 ? 1 : SP_SRM_MAX);   /* v3.13: before the shoot memory */
     rt_alloc_chunks(c_dng ? RT_MAXCH : RT_MAXCH_VIDEO);
+    if (c_dng && sp_srm_n) sp_srm_carve();
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
@@ -2328,6 +2389,7 @@ done:
     if (lv_raw) call("lv_save_raw", 0);
     if (rt_begun) rt_end();
     if (w_done) rt_free_chunks();
+    if (w_done) sp_srm_free();              /* v3.13: after the writer is done with its slots */
     rt_unlock();
     rt_printf("done t=%d\n", get_ms_clock());
     rt_flush();
@@ -3004,6 +3066,14 @@ static struct menu_entry sp_menu[] = {
                 .choices = CHOICES("3", "5", "7", "9"),
                 .help    = "Pre-capture: frames kept from before the full press (30 fps: 5 = ~0.17 s).",
                 .help2   = "At most all frames in memory minus 2 (~8-10 at 4K).",
+            },
+            {
+                .name    = "Extra memory",
+                .priv    = &sp_srm_sel,
+                .max     = 2,
+                .choices = CHOICES("OFF", "1 capture buffer", "up to 4"),
+                .help    = "EXPERIMENTAL: also borrow Canon's still-capture buffers for more frames per burst.",
+                .help2   = "Not camera-tested. Canon can't take photos while they're held (movie mode only).",
             },
             {
                 .name    = "Arm",
