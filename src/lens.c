@@ -252,6 +252,8 @@ static void r_bbar_task(void *unused)
     TASK_LOOP
     {
         msleep(50);
+        extern int r_bisect_bg;
+        if (r_bisect_bg == 1 || r_bisect_bg == 2) { msleep(950); continue; }
         uint32_t sig = r_bbar_sig();
         int now = get_ms_clock();
         int autob = r_bottombar_mode() == 2, autot = r_topbar_mode() == 2;   /* bars on Auto-hide */

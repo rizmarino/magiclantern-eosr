@@ -4376,9 +4376,10 @@ livev_hipriority_task( void* unused )
              * old layout lie outside the new overlay area, so no later pass ever clears them (camera: EVF zebras left
              * on the rear screen, and a stale band in movie mode). Wipe ML's layer and the mirror once per change. */
             extern volatile int vram_params_gen;
+            extern int r_bisect_bg;
             static int seen_gen = -1;
-            get_yuv422_vram();          /* recomputes the params if dirty */
-            if (seen_gen != vram_params_gen && !gui_menu_shown())
+            if (r_bisect_bg != 1) get_yuv422_vram();          /* recomputes the params if dirty */
+            if (r_bisect_bg != 1 && seen_gen != vram_params_gen && !gui_menu_shown())
             {
                 seen_gen = vram_params_gen;
                 clrscr();

@@ -1107,6 +1107,7 @@ extern void *_malloc(size_t size);
 extern void _free(void *ptr);
 extern int GetFreeMemForMalloc();
 static int st_pad_sel;
+extern int r_bisect_bg;
 static void *st_pad_ptr;
 static MENU_SELECT_FUNC(st_pad_select)
 {
@@ -1178,6 +1179,14 @@ static struct menu_entry st_menu[] = {
                 .update = st_update,
                 .help   = "You hold the shutter in High-speed continuous; ML only logs.",
                 .help2  = "Logs the first 5/10/20 frames (Shots). SILENT.TXT + LOGnnn.LOG",
+            },
+            {
+                .name    = "Bisect: bg tasks",
+                .priv    = &r_bisect_bg,
+                .max     = 3,
+                .choices = CHOICES("All ON", "All OFF", "Info-bar OFF", "Watch+marker OFF"),
+                .help    = "Test only: idles ML background tasks added since v2.4. Saved.",
+                .help2   = "Info-bar = Auto-hide check; Watch+marker = LV silent watcher, crop marker.",
             },
             {
                 .name    = "Heap pad",
