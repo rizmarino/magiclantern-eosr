@@ -736,9 +736,11 @@ static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
 #define ST_SECTION  0xE0F00000
 #define ST_L1_SIZE  0x4900              /* Canon L1 (0x4000) + core L2s for 0-1 MB + core L1s for 0-32 MB */
 /* L1 copy (16 KB aligned) + L2 table (1 KB aligned) + RAM page (4 KB aligned), aligned at runtime inside a plain
- * array: a linker-aligned struct cost ~51 KB of bss in v1.8-pre, this costs 39 KB */
+ * array: a linker-aligned struct cost ~51 KB of bss in v1.8-pre, this costs 40 KB.
+ * v3.15: slack is a full 0x4000. The old 0x3C00 only fit when the array happened to land within 0x3C00 below a
+ * 16 KB boundary; v3.14 has it at 0x118138 (needs 0x3EC8), so every setup failed at step 9 (ERROR 20009). */
 #define ST_MMU_SPAN 0x6000              /* l1 at +0, l2 at +0x4C00, page at +0x5000 */
-static uint8_t st_mmu_buf[ST_MMU_SPAN + 0x3C00];
+static uint8_t st_mmu_buf[ST_MMU_SPAN + 0x4000];
 static uint8_t *st_mmu_l1;
 static uint32_t *st_mmu_l2;
 static uint8_t *st_mmu_page;
