@@ -4184,23 +4184,27 @@ uint8_t *lv_window(uint8_t *base, uint32_t off)
  * overlays) and writes ML/ZEBDIAG.TXT. Read-only apart from the file. */
 static volatile int zdiag_samples_left = 0;
 static int zdiag_next_ms = 0;
-static char zdiag_buf[12288];   /* riz: +4 KB for the movie geometry block */
+#define ZDIAG_SZ 12288             /* riz: +4 KB for the movie geometry block */
+static char *zdiag_buf;           /* v3.16: malloc'd per run (was 12 KB of bss, i.e. off Canon's heap all the time) */
 static int zdiag_len = 0;
 
 void zebra_diag_start(void)
 {
+    if (zdiag_samples_left) return;
+    if (!zdiag_buf) zdiag_buf = malloc(ZDIAG_SZ);
+    if (!zdiag_buf) { NotifyBox(4000, "ZEBDIAG: no memory"); return; }
     zdiag_len = 0;
     zdiag_next_ms = get_ms_clock() + 5000; /* time to close the menu */
     zdiag_samples_left = 12;
     NotifyBox(4000, "ZEBDIAG: close menu, aim at bright area");
 }
 
-#define ZD(...) do { if (zdiag_len < (int)sizeof(zdiag_buf) - 200) \
-    zdiag_len += snprintf(zdiag_buf + zdiag_len, sizeof(zdiag_buf) - zdiag_len, __VA_ARGS__); } while (0)
+#define ZD(...) do { if (zdiag_len < ZDIAG_SZ - 200) \
+    zdiag_len += snprintf(zdiag_buf + zdiag_len, ZDIAG_SZ - zdiag_len, __VA_ARGS__); } while (0)
 
 static void zdiag_tick(void)
 {
-    if (!zdiag_samples_left) return;
+    if (!zdiag_samples_left || !zdiag_buf) return;
     int now = get_ms_clock();
     if (now < zdiag_next_ms) return;
     zdiag_next_ms = now + 1000;
@@ -4341,6 +4345,8 @@ static void zdiag_tick(void)
         {
             NotifyBox(4000, "ZEBDIAG: could not create file");
         }
+        free(zdiag_buf);
+        zdiag_buf = 0;
     }
 }
 #undef ZD

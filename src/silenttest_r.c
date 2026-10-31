@@ -1096,6 +1096,31 @@ static MENU_UPDATE_FUNC(st_burst_update)
     else MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
 }
 
+/* v3.16 test knob: Debug > Silent shutter test > Heap pad. Takes ST_PAD_KB from Canon's malloc heap (the user_mem
+ * that ML's own size also comes out of) until it is set back to OFF or the camera is switched off. Not saved. ON
+ * makes this build leave Canon as much heap as v3.15 did, so one build A/B-tests "ML size" for the full-buffer
+ * lock-up. */
+#ifndef ST_PAD_KB
+#define ST_PAD_KB 20             /* v3.15 _bss_end 0x122800 - v3.16 0x11D800 */
+#endif
+extern void *_malloc(size_t size);
+extern void _free(void *ptr);
+extern int GetFreeMemForMalloc();
+static int st_pad_sel;
+static void *st_pad_ptr;
+static MENU_SELECT_FUNC(st_pad_select)
+{
+    menu_numeric_toggle(&st_pad_sel, delta, 0, 1);
+    if (st_pad_sel && !st_pad_ptr) st_pad_ptr = _malloc(ST_PAD_KB * 1024);
+    if (!st_pad_sel && st_pad_ptr) { _free(st_pad_ptr); st_pad_ptr = 0; }
+    if (st_pad_sel && !st_pad_ptr) st_pad_sel = 0;
+}
+static MENU_UPDATE_FUNC(st_pad_update)
+{
+    MENU_SET_VALUE(st_pad_ptr ? "%d KB taken" : "OFF", ST_PAD_KB);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Canon malloc heap free now: %d KB. Not saved.", GetFreeMemForMalloc() / 1024);
+}
+
 static MENU_UPDATE_FUNC(st_update)
 {
     if (st_busy)
@@ -1153,6 +1178,15 @@ static struct menu_entry st_menu[] = {
                 .update = st_update,
                 .help   = "You hold the shutter in High-speed continuous; ML only logs.",
                 .help2  = "Logs the first 5/10/20 frames (Shots). SILENT.TXT + LOGnnn.LOG",
+            },
+            {
+                .name    = "Heap pad",
+                .priv    = &st_pad_sel,
+                .max     = 1,
+                .select  = st_pad_select,
+                .update  = st_pad_update,
+                .help    = "Test only: takes Canon heap so this build leaves as much as v3.15.",
+                .help2   = "Shows Canon's free malloc heap. OFF frees it. Not saved.",
             },
             {
                 .name    = "Canon log",

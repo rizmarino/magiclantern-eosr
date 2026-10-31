@@ -21,7 +21,9 @@ PLATFORM_ARCH = armv7-a
 ML_BOOT_OBJ = boot-d678.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o $(BUILD_DIR)/test_features.o
 # riz/eosr-dmlog: Debug -> LV log capture (Canon DbgMgr, no ROM patching)
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o $(BUILD_DIR)/audprobe_r.o $(BUILD_DIR)/memsurvey_r.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
+# v3.16: audprobe_r.o (Debug > Audio probe) and memsurvey_r.o (Debug > Memory survey) left out: finished test
+# tools; ML footprint is Canon heap (silent-burst lock-up when the buffer clears)
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete
