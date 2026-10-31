@@ -219,7 +219,7 @@ out:
     ms_busy = 0;
 }
 
-static void ms_srm_select(void *priv, int delta)
+static void __attribute__((unused)) ms_srm_select(void *priv, int delta)
 {
     if (ms_busy) return;
     ms_busy = 1;
@@ -240,12 +240,7 @@ static struct menu_entry ms_menu[] = {
         .help   = "Read-only: shoot memory pieces, Canon heap, 1 GB usage map. SET, close menu, wait for the box.",
         .help2  = "Run once per mode (photo LV, movie FHD, movie 4K). Appends to ML/MEMSURV.TXT.",
     },
-    {
-        .name   = "SRM probe",
-        .select = ms_srm_select,
-        .help   = "Borrows Canon's still-capture buffers (up to 4) and hands them back at once; logs size/address.",
-        .help2  = "SET, close menu, wait for the box (~2 s). Don't press the shutter meanwhile. ML/MEMSURV.TXT.",
-    },
+
 };
 
 static void ms_init(void *unused)

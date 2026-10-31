@@ -2106,9 +2106,10 @@ static void rt_task(void *unused)
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
     }
-    if (c_dng && sp_srm_sel) sp_srm_alloc(sp_srm_sel == 1 ? 1 : SP_SRM_MAX);   /* v3.13: before the shoot memory */
+    /* v3.14: SRM "Extra memory" removed: Canon's 1st-job buffer is carved from the same shoot memory (no gain), and an
+     * unanswered request in LV blocks all later allocations until a power cycle (lv-survey.md "SRM static RE"). */
     rt_alloc_chunks(c_dng ? RT_MAXCH : RT_MAXCH_VIDEO);
-    if (c_dng && sp_srm_n) sp_srm_carve();
+    (void)sp_srm_carve; (void)sp_srm_alloc; (void)sp_srm_sel;
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
@@ -3066,14 +3067,6 @@ static struct menu_entry sp_menu[] = {
                 .choices = CHOICES("3", "5", "7", "9"),
                 .help    = "Pre-capture: frames kept from before the full press (30 fps: 5 = ~0.17 s).",
                 .help2   = "At most all frames in memory minus 2 (~8-10 at 4K).",
-            },
-            {
-                .name    = "Extra memory",
-                .priv    = &sp_srm_sel,
-                .max     = 2,
-                .choices = CHOICES("OFF", "1 capture buffer", "up to 4"),
-                .help    = "EXPERIMENTAL: also borrow Canon's still-capture buffers for more frames per burst.",
-                .help2   = "Not camera-tested. Canon can't take photos while they're held (movie mode only).",
             },
             {
                 .name    = "Arm",
