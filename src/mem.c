@@ -227,8 +227,17 @@ static struct mem_allocator allocators[] = {
         .get_free_space = GetFreeMemForMalloc,
         .preferred_min_alloc_size = 0,
         .preferred_max_alloc_size = 512 * 1024,
+#ifdef CONFIG_R
+        /* riz v3.18: Canon's own malloc heap must keep > ~450 KB free or a full-buffer silent burst ends in a
+         * lock-up / Err 70 (camera A/B 2026-10-31: 470 KB OK, 450 KB Err 70). ML's allocations go to AllocateMemory
+         * (~1.8 MB free) first; the heap only while it has > 768 KB free, never below 512 KB unless nothing else
+         * is left. */
+        .preferred_free_space = 768 * 1024,
+        .minimum_free_space = 512 * 1024,
+#else
         .preferred_free_space = 384 * 1024,
         .minimum_free_space = 256 * 1024,
+#endif
     },
 
     {

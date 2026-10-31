@@ -740,7 +740,15 @@ static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
  * v3.15: slack is a full 0x4000. The old 0x3C00 only fit when the array happened to land within 0x3C00 below a
  * 16 KB boundary; v3.14 has it at 0x118138 (needs 0x3EC8), so every setup failed at step 9 (ERROR 20009). */
 #define ST_MMU_SPAN 0x6000              /* l1 at +0, l2 at +0x4C00, page at +0x5000 */
-static uint8_t st_mmu_buf[ST_MMU_SPAN + 0x4000];
+/* v3.18: no longer bss. Canon needs > ~450 KB of free malloc heap (user_mem, where ML's bss also comes from) to
+ * get through a full-buffer burst (camera A/B 2026-10-31: v2.4 at 470 KB free OK, same build with 20 KB taken: Err
+ * 70). So the buffer comes from Canon's AllocateMemory pool (~1.8 MB free) on first use, i.e. only once a faster
+ * rate is picked; the heap is only a fallback. Never freed: the switched tables live in it. */
+#define ST_MMU_ALLOC (ST_MMU_SPAN + 0x4000)
+extern void *_AllocateMemory(size_t size);
+extern void *_malloc(size_t size);
+static uint8_t *st_mmu_buf;
+static int st_mmu_from_heap;
 static uint8_t *st_mmu_l1;
 static uint32_t *st_mmu_l2;
 static uint8_t *st_mmu_page;
@@ -751,12 +759,20 @@ static int st_remap_init(void)
 {
     if (st_mmu_on) return 0;
     if (get_cpu_id() != 0) return -1;
+    if (!st_mmu_buf)
+    {
+        uint8_t *p = _AllocateMemory(ST_MMU_ALLOC);
+        if (p && (uint32_t)p >= 0x40000000) p = 0;      /* must be a plain cacheable RAM address (TTBR, L2 pointers); leaked */
+        if (!p) { p = _malloc(ST_MMU_ALLOC); st_mmu_from_heap = 1; }
+        if (!p || (uint32_t)p >= 0x40000000) return -10;
+        st_mmu_buf = p;
+    }
     uint32_t l1 = ((uint32_t)st_mmu_buf + 0x3FFF) & ~0x3FFF;
-    if (l1 + ST_MMU_SPAN > (uint32_t)st_mmu_buf + sizeof(st_mmu_buf)) return -9;
+    if (l1 + ST_MMU_SPAN > (uint32_t)st_mmu_buf + ST_MMU_ALLOC) return -9;
     st_mmu_l1 = (uint8_t *)l1;
     st_mmu_l2 = (uint32_t *)(l1 + 0x4C00);
     st_mmu_page = (uint8_t *)(l1 + 0x5000);
-    st_mmu_log("v1.8 init", l1, (uint32_t)st_mmu_page);
+    st_mmu_log(st_mmu_from_heap ? "init heap" : "init AM", l1, (uint32_t)st_mmu_page);
     if (copy_mmu_tables_ex(l1, 0xE0000000, ST_L1_SIZE)) return -2;
     uint32_t *a = (uint32_t *)l1, *b = (uint32_t *)0xE0000000, diff = 0;
     for (int i = 0; i < ST_L1_SIZE / 4; i++) if (a[i] != b[i] && i != 0x1200 && i != 0x1220) diff++;
@@ -1119,7 +1135,9 @@ static MENU_SELECT_FUNC(st_pad_select)
 static MENU_UPDATE_FUNC(st_pad_update)
 {
     MENU_SET_VALUE(st_pad_ptr ? "%d KB taken" : "OFF", ST_PAD_KB);
-    MENU_SET_WARNING(MENU_WARN_INFO, "Canon malloc heap free now: %d KB. Not saved.", GetFreeMemForMalloc() / 1024);
+    extern int GetFreeMemForAllocateMemory();
+    MENU_SET_WARNING(MENU_WARN_INFO, "Free: heap %d KB, AllocateMemory %d KB. Not saved.",
+                     GetFreeMemForMalloc() / 1024, GetFreeMemForAllocateMemory() / 1024);
 }
 
 static MENU_UPDATE_FUNC(st_update)
