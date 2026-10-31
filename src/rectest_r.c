@@ -150,9 +150,9 @@ static volatile int sp_half;            /* v3.8: half-press held (0x7D seen, 0x7
 static volatile int sp_n85;             /* lone 0x85 events in a row (full press held: see sp_keys) */
 static volatile uint32_t sp_t85;        /* ms of the last 0x85 */
 static volatile int sp_wait_rel;
-/* v3.9: bmp.c skips ML display refreshes while this is set. v3.8 camera test: copies 24-26 ms until the status text
- * started changing (~0.05-0.25 s after the press), then 31-34 ms and torn: each refresh converts ML's whole layer
- * (zebras are off while the engine runs) and competes for memory bandwidth with the EDMAC copy. */
+/* v3.9: bmp.c skips ML display refreshes while this is set (from the press to the end of capture). It did NOT fix the
+ * mid-burst slowdown (v3.9 camera: 0 refreshes, same 31-37 ms copies): that followed the chunk (v3.10 survey). Kept:
+ * cheap, and the screen doesn't need updating during a ~0.4 s burst. */
 volatile int r_refresh_hold;
 static uint32_t sp_ref0, sp_ref_cap;   /* refreshes since the press / during capture */        /* a session ended with the full press still held: no new one until it's let go */
 #define SP_TICK_GAP_MS  250
@@ -294,8 +294,8 @@ static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_
 
 /* ---- buffers: contiguous shoot_malloc chunks ---- */
 struct rt_chunk { struct memSuite *suite; uint32_t base; volatile int state; volatile int n;
-                  uint32_t seq, t_us; int fl; };   /* v20 silent pictures (1 frame per chunk): frame event no., time, flags */
-enum { CH_FREE = 0, CH_FILL, CH_FULL, CH_RING };   /* v20: CH_RING = pre-capture frame, not (yet) to be written */
+                  uint32_t seq, t_us; int fl; uint32_t cp_us; };   /* v20 silent pictures (1 frame per chunk): frame event no., time, flags; v3.10 survey copy time */
+enum { CH_FREE = 0, CH_FILL, CH_FULL, CH_RING, CH_SKIP };   /* v20: CH_RING = pre-capture frame, not (yet) to be written; v3.10: CH_SKIP = too slow to copy into */
 #define RT_MAXCH_VIDEO 10                   /* raw video: as before v20 */
 static struct rt_chunk ch[RT_MAXCH];
 static int nch, kslots;
@@ -322,6 +322,7 @@ static void rt_alloc_chunks(int maxch)
         ch[i].suite = s;
         ch[i].base = ((uint32_t)UNCACHEABLE(a) + 4095) & ~4095;
         ch[i].state = CH_FREE; ch[i].n = 0;
+        rt_printf("chunk %d at %08x, used from %08x, %d bytes\n", i, a, ch[i].base, sz);   /* v3.10 */
         nch++;
     }
     RT_SYNC_CACHES();                   /* no dirty cache lines may later land on DMA-written data */
@@ -1282,13 +1283,15 @@ static void rt_timeline(uint32_t now)
 #define SP_SWAP_BLK  16384
 #define SP_NCHK      64
 #define SP_MAXREC    400
+#define SP_SLOW_US   26000              /* v3.10: chunk survey limit (4K 10-bit, v3.8/v3.9: clean 23.6-26.4 ms, torn 25.7-37 ms) */
+static int sp_nfast;
 static char sp_dir[16];
 static uint8_t *sp_hdr;                 /* SP_HDR, malloc'd per session (cached; copied into the slot) */
 static struct tm sp_tm;                 /* RTC at the press */
 static volatile uint32_t sp_press_us;   /* rt_us() at the press (key handler) */
 static int sp_run_mode, sp_ring_n, sp_ring_max, sp_trig_cap;
 static volatile uint32_t sp_swap_us_sum, sp_swap_us_max, sp_wr_us_sum, sp_wr_us_max, sp_chk_bad, sp_torn;
-struct sp_rec { uint32_t seq, t_us, swap_us, wr_us; int fl; };
+struct sp_rec { uint32_t seq, t_us, swap_us, wr_us; int fl, chunk; };
 static struct sp_rec *sp_recs;          /* per written DNG (main task logs them; the writer never calls rt_printf) */
 
 static inline uint32_t sp_sw16(uint32_t v)
@@ -1446,7 +1449,7 @@ static int sp_write_dng(int k)
     if (sp_recs && sp_saved < SP_MAXREC)
     {
         struct sp_rec *q = &sp_recs[sp_saved];
-        q->seq = c->seq; q->t_us = c->t_us; q->swap_us = t1 - t0; q->wr_us = t2 - t1; q->fl = c->fl | (bad ? 0x100 : 0);
+        q->seq = c->seq; q->t_us = c->t_us; q->swap_us = t1 - t0; q->wr_us = t2 - t1; q->fl = c->fl | (bad ? 0x100 : 0); q->chunk = k;
     }
     w_bytes += SP_HDR + frame_bytes; w_n++; w_us_sum += t2 - t1;
     if (t2 - t1 < w_us_min) w_us_min = t2 - t1;
@@ -1591,7 +1594,7 @@ out:
     }
     nfr++;
     int used = 0;
-    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used++;
+    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE && ch[i].state != CH_SKIP) used++;
     if ((uint32_t)used > max_used) max_used = used;
     return 0;
 }
@@ -1940,13 +1943,36 @@ static void rt_task(void *unused)
         { rt_printf("!! first EDMAC copy timed out\n"); rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout"); goto done; }
         rt_printf("first copy: dma %d us\n", us);
     }
+    if (c_dng)                          /* v3.10: copy time into every chunk (v3.8/v3.9 camera: frames in chunks 6+ copied in
+                                         * 30-37 ms and tore, chunks 0-5 in ~25 ms); chunks over SP_SLOW_US aren't used */
+    {
+        int nfast = 0;
+        for (int i = 0; i < nch; i++)
+        {
+            uint32_t mx = 0;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                uint32_t us;
+                if (rt_copy(c_src, pitch, ch[i].base + slot_pre, c_rb, c_ch, &us))
+                { rt_printf("!! survey copy timed out\n"); rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout"); goto done; }
+                if (us > mx) mx = us;
+            }
+            ch[i].cp_us = mx;
+            if (mx <= SP_SLOW_US) nfast++;
+        }
+        for (int i = 0; i < nch; i++)
+            rt_printf("chunk %d at %08x: copy %d us%s\n", i, ch[i].base, ch[i].cp_us,
+                      ch[i].cp_us > SP_SLOW_US ? (nfast >= 3 ? " -> SLOW, not used" : " -> slow (kept: fewer than 3 fast)") : "");
+        if (nfast >= 3) for (int i = 0; i < nch; i++) if (ch[i].cp_us > SP_SLOW_US) ch[i].state = CH_SKIP;
+        sp_nfast = nfast >= 3 ? nfast : nch;
+    }
 
     if (c_dng)                          /* v20: a folder per session, the writer makes one DNG per kept frame */
     {
         w_file = 0;
         sp_dir[0] = 0;                  /* folder made by the writer at the first DNG: no empty folders */
-        sp_ring_max = MAX(1, MIN(sp_pre_n[sp_pre_sel & 3], nch - 2));
-        rt_printf("v20: %d frames fit in memory, pre-capture ring %d\n", nch, sp_ring_max);
+        sp_ring_max = MAX(1, MIN(sp_pre_n[sp_pre_sel & 3], sp_nfast - 2));
+        rt_printf("v20: %d frames fit in memory (%d usable), pre-capture ring %d\n", nch, sp_nfast, sp_ring_max);
     }
     else
     {
@@ -2096,20 +2122,21 @@ static void rt_task(void *unused)
                   sp_dir[0] ? sp_dir : "(no folder)", crop_w, crop_h, c_bpp, sp_kept, sp_pre_kept, n, drops, sp_torn,
                   sp_midtear, sp_ref_cap, sp_chk_bad, n ? sp_swap_us_sum / n / 1000 : 0, sp_swap_us_max / 1000, n ? sp_wr_us_sum / n / 1000 : 0,
                   sp_wr_us_max / 1000, w_err);
-        const int cap = 160 + nr * 96;
+        const int cap = 200 + nr * 112;
         char *b = malloc(cap);
         if (b && sp_dir[0])
         {
             int len = snprintf(b, cap, "LV silent pictures %s: %dx%d %d-bit, %s, %d DNGs (%d before the press), %d dropped\n"
-                               "name     ms from press  dma us  swap ms  write ms  flags\n", sp_dir, crop_w, crop_h, c_bpp,
+                               "name     ms from press  dma us  swap ms  write ms  chunk  start ms  flags\n", sp_dir, crop_w, crop_h, c_bpp,
                                sp_run_mode == 2 ? "pre-capture" : "burst", n, sp_pre_kept, drops);
-            for (int i = 0; i < nr && len < cap - 96; i++)
+            for (int i = 0; i < nr && len < cap - 112; i++)
             {
                 struct sp_rec *q = &sp_recs[i];
                 int32_t ms = (int32_t)(q->t_us - sp_press_us) / 1000;
-                int w = snprintf(b + len, cap - len, "F%04d.DNG %s%5d  %6d  %7d  %8d  %s%s%s\n", i, ms < 0 ? "-" : "+",
+                int lat = q->seq < RT_MAXFR ? fl[q->seq].lat : 0;     /* frame event -> copy start, 0.1 ms */
+                int w = snprintf(b + len, cap - len, "F%04d.DNG %s%5d  %6d  %7d  %8d  %5d  %4d.%d  %s%s%s\n", i, ms < 0 ? "-" : "+",
                                  ms < 0 ? -ms : ms, q->seq < RT_MAXFR ? fl[q->seq].dma_us : 0, q->swap_us / 1000,
-                                 q->wr_us / 1000, (q->fl & F_TORN) ? "TORN? " : "",
+                                 q->wr_us / 1000, q->chunk, lat / 10, lat % 10, (q->fl & F_TORN) ? "TORN? " : "",
                                  (q->fl & F_LATE) ? "late " : "", (q->fl & 0x100) ? "SWAP-CHECK-BAD" : "");
                 if (w > 0) len += MIN(w, cap - len - 1);
             }
