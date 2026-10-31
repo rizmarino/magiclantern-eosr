@@ -367,6 +367,13 @@ static volatile int irq_armed, irq_log_on, irq_log_n;
 struct rt_ev { uint32_t t, top, bot; };
 static struct rt_ev *irq_log;           /* allocated once, never freed (the ISR may use it) */
 
+/* v3.11 (silent pictures, mid-frame copy): at each frame-end IRQ hash SP_NIH rows of the frame just completed; the
+ * copy of that frame, started mid-frame, is checked against them afterwards. Two sets, by IRQ number parity. */
+#define SP_NIH 16
+static volatile int sp_ih_on;
+static uint32_t sp_ih_row[SP_NIH];
+static volatile uint32_t sp_ih[2][SP_NIH], sp_ih_n[2];
+
 static void rt_m1_isr(void *ctx)
 {
     uint32_t t = RT_DMA_TIMER();
@@ -376,6 +383,14 @@ static void rt_m1_isr(void *ctx)
     irq_t = t; irq_top = top; irq_bot = bot; irq_n++;
     RT_DMB();
     irq_seq++;
+    if (sp_ih_on)
+    {
+        uint32_t nn = irq_n, k = nn & 1;
+        sp_ih_n[k] = 0;
+        for (int j = 0; j < SP_NIH; j++) sp_ih[k][j] = rt_probe(sp_ih_row[j]);
+        RT_DMB();
+        sp_ih_n[k] = nn;
+    }
     if (irq_log_on && irq_log_n < RT_MAXIRQ)
     {
         irq_log[irq_log_n].t = t; irq_log[irq_log_n].top = top; irq_log[irq_log_n].bot = bot;
@@ -1283,7 +1298,8 @@ static void rt_timeline(uint32_t now)
 #define SP_SWAP_BLK  16384
 #define SP_NCHK      64
 #define SP_MAXREC    400
-#define SP_SLOW_US   26000              /* v3.10: chunk survey limit (4K 10-bit, v3.8/v3.9: clean 23.6-26.4 ms, torn 25.7-37 ms) */
+#define SP_SLOW_US   40000              /* v3.10 survey limit; v3.11: mid-frame copies tolerate the 0x3Axxxxxx chunks (~31-39 ms), so only
+                                         * pathological ones are dropped; v3.10 camera: 0x49-0x4D 23-26.5 ms, 0x7A-0x7E 30.7-38.9 ms */
 static int sp_nfast;
 static char sp_dir[16];
 static uint8_t *sp_hdr;                 /* SP_HDR, malloc'd per session (cached; copied into the slot) */
@@ -1599,6 +1615,113 @@ out:
     return 0;
 }
 
+/* ---- v3.11: mid-frame copy ----
+ * v3.8-v3.10 camera: copies started at the frame-end IRQ had ~1.8 ms head start on the next frame, and EDMAC stalls
+ * of a few ms mid-copy let the sensor overtake it (tears in 40% of frames, 25-37 ms copies). Now the copy of frame
+ * n+1 starts ~SP_MID_OFS after that frame begins: the sensor is then ~1250 rows ahead (a copy at full EDMAC speed,
+ * ~8 us/row, can't catch it before the end) and the next frame starts writing only ~15 ms later (a 37 ms copy at
+ * 16.7 us/row stays ahead of it). Check: SP_NIH rows hashed by the ISR at frame n+1's end vs the copy, plus the rows
+ * below the bottom probe vs MEM1 after the copy. A copy that would start > 1 ms late is skipped (frame dropped). */
+#define SP_MID_OFS   18000
+#define F_UNVER      128                /* no IRQ hash set for this frame: unverified */
+static struct semaphore *sp_tsem;
+static uint32_t sp_mid_delay, sp_late, sp_unver, irq_t_of_n;
+static int sp_mid_on;
+static void sp_mid_wake(int last_expiry, void *p) { give_semaphore(sp_tsem); }
+
+static int sp_frame_mid(uint32_t td_irq, uint32_t lat_us, uint32_t n)
+{
+    if (!first_t) { first_t = td_irq; next_tl = 0; }
+    uint32_t us = 0;
+    int flags = 0;
+    sp_check_tick_end();
+    int trig = sp_trig;
+    if (trig && !sp_trig_cap)
+    {
+        sp_trig_cap = 1;
+        r_refresh_hold = 1;
+        sp_ref0 = r_refresh_count;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING) { ch[i].state = CH_FULL; sp_pre_kept++; sp_kept++; }
+        sp_ring_n = 0;
+        give_semaphore(rt_wsem);
+    }
+    int want = trig || (sp_run_mode == 2 && !sp_trig_cap);
+    if (!want) goto out;
+    /* too late for SP_MID_OFS into frame n+1 (the last copy ran long): skip it, before touching any chunk */
+    uint32_t el = d20(RT_DMA_TIMER(), irq_t_of_n);
+    int32_t wait = (int32_t)sp_mid_delay - (int32_t)el;
+    if (wait < -1000) { sp_late++; flags |= F_LATE; goto out; }
+    int k = -1;
+    for (int i = 0; i < nch; i++) if (ch[i].state == CH_FREE) { k = i; break; }
+    if (!trig && (k < 0 || sp_ring_n >= sp_ring_max))
+    {
+        int o = -1;
+        uint32_t best = 0xFFFFFFFF;
+        for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING && ch[i].seq < best) { best = ch[i].seq; o = i; }
+        if (o >= 0) { k = o; sp_ring_n--; }
+    }
+    if (k < 0)
+    {
+        flags |= F_DROP; drops++;
+        if (first_drop_ms < 0) first_drop_ms = (td_irq - first_t) / 1000;
+        if (trig) sp_end = 1;
+        goto out;
+    }
+    /* wait until SP_MID_OFS into frame n+1 */
+    if (wait > 300)
+    {
+        if (SetHPTimerAfterNow(wait, sp_mid_wake, sp_mid_wake, 0) & 1) msleep(MAX(wait / 1000, 1));
+        else take_semaphore(sp_tsem, 100);
+    }
+    uint32_t td = rt_us();
+    ch[k].state = CH_FILL;
+    uint32_t dst = ch[k].base + slot_pre;
+    if (rt_copy(c_src, pitch, dst, c_rb, c_ch, &us))
+    {
+        rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
+        ch[k].state = CH_FREE;
+        rt_fail();
+        return -1;
+    }
+    /* verify against the ISR's hashes of frame n+1 (its IRQ comes ~13 ms into a 25 ms copy) */
+    {
+        for (int i = 0; i < 60 && irq_n < n + 1; i++) msleep(1);
+        int mb = 0, set = (n + 1) & 1;
+        if (sp_ih_n[set] != n + 1) { flags |= F_UNVER; sp_unver++; }
+        else
+        {
+            uint32_t h[SP_NIH];
+            for (int j = 0; j < SP_NIH; j++) h[j] = sp_ih[set][j];
+            RT_DMB();
+            if (sp_ih_n[set] != n + 1) { flags |= F_UNVER; sp_unver++; }
+            else for (int j = 0; j < SP_NIH; j++) if (sp_rowhash(dst, sp_ih_row[j]) != h[j]) mb++;
+        }
+        uint32_t h1 = c_ch - 1;
+        for (int j = 0; j < 6 && r_bot + 1 < h1; j++)
+        {
+            uint32_t row = r_bot + 1 + (uint32_t)j * (h1 - r_bot - 1) / 5;
+            if (sp_rowhash(dst, row) != rt_probe(row)) mb++;
+        }
+        if (mb) { flags |= F_MIDTEAR; sp_midtear++; }
+    }
+    frames++; dsum += us; if (us > dmax) dmax = us;
+    ch[k].seq = nfr; ch[k].t_us = td; ch[k].fl = flags;
+    if (trig) { sp_kept++; ch[k].state = CH_FULL; give_semaphore(rt_wsem); }
+    else { ch[k].state = CH_RING; sp_ring_n++; }
+out:
+    if (sp_rel && sp_kept) { sp_trig = 0; sp_end = 1; }
+    if (nfr < RT_MAXFR)
+    {
+        fl[nfr].t_us = td_irq - first_t; fl[nfr].dma_us = MIN(us, 65535);
+        fl[nfr].lat = MIN(lat_us / 100, 255); fl[nfr].flags = flags;
+    }
+    nfr++;
+    int used = 0;
+    for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE && ch[i].state != CH_SKIP) used++;
+    if ((uint32_t)used > max_used) max_used = used;
+    return 0;
+}
+
 /* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
  * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
 static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
@@ -1688,6 +1811,12 @@ static void rt_capture_irq(void)
         uint32_t lat = d20(RT_DMA_TIMER(), t);
         uint32_t td = rt_us() - lat;
         t_last_ev = td;
+        if (sp_mid_on)                  /* v3.11: silent pictures copy frame n+1 mid-frame */
+        {
+            irq_t_of_n = t;
+            if (sp_frame_mid(td, lat, n)) { c_abort = 1; break; }
+            continue;
+        }
         if (rt_frame(td, lat, 0, top, bot)) { c_abort = 1; break; }
     }
     irq_armed = 0;
@@ -1962,9 +2091,12 @@ static void rt_task(void *unused)
         }
         for (int i = 0; i < nch; i++)
             rt_printf("chunk %d at %08x: copy %d us%s\n", i, ch[i].base, ch[i].cp_us,
-                      ch[i].cp_us > SP_SLOW_US ? (nfast >= 3 ? " -> SLOW, not used" : " -> slow (kept: fewer than 3 fast)") : "");
+                      ch[i].cp_us > SP_SLOW_US ? (nfast >= 3 ? " -> too slow, not used" : " -> slow (kept: fewer than 3 others)") : "");
         if (nfast >= 3) for (int i = 0; i < nch; i++) if (ch[i].cp_us > SP_SLOW_US) ch[i].state = CH_SKIP;
         sp_nfast = nfast >= 3 ? nfast : nch;
+        /* v3.11: fastest chunks first (a burst fills them in index order) */
+        for (int i = 1; i < nch; i++)
+            for (int j = i; j > 0 && ch[j - 1].cp_us > ch[j].cp_us; j--) { struct rt_chunk t = ch[j]; ch[j] = ch[j - 1]; ch[j - 1] = t; }
     }
 
     if (c_dng)                          /* v20: a folder per session, the writer makes one DNG per kept frame */
@@ -2008,6 +2140,21 @@ static void rt_task(void *unused)
     uint32_t irq0 = irq_n;
     rt_drain(rt_csem);
     rr_t0_ms = get_ms_clock();
+    sp_mid_on = 0;
+    if (c_dng && mode == SYNC_IRQ)      /* v3.11: mid-frame copies (see sp_frame_mid) */
+    {
+        if (!sp_tsem) sp_tsem = create_named_semaphore("sp_tim", SEM_CREATE_LOCKED);
+        rt_drain(sp_tsem);
+        sp_late = sp_unver = 0;
+        for (int j = 0; j < SP_NIH; j++) sp_ih_row[j] = r_top + 1 + (uint32_t)j * (r_bot - r_top - 2) / (SP_NIH - 1);
+        sp_ih_n[0] = sp_ih_n[1] = 0;
+        sp_mid_delay = (sv_irq_to_top > 500 && sv_irq_to_top < 5000 ? sv_irq_to_top : 1850) + SP_MID_OFS;
+        RT_DMB();
+        sp_ih_on = 1;
+        sp_mid_on = 1;
+        rt_printf("v3.11 mid-frame copy: start %d us after the frame-end IRQ (frame start + %d us)\n", sp_mid_delay, SP_MID_OFS);
+        rt_flush();
+    }
     task_create("rt_capture", RT_CAP_PRIO, 0x1000, rt_capture_task, 0);   /* (rr_t0_ms: on-screen timer) */
     if (c_dng) sp_ready = 1;            /* v20: armed (status shows READY) */
     if (dur_s > 0)
@@ -2025,6 +2172,9 @@ static void rt_task(void *unused)
     {
         sp_ref_cap = sp_trig_cap ? r_refresh_count - sp_ref0 : 0;
         r_refresh_hold = 0;
+        sp_ih_on = 0;
+        if (sp_mid_on) rt_printf("v3.11: %d copies skipped (would start late), %d unverified\n", sp_late, sp_unver);
+        sp_mid_on = 0;
         sp_ready = 0;
         for (int i = 0; i < nch; i++) if (ch[i].state == CH_RING || ch[i].state == CH_FILL) ch[i].state = CH_FREE;
         if (!c_abort) rt_end();
@@ -2168,6 +2318,7 @@ static void rt_task(void *unused)
     }
 
 done:
+    sp_ih_on = 0; sp_mid_on = 0;            /* v3.11 */
     if (ra_started) ra_stop();              /* v19: error paths */
     if (ra_on) rt_printf("audio: %d blocks written (%d KB)\n", (int)ra_count, (int)(ra_bytes_written >> 10));
     ra_on = 0;
