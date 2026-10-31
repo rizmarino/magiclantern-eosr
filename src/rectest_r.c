@@ -864,9 +864,6 @@ static int      (*const ACTRL_IsActiveState)(int mask, int lock)                
 #endif
 
 static CONFIG_INT("r.rawrec.audio", rr_audio, 0);
-/* v3.17 bisect (Debug > Silent shutter test > Bisect: bg tasks): 0 all on, 1 all off, 2 info-bar task off,
- * 3 LV-silent watcher + crop marker off. An "off" task only sleeps (stack and size unchanged). Saved. */
-CONFIG_INT("r.bisect.bg", r_bisect_bg, 0);
 
 #define RA_NBUF   4
 #define RA_BLK    98304                 /* AUDF 24 + RA_PAYLOAD 96000 + NULL padding, a multiple of 4096 */
@@ -1099,6 +1096,7 @@ static void ra_meter_task(void *unused)
     rr_meter_layout();
     ra_m_updates = ra_m_bad = 0; ra_m_clip[0] = ra_m_clip[1] = ra_m_maxpk[0] = ra_m_maxpk[1] = 0;
     ra_m_ref0 = r_refresh_count; ra_m_refus0 = r_refresh_us_max; ra_m_ximr0 = r_ximr_us_max;
+    r_refresh_us_max = r_ximr_us_max = 0;   /* v3.19: the clip log's maxima are for this clip (were since power-on) */
     while (!ra_meter_stop)
     {
         msleep(125);
@@ -2621,7 +2619,6 @@ static void sp_watch_task(void *unused)
     for (;;)
     {
         msleep(200);
-        if (r_bisect_bg == 1 || r_bisect_bg == 3) { msleep(800); continue; }
         int mlv = sp_movie_lv() && DISPLAY_IS_ON;
         sp_check_tick_end();
         if (!mlv) sp_half = 0;          /* a release may have gone to the ML menu or Canon's */
@@ -2950,7 +2947,6 @@ static void rr_mark_task(void *unused)
     for (;;)
     {
         msleep(250);
-        if (r_bisect_bg == 1 || r_bisect_bg == 3) { msleep(750); continue; }
         tick++;
         int want = rr_mark && rr_on && lv && lv_movie_select == LVMS_ENABLE_MOVIE && get_global_draw()
                    && !gui_menu_shown() && DISPLAY_IS_ON;
