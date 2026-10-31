@@ -451,10 +451,27 @@ int handle_module_keys(struct event * event) __attribute__((weak,alias("null_eve
 int handle_flexinfo_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 int handle_rawrec_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 
+#ifdef CONFIG_R
+/* riz v4.0: half-shutter state from Canon's GUI events (camera key log 2026-10-30: press ... 0x7D, release
+ * 0x82 0x7E). MENU / PLAY / Trash (ML menu) clear it in case a release went elsewhere: a stuck flag would
+ * close the ML menu as soon as it opens (menu.c) and keep trap focus armed. */
+static volatile int r_half;
+int r_halfshutter_pressed(void) { return r_half; }
+static void r_half_track(int p)
+{
+    if (p == BGMT_PRESS_HALFSHUTTER) r_half = 1;
+    else if (p == BGMT_PRESS_HALFSHUTTER + 1 || p == BGMT_MENU || p == BGMT_PLAY || p == BGMT_TRASH) r_half = 0;
+}
+#endif
+
 int handle_common_events_by_feature(struct event * event)
 {
     // common to most cameras
     // there may be exceptions
+
+#ifdef CONFIG_R
+    r_half_track(event->param);
+#endif
 
     /* log button codes, if enabled from the Debug menu */
     spy_event(event);

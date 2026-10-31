@@ -1988,6 +1988,10 @@ static MENU_UPDATE_FUNC(warn_display)
 {
     if (warn_code)
         MENU_SET_WARNING(MENU_WARN_ADVICE, get_warn_msg(", "));
+#ifdef CONFIG_R
+    /* R test aid: what the checks read right now (mode 3 = M; WB 0 = auto; AF mode 3 = MF) */
+    MENU_SET_RINFO("m%d wb%d af%x", shooting_mode, lens_info.wb_mode, af_mode);
+#endif
 }
 #endif
 
@@ -2175,6 +2179,7 @@ static struct menu_entry tweak_menus[] = {
                 .choices = (const char *[]) {"OFF", "other than M", "other than Av", "other than Tv", "other than P"},
                 .help = "Warn if you turn the mode dial to some other position.",
             },
+            #ifndef CONFIG_R    /* R: CR3 quality and ALO property encodings not verified yet */
             {
                 .name = "Quality warning",
                 .priv = &warn_picq,
@@ -2189,6 +2194,7 @@ static struct menu_entry tweak_menus[] = {
                 .choices = (const char *[]) {"OFF", "other than OFF"},
                 .help = "Warn if you enable ALO by mistake.",
             },
+            #endif
             {
                 .name = "WB warning",
                 .priv = &warn_wb,

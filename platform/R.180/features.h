@@ -66,6 +66,23 @@
 #define FEATURE_INTERVALOMETER
 #define FEATURE_HDR_BRACKETING
 
+// riz v4.0 "quick wins" (NOT camera-tested yet; see kit README):
+// Expo menu ISO / Shutter / Aperture (uses the R's verified byte-1 / hi-byte property writes; the toggles
+// are also what the adv_int module needs) and Expo presets (SET or INFO swaps two ISO/Tv/Av sets).
+#define FEATURE_EXPO_ISO
+#define FEATURE_EXPO_SHUTTER
+#define FEATURE_EXPO_APERTURE
+#define FEATURE_EXPO_PRESET
+// Shoot > Motion detect and Focus > Trap focus (LV, MF, hold half-press): on the R both read a sampled
+// grid of the LV luma (r_spot_luma in zebra.c), fire through take_a_pic (remote-release path).
+#define FEATURE_MOTION_DETECT
+#define FEATURE_TRAP_FOCUS
+// Prefs > Warning for bad settings (read-only: mode, WB, AF/MF; quality/ALO hidden on the R, encodings unknown)
+#define FEATURE_WARNINGS_FOR_BAD_SETTINGS
+// Debug: LV image buffer sizes and the EFIC temperature property (raw value, already registered)
+#define FEATURE_SHOW_IMAGE_BUFFERS_INFO
+#define FEATURE_SHOW_CMOS_TEMPERATURE
+
 // keep upstream dev's crash log + ROM autobackup: crash logs are essential
 // for first hardware tests, ROM dumps enable qemu-eos emulation later
 #define CONFIG_CRASH_LOG

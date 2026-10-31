@@ -160,8 +160,16 @@
 
 #define YUV422_HD_BUFFER_DMA_ADDR 0x0 // it expects this to be shamem_read(some_DMA_ADDR)
 
-/* WRONG! */
-#define HALFSHUTTER_PRESSED         0
+/* riz v4.0: no half-shutter flag found in RAM; gui-common.c follows Canon's GUI events instead
+ * (camera key log: half-press ... 0x7D, half release 0x82 0x7E). See r_halfshutter_pressed(). */
+int r_halfshutter_pressed(void);
+#define HALFSHUTTER_PRESSED         r_halfshutter_pressed()
+
+/* trap focus status text outside LV (never used on the R, which is always LV; needed to compile shoot.c) */
+#define DISPLAY_TRAP_FOCUS_POS_X     50
+#define DISPLAY_TRAP_FOCUS_POS_Y     360
+#define DISPLAY_TRAP_FOCUS_MSG       "TRAP FOCUS"
+#define DISPLAY_TRAP_FOCUS_MSG_BLANK "          "
 /* kitor: I was unable to find any related stuff from 200D
  * Working theory: since R is LV all-the-time, maybe it's not special anymore
  * and is handled by MPU now?

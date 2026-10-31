@@ -1660,6 +1660,7 @@ iso_toggle( void * priv, int sign )
 {
     int (*iso_checker)(int) = is_round_iso;
     
+    #ifndef CONFIG_R    /* R: ML's movie exposure paths (BV override, DIGIC ISO) aren't built */
     if (is_movie_mode())
     {
         extern int bv_auto;
@@ -1675,6 +1676,7 @@ iso_toggle( void * priv, int sign )
         if (digic_gain != 1024) // keep the DIGIC gain, toggle ISO in full-stops
             iso_checker = is_native_iso;
     }
+    #endif
     
     int i = raw2index_iso(lens_info.raw_iso);
     int i0 = i;
@@ -1809,7 +1811,8 @@ static MENU_UPDATE_FUNC(aperture_display)
     }
     else
     {
-        MENU_SET_ICON(MNI_PERCENT, (lens_info.raw_aperture - lens_info.raw_aperture_min) * 100 / (lens_info.raw_aperture_max - lens_info.raw_aperture_min));
+        if (lens_info.raw_aperture_max > lens_info.raw_aperture_min) /* R: both 0 (no lens range) */
+            MENU_SET_ICON(MNI_PERCENT, (lens_info.raw_aperture - lens_info.raw_aperture_min) * 100 / (lens_info.raw_aperture_max - lens_info.raw_aperture_min));
         MENU_SET_ENABLED(1);
     }
 
@@ -1819,6 +1822,13 @@ static MENU_UPDATE_FUNC(aperture_display)
 void
 aperture_toggle( void* priv, int sign)
 {
+#ifdef CONFIG_PROP_APERTURE_BYTE1
+    /* R: no lens range in lens_info (min/max 0) and the camera works in 1/3 stops (3 raw units = 1.125 thirds,
+     * always the next code after rounding); it clamps to the lens itself. */
+    if (!lens_info.raw_aperture) return;
+    lens_set_rawaperture(lens_info.raw_aperture + 3 * SGN(sign));
+    return;
+#endif
     if (!lens_info.lens_exists) return; // only chipped lenses can change aperture
     if (!lens_info.raw_aperture) return;
     int amin = codes_aperture[1];
@@ -3291,11 +3301,19 @@ static void expo_preset_toggle()
     else
         beep();
     
+    #ifdef CONFIG_R /* R: 0 = unknown here (Tv 0 would clamp to 30 s, Av code 0 is undefined); skip those */
+    if (pre_tv) lens_set_rawshutter(pre_tv);
+    lens_set_rawiso(pre_iso);
+    if (pre_av) lens_set_rawaperture(pre_av);
+    #else
     if (pre_tv != SHUTTER_BULB) lens_set_rawshutter(pre_tv); else ensure_bulb_mode();
     lens_set_rawiso(pre_iso);
     lens_set_rawaperture(pre_av);
+    #endif
+    #ifndef CONFIG_R    /* R: WB property format not verified, not in prop_write_allow */
     if (lens_info.wb_mode == WB_KELVIN)
         lens_set_kelvin(pre_kelvin);
+    #endif
     
     pre_iso = c_iso;
     pre_tv = c_tv;
@@ -4034,6 +4052,7 @@ static struct menu_entry expo_menus[] = {
         .help2 = "Advanced: digital ISO tweaks, HTP, ISO 50, ISO 800.000...",
         .edit_mode = EM_SHOW_LIVEVIEW,
         
+        #ifndef CONFIG_R    /* R: analog/digital split and 1/8-EV steps don't map onto its 1/3-stop ISO codes */
         .submenu_width = 650,
 
         .children =  (struct menu_entry[]) {
@@ -4119,6 +4138,7 @@ static struct menu_entry expo_menus[] = {
             #endif
             MENU_EOL
         },
+        #endif /* !CONFIG_R */
     },
     #endif
     #ifdef FEATURE_EXPO_SHUTTER
@@ -4488,8 +4508,18 @@ static int hdr_shutter_release(int ev_x8)
         }
         else if (hdr_type == 2) // aperture
         {
+#ifdef CONFIG_PROP_APERTURE_BYTE1
+            /* R: the lens range isn't reported (raw_aperture_min/max stay 0, so the COERCE below gives 0 and
+             * the aperture never moves) and the R clamps to the lens itself: ask for the new Av, then
+             * compensate by the step the lens really made (0 at a lens limit -> a repeat of the base frame). */
+            int av_want = av0 - ev_x8;
+            hdr_set_rawaperture(av_want);
+            ev_x8 = lens_info.raw_aperture - av0;
+            ans = ABS(lens_info.raw_aperture - av_want) <= 2;
+#else
             ev_x8 = COERCE(-ev_x8, lens_info.raw_aperture_min - av0, lens_info.raw_aperture_max - av0);
             ans = hdr_set_rawaperture(av0 + ev_x8) == 1;
+#endif
             if (!manual) ev_x8 = 0; // no need to compensate, Canon meter does it
             // don't return, do the normal exposure bracketing
         }
@@ -5903,6 +5933,12 @@ shoot_task( void* unused )
 
         // same for motion detect
         int mdx = motion_detect && (liveview_display_idle() || (lv && !DISPLAY_IS_ON)) && NOT_RECORDING && !gui_menu_shown() && !intervalometer_running;
+        #ifdef CONFIG_R
+        /* R: photo LV only (a remote release in movie mode isn't a still), and one sample per LV frame (~30 ms):
+         * with priority_feature_enabled this loop would otherwise read the uncached LV ~100x a second */
+        if (mdx && lv_movie_select == LVMS_ENABLE_MOVIE) mdx = 0;
+        if (mdx) msleep(30);
+        #endif
         #endif
 
         #ifdef FEATURE_TRAP_FOCUS
@@ -5974,7 +6010,15 @@ shoot_task( void* unused )
                 static int old_ae_avg = 0;
                 int y,u,v;
                 //TODO: maybe get the spot yuv of the target box
+                #ifdef CONFIG_R
+                extern int r_spot_luma(int dxb, int xcb, int ycb, int *motion, int *grad);
+                if (get_global_draw()) bmp_draw_rect(COLOR_WHITE, xcb - detect_size, ycb - detect_size, 2 * detect_size, 2 * detect_size);
+                y = r_spot_luma(detect_size, xcb, ycb, 0, 0);   /* full-res read is ~0.06-0.4 s here (uncached) */
+                if (y < 0) y = old_ae_avg / 50;                 /* no LV buffer: no change, no false trigger */
+                (void) u; (void) v;
+                #else
                 get_spot_yuv_ex(detect_size, xcb-os.x_max/2, ycb-os.y_max/2, &y, &u, &v, 1, 1);
+                #endif
                 aev = y / 2;
                 if (K > 40) bmp_printf(FONT_MED, 0, 20, "Average exposure: %3d    New exposure: %3d   ", old_ae_avg/100, aev);
                 if (K > 40 && ABS(old_ae_avg/100 - aev) >= (int)motion_detect_level)

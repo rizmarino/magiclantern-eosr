@@ -851,7 +851,13 @@ static int lv_focus_confirmation = 0;
 static int hsp_countdown = 0;
 int can_lv_trap_focus_be_active()
 {
-#ifdef CONFIG_LV_FOCUS_INFO
+#ifdef CONFIG_R
+    /* R: photo LV, nothing over it, MF (sharpness is measured from the LV image in focus_misc_task) */
+    if (!lv) return 0;
+    if (lv_movie_select == LVMS_ENABLE_MOVIE) return 0;
+    if (gui_menu_shown() || !liveview_display_idle()) return 0;
+    return is_manual_focus();
+#elif defined(CONFIG_LV_FOCUS_INFO)
     //~ bmp_printf(FONT_MED, 100, 100, "LVTF 0 lv=%d hsc=%d dof=%d sm=%d gs=%d sp=%d mf=%d",lv,hsp_countdown,dofpreview,shooting_mode,gui_state,get_silent_pic_mode(),is_manual_focus());
     if (!lv) return 0;
     if (hsp_countdown) return 0; // half-shutter can be mistaken for DOF preview, but DOF preview property triggers a bit later
@@ -994,6 +1000,7 @@ static void plot_focus_mag()
 #undef FH
 #undef NMAGS
 
+#ifndef CONFIG_R    /* R: not registered (unverified property on DIGIC 8; the R feeds update_focus_mag itself) */
 static int focus_mag_a = 0;
 static int focus_mag_b = 0;
 static int focus_mag_c = 0;
@@ -1012,6 +1019,7 @@ PROP_HANDLER(PROP_LV_FOCUS_DATA)
     
     update_focus_mag(focus_mag);
 }
+#endif
 #else
 void plot_focus_mag(){};
 #endif
@@ -1024,6 +1032,22 @@ focus_misc_task(void* unused)
         msleep(100);
         
         if (hsp_countdown) hsp_countdown--;
+
+        #if defined(CONFIG_R) && defined(FEATURE_TRAP_FOCUS)
+        /* R: trap focus input = mean neighbour-pixel luma difference in a centre box of the LV image (~4 ms of
+         * uncached reads, 10x a second), through the stock history/autoscale logic in update_focus_mag */
+        if (trap_focus && can_lv_trap_focus_be_active())
+        {
+            extern int r_spot_luma(int dxb, int xcb, int ycb, int *motion, int *grad);
+            int g = 0, xc = os.x0 + os.x_ex / 2, yc = os.y0 + os.y_ex / 2;
+            if (r_spot_luma(40, xc, yc, 0, &g) >= 0)
+            {
+                update_focus_mag(g + 1);
+                if (get_global_draw()) bmp_draw_rect(COLOR_WHITE, xc - 40, yc - 40, 80, 80);
+                ml_refresh_display_needed = 1;  /* R RGBA layer: direct pixel draws (box, graph) need a push */
+            }
+        }
+        #endif
 
         if (focus_graph_dirty && get_focus_graph()) 
         {
@@ -1086,17 +1110,22 @@ static struct menu_entry trap_focus_menu[] = {
     {
         .name = "Trap Focus",
         .priv       = &trap_focus,
-        #ifdef CONFIG_PROP_REQUEST_CHANGE
+        #if defined(CONFIG_PROP_REQUEST_CHANGE) && !defined(CONFIG_R)
         .max = 2,
         #else
-        .max = 1,
+        .max = 1,   /* R: "Continuous" holds SW1 via a property, which doesn't send the 0x7D event the R tracks */
         #endif
         .update    = trap_focus_display,
         .choices = (const char *[]) {"OFF", "Hold AF button", "Continuous"},
+        #ifdef CONFIG_R
+        .help = "LV, MF: hold half-press; shoots when the centre box gets sharp.",
+        .help2 = "R: sharpness from the LV image (graph top left). SET: autoscale on/off.",
+        #else
         .help = "Takes a picture when the subject comes in focus. MF only.",
+        #endif
         .icon_type = IT_DICE_OFF,
         .depends_on = DEP_PHOTO_MODE | DEP_MANUAL_FOCUS
-            #ifndef CONFIG_LV_FOCUS_INFO
+            #if !defined(CONFIG_LV_FOCUS_INFO) && !defined(CONFIG_R)
             | DEP_NOT_LIVEVIEW
             #endif
             ,

@@ -2258,8 +2258,68 @@ void get_spot_yuv(int dxb, int* Y, int* U, int* V)
 static int spm_pre_xcb = -1;
 static int spm_pre_ycb = -1;
 
+#ifdef CONFIG_R
+/* riz v4.0: motion detect / trap focus input on the R. The LV image sits behind one display pointer (no second
+ * buffer to diff against, see get_yuv422buffer) and every read is uncached (~1.2 us), so the stock full-res helpers
+ * are blind (DIF) or slow. Instead read R_SP_ROWS evenly spaced rows of the box (centre xcb,ycb, half-size dxb, BM
+ * coords), up to R_SP_COLS evenly spaced pixels each (<= 4096 reads, ~5 ms). Returns the mean luma (-1 = no LV);
+ * *motion = 2 x mean |dY| against the previous call's samples (an unchanged frame keeps the last value);
+ * *grad = 100 x mean |dY| between neighbouring samples in a row (a sharpness measure for trap focus; only
+ * neighbouring pixels when the box is <= R_SP_COLS LV pixels wide). */
+#define R_SP_ROWS 32
+#define R_SP_COLS 128
+#define R_SP_KEEP 32                            /* samples per row kept for the motion diff */
+static uint8_t r_sp_prev[R_SP_ROWS * R_SP_KEEP];
+int r_spot_luma(int dxb, int xcb, int ycb, int *motion, int *grad)
+{
+    static int last_motion, have_prev;
+    struct vram_info *vram = get_yuv422_vram();
+    if (!vram || !vram->vram) return -1;
+    const uint16_t *vr = (void *) vram->vram;
+    int w = vram->width, h = vram->height;
+    int x0 = COERCE(BM2LV_X(xcb - dxb), 0, w - 2), x1 = COERCE(BM2LV_X(xcb + dxb), x0 + 1, w - 1);
+    int y0 = COERCE(BM2LV_Y(ycb - dxb), 0, h - 1), y1 = COERCE(BM2LV_Y(ycb + dxb), y0, h - 1);
+    int nx = MIN(x1 - x0 + 1, R_SP_COLS);
+    int kstep = (nx + R_SP_KEEP - 1) / R_SP_KEEP;   /* every kstep-th sample is kept: <= R_SP_KEEP per row */
+    uint32_t sum = 0, sgrad = 0, sdiff = 0, n = 0, ng = 0, nk = 0;
+    for (int r = 0; r < R_SP_ROWS; r++)
+    {
+        const uint16_t *row = vr + (y0 + (y1 - y0) * r / (R_SP_ROWS - 1)) * w;
+        int prev = -1;
+        for (int c = 0; c < nx; c++)
+        {
+            int yv = (row[x0 + (x1 - x0) * c / (nx - 1)] >> 8) & 0xFF;
+            sum += yv; n++;
+            if (prev >= 0) { sgrad += ABS(yv - prev); ng++; }
+            prev = yv;
+            if (motion && c % kstep == 0)   /* only the motion caller owns r_sp_prev (trap focus passes 0) */
+            {
+                uint8_t *p = &r_sp_prev[r * R_SP_KEEP + c / kstep];
+                sdiff += ABS(yv - *p);
+                *p = yv;
+                nk++;
+            }
+        }
+    }
+    if (motion)
+    {
+        if (have_prev && sdiff) last_motion = sdiff * 2 / nk;
+        *motion = have_prev ? last_motion : 0;
+        have_prev = 1;
+    }
+    if (grad) *grad = ng ? sgrad * 100 / ng : 0;
+    return n ? (int)(sum / n) : -1;
+}
+#endif
+
 int get_spot_motion(int dxb, int xcb, int ycb, int draw)
 {
+#ifdef CONFIG_R
+    int m = 0;
+    if (draw) { bmp_draw_rect(COLOR_WHITE, xcb - dxb, ycb - dxb, 2 * dxb, 2 * dxb); ml_refresh_display_needed = 1; }
+    r_spot_luma(dxb, xcb, ycb, &m, 0);
+    return m;
+#endif
     struct vram_info *  vram = get_yuv422_vram();
 
     if( !vram->vram )
