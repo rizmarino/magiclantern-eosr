@@ -242,7 +242,9 @@ void menu_toggle_submenu();
 extern int gui_state;
 void menu_enable_lv_transparent_mode()
 {
+#ifndef CONFIG_R    /* R: the menu's backdrop is Canon's Picture Style dialog (GUIMODE_ML_MENU 0x68), see EM_SHOW_LIVEVIEW */
     if (lv) menu_lv_transparent_mode = 1;
+#endif
     menu_damage = 1;
 }
 void menu_disable_lv_transparent_mode()
@@ -4500,9 +4502,14 @@ void menu_entry_select(
             }
             else if (entry->edit_mode & EM_SHOW_LIVEVIEW)
             {
-                
+                #ifdef CONFIG_R
+                /* R: ML's menu sits on Canon GUI mode 0x68 (the Picture Style dialog, GUIMODE_ML_MENU); hiding
+                 * the menu to "show live view" shows that dialog instead (camera photo 2026-11-01). Edit in place. */
+                edit_mode = !edit_mode;
+                #else
                 if (lv) menu_lv_transparent_mode = !menu_lv_transparent_mode;
                 else edit_mode = !edit_mode;
+                #endif
             }
             else if (SHOULD_USE_EDIT_MODE(entry))
             {
