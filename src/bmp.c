@@ -252,6 +252,7 @@ void refresh_yuv_from_rgb(void)
 {
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
     uint64_t r_t0 = get_us_clock();
+    int r_menu_opaque_pass = 0;
 #endif
     // get our indexed buffer, convert into our real rgb buffer
     uint8_t *b = bmp_vram_indexed;
@@ -310,6 +311,13 @@ void refresh_yuv_from_rgb(void)
             rgb_row = rgb_row + BMP_LAYER_WIDTH;
         }
 #else
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+        /* riz v4.4: while the ML menu is up, the screen behind ML's layer is Canon's Picture Style dialog (GUI mode
+         * 0x68, GUIMODE_ML_MENU), so any transparent pixel (index 0 / 3: clrscr, erase-by-0) shows that dialog -
+         * e.g. arkanoid, which clears the screen and erases with colour 0 (user, v4.3). Draw them opaque black. */
+        const int r_menu_opaque = gui_menu_shown();
+        r_menu_opaque_pass = r_menu_opaque;
+#endif
         //SJE FIXME benchmark this loop, it probably wants optimising
         for (size_t n = 0; n < BMP_VRAM_SIZE; n++)
         {
@@ -317,6 +325,9 @@ void refresh_yuv_from_rgb(void)
             // don't copy into dest.  This is COLOR_TRANSPARENT_BLACK in
             // the LUT
             uint32_t rgb = indexed2rgb(*b);
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+            if (r_menu_opaque && !(rgb >> 24)) rgb = 0xFF000000;
+#endif
             if ((rgb && 0xff000000) == 0x00000000)
                 rgb_data++;
             else
@@ -331,6 +342,14 @@ void refresh_yuv_from_rgb(void)
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
     uint64_t r_t1 = get_us_clock();
     { uint32_t c = (uint32_t)(r_t1 - r_t0); if (c > r_conv_us_max) r_conv_us_max = c; }
+    /* v4.4: the menu closed while this pass painted transparent pixels black: menu_close's clrscr may already have
+     * run, and later passes skip transparent pixels, so the black would stay over live view. Clear and redo. */
+    if (r_menu_opaque_pass && !gui_menu_shown())
+    {
+        rgba_buffer_clear();
+        ml_refresh_display_needed = 1;
+    }
+    r_menu_opaque_pass = 0;
 #endif
     // trigger Ximr to render to OSD from RGB buffer
 #ifdef CONFIG_DIGIC_VI
@@ -349,6 +368,14 @@ void refresh_yuv_from_rgb(void)
 void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    if (gui_menu_shown())       /* v4.4: opaque black over Canon's Picture Style dialog (see refresh_yuv_from_rgb) */
+    {
+        uint32_t *p = (uint32_t *) rgb_vram_info->bitmap_data;
+        for (size_t n = 0; n < BMP_VRAM_SIZE; n++) p[n] = 0xFF000000;
+        return;
+    }
+#endif
     bzero32(rgb_vram_info->bitmap_data, BMP_VRAM_SIZE*4);
 }
 
