@@ -43,3 +43,7 @@
 #define CONFIG_PROP_ISO_BYTE1           /* PROP_ISO is a 4-byte value, ISO code in BYTE 1: code 15=ISO100, +3/stop (R encoding) */
 #define CONFIG_PROP_APERTURE_BYTE1      /* PROP_APERTURE is a 2-byte value, Av code in BYTE 1: code 9=f/2.8, +3/stop (R encoding) */
 #define CONFIG_HDR_BRACKET_VIA_FILENUMBER  /* job_state unreliable: drive HDR bracketing off the card file_number + related R adaptations */
+
+/** v4.6: Canon closes the dialog under ML's menu (GUI mode 0x68) after a while without keys; poke it every 2 s
+ * like EOSM/6D/100D (menu.c menu_ensure_canon_dialog). Not camera-tested on the R. */
+#define CONFIG_MENU_TIMEOUT_FIX

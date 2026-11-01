@@ -695,6 +695,22 @@ static MENU_UPDATE_FUNC(image_buf_display)
 }
 #endif
 
+#ifdef CONFIG_R
+/* v4.6: screen refresh timing (bmp.c redraw_task), to tell slow conversion from slow XimrExe (Canon's push) */
+extern uint32_t r_refresh_count, r_refresh_us_max, r_conv_us_max, r_ximr_us_max, r_full_count;
+static MENU_UPDATE_FUNC(r_refresh_stats_display)
+{
+    MENU_SET_VALUE("max %d ms", (int)(r_refresh_us_max / 1000));
+    MENU_SET_RINFO("conv %d, push %d", (int)(r_conv_us_max / 1000), (int)(r_ximr_us_max / 1000));
+    MENU_SET_WARNING(MENU_WARN_INFO, "%d refreshes, %d full passes. SET resets the maxima.",
+                     (int)r_refresh_count, (int)r_full_count);
+}
+static MENU_SELECT_FUNC(r_refresh_stats_reset)
+{
+    r_refresh_us_max = r_conv_us_max = r_ximr_us_max = 0;
+}
+#endif
+
 static MENU_UPDATE_FUNC(shuttercount_display)
 {
 #if defined(CONFIG_DIGIC_8X)
@@ -1109,6 +1125,15 @@ static struct menu_entry debug_menus[] = {
         .icon_type = IT_ALWAYS_ON,
         .help = "Display the image buffer sizes (LiveView and Craw).",
         //.essential = 0,
+    },
+#endif
+#ifdef CONFIG_R
+    {
+        .name = "Screen refresh",
+        .update = r_refresh_stats_display,
+        .select = r_refresh_stats_reset,
+        .icon_type = IT_ACTION,
+        .help = "Worst ML screen update since reset: total, conversion, Canon push.",
     },
 #endif
 #ifdef FEATURE_SHOW_SHUTTER_COUNT

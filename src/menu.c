@@ -4957,6 +4957,11 @@ menu_redraw_task()
         int msg;
         int err = msg_queue_receive(menu_redraw_queue, (struct event**)&msg, 500);
         if (err) {
+            #if defined(CONFIG_R) && defined(CONFIG_MENU_TIMEOUT_FIX)
+            /* v4.6: with no key presses (e.g. a game blocking menu redraws) no redraw message arrives, so the
+             * keep-alive in menu_ensure_canon_dialog never ran and Canon closed the dialog under ML's menu (user) */
+            if (gui_menu_shown()) menu_ensure_canon_dialog();
+            #endif
             //DryosDebugMsg(0, 15, "err from queue, continuing anyway: 0x%x", err);
             //SJE FIXME - we see 0x9 errors.
             // There looks to be only one path where msg_queue_receive() returns 9,

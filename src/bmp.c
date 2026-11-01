@@ -206,6 +206,7 @@ extern struct semaphore *winsys_sem;
 static uint32_t *r_shadow = NULL;
 static uint32_t *r_shadow_rgb = NULL;
 static int r_full_countdown = 0;
+static volatile int r_force_full = 1;   /* v4.6: shadow known stale (clear, other conversion path): next pass full */
 uint32_t r_refresh_us_last = 0, r_refresh_us_max = 0, r_refresh_count = 0, r_refresh_words_last = 0;
 uint32_t r_conv_us_max = 0, r_ximr_us_max = 0, r_full_count = 0;
 static int r_prev_evf = -1;
@@ -219,10 +220,14 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb, int opaque)
     {
         r_shadow = malloc(BMP_VRAM_SIZE);
         if (!r_shadow) return 0; /* fall back to full conversion */
-        r_full_countdown = 0;
+        r_force_full = 1;
     }
     int evf = R_DISP_IS_EVF();
-    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb) || (evf != r_prev_evf) || (opaque != r_prev_opaque);
+    /* v4.6: no periodic safety pass while the ML menu is up: one full pass costs ~0.1-0.4 s, a visible stall in
+     * games (user, v4.5); forced passes (clear, path switch, EVF, menu open/close) still happen */
+    int periodic = opaque ? 0 : (r_full_countdown-- <= 0);
+    int full = r_force_full || periodic || (rgb != r_shadow_rgb) || (evf != r_prev_evf) || (opaque != r_prev_opaque);
+    r_force_full = 0;
     r_prev_evf = evf;
     r_prev_opaque = opaque;
     if (full)
@@ -303,7 +308,7 @@ void refresh_yuv_from_rgb(void)
     }
     else{
 #ifdef CONFIG_R
-        r_full_countdown = 0; // shadow is stale once the other path has drawn
+        r_force_full = 1; // shadow is stale once the other path has drawn
 #endif
 #endif
 #if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
@@ -387,7 +392,7 @@ void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
-    r_full_countdown = 0;       /* v4.5: the diff shadow no longer matches the RGBA buffer */
+    r_force_full = 1;           /* v4.5: the diff shadow no longer matches the RGBA buffer */
     if (gui_menu_shown())       /* v4.4: opaque black over Canon's Picture Style dialog (see refresh_yuv_from_rgb) */
     {
         uint32_t *p = (uint32_t *) rgb_vram_info->bitmap_data;
