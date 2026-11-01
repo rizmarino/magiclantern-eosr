@@ -4746,6 +4746,11 @@ menu_redraw_do()
     if (gui_state == GUISTATE_MENUDISP)
         return;
 
+#if defined(CONFIG_R)
+    extern void r_menu_draw_begin(void), r_menu_draw_end(void);
+    r_menu_draw_begin();    /* bmp.c: no screen push of a half-drawn menu */
+#endif
+
     if (menu_help_active)
     {
         menu_help_redraw();
@@ -4864,6 +4869,10 @@ menu_redraw_do()
         //~ update_stuff();
         lens_display_set_dirty();
     }
+
+#if defined(CONFIG_R)
+    r_menu_draw_end();
+#endif
     
     bmp_on();
 

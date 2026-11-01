@@ -352,6 +352,32 @@ void rgba_buffer_clear()
     bzero32(rgb_vram_info->bitmap_data, BMP_VRAM_SIZE*4);
 }
 
+#if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+/* riz v4.2: the ML menu redraws by clearing and repainting the one indexed layer (DOUBLE_BUFFERING is off on RGBA),
+ * and redraw_task converts that layer to the screen whenever ml_refresh_display_needed is set - which every
+ * bmp_printf of the redraw sets. A conversion that ran during (or was preempted by) a menu redraw pushed a
+ * half-painted menu: tab bar and items flicker. menu.c wraps each redraw in begin/end: begin stops new conversions
+ * and waits for a running one (r_in_refresh) to finish; end pushes the finished frame once. */
+volatile int r_menu_hold;
+static volatile int r_in_refresh;
+uint32_t r_menu_hold_waits;                     /* redraws that had to wait for a running conversion */
+void r_menu_draw_begin(void)
+{
+    r_menu_hold = 1;
+    asm volatile ("dmb" ::: "memory");
+    for (int i = 0; i < 50 && r_in_refresh; i++)   /* <= ~0.5 s; a full conversion takes well under that */
+    {
+        if (i == 0) r_menu_hold_waits++;
+        msleep(10);
+    }
+}
+void r_menu_draw_end(void)
+{
+    r_menu_hold = 0;
+    ml_refresh_display_needed = 1;
+}
+#endif
+
 #if defined(CONFIG_INSTALLER)
 // Normally in tasks.c, which installer builds don't include.
 // Unused, just need it defined to build.
@@ -370,7 +396,8 @@ void refresh_yuv_from_rgb_task(void *unused)
     {
         #if defined(CONFIG_R)
         extern volatile int r_refresh_hold;     /* riz: LV silent pictures hold refreshes while frames are copied */
-        if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON && !r_refresh_hold)
+        r_in_refresh = 1;                       /* set before testing r_menu_hold: see r_menu_draw_begin */
+        if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON && !r_refresh_hold && !r_menu_hold)
         #else
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
         #endif
@@ -387,6 +414,7 @@ void refresh_yuv_from_rgb_task(void *unused)
             #endif
         }
         #if defined(CONFIG_R)
+        r_in_refresh = 0;
         // riz/eosr: poll faster for LV overlays; menu keeps the stock 50 ms (faster refreshes caught it mid-draw)
         msleep(gui_menu_shown() ? 50 : ml_refresh_display_needed ? 10 : 20);
         #else
