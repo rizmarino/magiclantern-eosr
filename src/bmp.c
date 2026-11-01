@@ -209,8 +209,11 @@ static int r_full_countdown = 0;
 uint32_t r_refresh_us_last = 0, r_refresh_us_max = 0, r_refresh_count = 0, r_refresh_words_last = 0;
 uint32_t r_conv_us_max = 0, r_ximr_us_max = 0, r_full_count = 0;
 static int r_prev_evf = -1;
+static int r_prev_opaque = -1;
+static uint32_t r_lut[256];             /* v4.5: indexed -> RGBA for this pass (opaque variant while the ML menu is up) */
 
-static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
+/* opaque: draw transparent indices as black (ML menu up: Canon's Picture Style dialog is behind the layer, v4.4) */
+static int r_refresh_diff(const uint8_t *b, uint32_t *rgb, int opaque)
 {
     if (!r_shadow)
     {
@@ -219,13 +222,19 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
         r_full_countdown = 0;
     }
     int evf = R_DISP_IS_EVF();
-    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb) || (evf != r_prev_evf);
+    int full = (r_full_countdown-- <= 0) || (rgb != r_shadow_rgb) || (evf != r_prev_evf) || (opaque != r_prev_opaque);
     r_prev_evf = evf;
+    r_prev_opaque = opaque;
     if (full)
     {
         r_full_count++;
         r_full_countdown = R_FULL_EVERY;
         r_shadow_rgb = rgb;
+    }
+    for (int i = 0; i < 256; i++)
+    {
+        uint32_t c = indexed2rgb(i);
+        r_lut[i] = (opaque && !(c >> 24)) ? 0xFF000000 : c;
     }
 
     const uint32_t *b4 = (const uint32_t *)b;
@@ -238,10 +247,10 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb)
         s4[w] = v;
         changed++;
         uint32_t *d = rgb + w * 4;
-        d[0] = indexed2rgb(v & 0xFF);
-        d[1] = indexed2rgb((v >> 8) & 0xFF);
-        d[2] = indexed2rgb((v >> 16) & 0xFF);
-        d[3] = indexed2rgb(v >> 24);
+        d[0] = r_lut[v & 0xFF];
+        d[1] = r_lut[(v >> 8) & 0xFF];
+        d[2] = r_lut[(v >> 16) & 0xFF];
+        d[3] = r_lut[v >> 24];
     }
     r_refresh_words_last = changed;
     return 1;
@@ -269,11 +278,20 @@ void refresh_yuv_from_rgb(void)
     }
 
 #if !defined(CONFIG_INSTALLER)
+#ifdef CONFIG_R
+    /* v4.5: the ML menu (and games/tools drawn over it) used the full conversion on every refresh: 518k pixels,
+     * ~100-400 ms each, so Arkanoid ran at a few fps (user). The changed-pixels path serves the menu too now, with
+     * transparent pixels drawn opaque black (v4.4). */
+    const int r_menu_up = gui_menu_shown();
+    if (r_menu_up) r_menu_opaque_pass = 1;
+    if (zebra_should_run() || r_menu_up){
+#else
     if(zebra_should_run()){
+#endif
 #ifdef CONFIG_R
         // riz/eosr-experimental: only convert pixels whose index changed
         // (full redraw every ~20 refreshes as a safety net).
-        if (!r_refresh_diff(b, rgb_data))
+        if (!r_refresh_diff(b, rgb_data, r_menu_up))
 #endif
         {
         // always draw our stuff, including full alpha
@@ -369,6 +387,7 @@ void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    r_full_countdown = 0;       /* v4.5: the diff shadow no longer matches the RGBA buffer */
     if (gui_menu_shown())       /* v4.4: opaque black over Canon's Picture Style dialog (see refresh_yuv_from_rgb) */
     {
         uint32_t *p = (uint32_t *) rgb_vram_info->bitmap_data;
@@ -443,7 +462,9 @@ void refresh_yuv_from_rgb_task(void *unused)
         #if defined(CONFIG_R)
         r_in_refresh = 0;
         // riz/eosr: poll faster for LV overlays; menu keeps the stock 50 ms (faster refreshes caught it mid-draw)
-        msleep(gui_menu_shown() ? 50 : ml_refresh_display_needed ? 10 : 20);
+        // v4.5: a game/tool that blocks menu redraws (arkanoid) owns the screen: 20 ms, like LV overlays
+        extern int menu_redraw_blocked;
+        msleep(gui_menu_shown() && !menu_redraw_blocked ? 50 : ml_refresh_display_needed ? 10 : 20);
         #else
         msleep(50); // max 20 fps refresh
         #endif
