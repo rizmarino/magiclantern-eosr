@@ -1761,6 +1761,13 @@ void
 shutter_toggle(void* priv, int sign)
 {
     if (!lens_info.raw_shutter) return;
+#ifdef CONFIG_PROP_SHUTTER_HI_BYTE
+    /* R: the camera takes 1/3-stop codes (lens.c ml_raw_to_r_shutter16 rounds), but codes_shutter steps 1/8 EV, so
+     * the next entry rounds back to the current third: the same value is written every press and the shutter never
+     * moves (user, v4.2). Step +-3 raw = 1.125 thirds, which always lands on the neighbouring third. */
+    lens_set_rawshutter(lens_info.raw_shutter + 3 * SGN(sign));
+    return;
+#endif
     int i = raw2index_shutter(lens_info.raw_shutter);
     int k;
     for (k = 0; k < 15; k++)
