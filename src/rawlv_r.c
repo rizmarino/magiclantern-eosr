@@ -24,6 +24,7 @@
 #include "config.h"
 #include "histogram.h"
 #include "zebra.h"
+#include "lens.h"
 #define RL_RD32(a) (*(volatile uint32_t *)(a))
 extern int rawrec_running(void);
 extern int r_rawlv_wanted(void);        /* zebra.c: RAW histogram or RAW zebras selected and drawn */
@@ -93,7 +94,7 @@ struct rl_res
 {
     uint32_t hist_r[HIST_WIDTH], hist_g[HIST_WIDTH], hist_b[HIST_WIDTH], total;
     uint8_t cell[RL_GH][RL_GW];         /* bit0/1/2 R/G/B clipped, bit3 under ((R+2G+B)/4 < black + 2 sigma + 1) */
-    int black, sigma_x10, dr_x10, w, h, bpp, ml_order, pass_ms, t_ms;
+    int black, sigma_x10, dr_x10, w, h, bpp, ml_order, pass_ms, t_ms, t0_ms;
 };
 #define RL_CLIP_R 1
 #define RL_CLIP_G 2
@@ -210,6 +211,7 @@ void r_rawlv_status(char *s, int n, int *ok)
 }
 
 /* ---- sampler task ---- */
+static int r_ettr_wants_raw(void);
 static int rl_own, rl_lv_since, rl_settle_until;
 static void rl_step(void)
 {
@@ -222,7 +224,7 @@ static void rl_step(void)
     }
     if (!rl_lv_since) rl_lv_since = now;
     int canon_rec = RECORDING && !rawrec_running();
-    int want = r_rawlv_wanted() && lv_movie_select == LVMS_ENABLE_MOVIE && get_global_draw_setting() && !canon_rec;
+    int want = (r_rawlv_wanted() || r_ettr_wants_raw()) && lv_movie_select == LVMS_ENABLE_MOVIE && get_global_draw_setting() && !canon_rec;
     if (!want)
     {
         if (rl_own && MEM(RL_PATH + 0x40) && !rawrec_running())
@@ -254,7 +256,7 @@ static void rl_step(void)
     struct rl_res *r = rl_buf[k];
     int t0 = get_ms_clock();
     if (!rl_pass(r, &f)) { rl_skips++; return; }
-    r->t_ms = get_ms_clock(); r->pass_ms = r->t_ms - t0;
+    r->t_ms = get_ms_clock(); r->pass_ms = r->t_ms - t0; r->t0_ms = t0;
     rl_front = k;
     rl_passes++;
 }
@@ -267,6 +269,179 @@ static void rl_task(void *unused)
         rl_step();
     }
 }
+
+/* ---- v4.10: movie ETTR (Expo > Auto ETTR (movie)) ----
+ * Expose to the right with ISO only (video keeps its shutter angle): from the newest raw pass, find the brightest
+ * channel's level above which only "Highlight ignore" of the samples lie, and set ISO so that level sits "Headroom"
+ * below clipping. Clipped beyond the ignore share: step down (-1 EV - headroom) and measure again. Up to 5 steps, each
+ * on a raw pass that started >= 400 ms after the ISO change. ISO in the R's own 1/3-stop codes (15 = ISO 100, +3 per
+ * stop, lens.c r_iso_to_ml_raw), so the readback check is exact. Never while recording (Canon H.264 or RAW video).
+ * Triggers: menu "Run now", half-press (movie LV, ML menu closed), or Continuous (every ~2 s, hysteresis 0.7 EV). */
+static CONFIG_INT("r.ettr.trig", ettr_trig, 0);         /* 0 OFF, 1 half-press, 2 continuous */
+static CONFIG_INT("r.ettr.ignore", ettr_ign_sel, 1);     /* 0 / 0.1 / 0.5 / 1 / 2 % */
+static CONFIG_INT("r.ettr.head", ettr_head_sel, 1);      /* 0.3 / 0.5 / 1.0 EV */
+static CONFIG_INT("r.ettr.maxiso", ettr_max_sel, 2);     /* 800 1600 3200 6400 12800 */
+static const int ettr_ign_x1000[] = { 0, 1, 5, 10, 20 };   /* per mille */
+static const int ettr_head_x10[] = { 3, 5, 10 };
+static const int ettr_max_iso[] = { 800, 1600, 3200, 6400, 12800 };
+static volatile int ettr_run_req, ettr_busy;
+static char ettr_last[48] = "not run yet";
+
+static int r_ettr_wants_raw(void) { return ettr_trig || ettr_run_req || ettr_busy; }
+
+static int rl_div_round(int a, int b) { return a >= 0 ? (2 * a + b) / (2 * b) : -((-2 * a + b) / (2 * b)); }
+static int ettr_code_of_raw(int raw) { return raw ? 15 + rl_div_round((raw - 72) * 3, 8) : 0; }    /* = lens.c ml_raw_to_r_iso */
+static int ettr_raw_of_code(int code) { return 72 + rl_div_round((code - 15) * 8, 3); }            /* = lens.c r_iso_to_ml_raw */
+static int ettr_code_of_iso(int iso) { int c = 15; for (int i = 100; i < iso; i *= 2) c += 3; return c; }
+
+/* EV (x100) from the ignore-percentile highlight level to clipping; -1 = clipped beyond the ignore share */
+static int ettr_stops_x100(const struct rl_res *r, int ign_x1000)
+{
+    uint32_t lim = (uint32_t)((uint64_t)r->total * ign_x1000 / 1000);
+    const uint32_t *h[3] = { r->hist_r, r->hist_g, r->hist_b };
+    int top = 0;
+    for (int c = 0; c < 3; c++)
+    {
+        uint32_t acc = 0;
+        int b = HIST_WIDTH - 1;
+        for (; b > 0; b--) { acc += h[c][b]; if (acc > lim) break; }
+        if (b > top) top = b;
+    }
+    if (top >= HIST_WIDTH - 1) return -1;
+    return (HIST_WIDTH - 1 - top) * 1200 / (HIST_WIDTH - 1) - 1200 / (HIST_WIDTH - 1) / 2;   /* bin centre */
+}
+
+/* newest pass that started at or after t (waits up to ~3 s) */
+static struct rl_res *ettr_wait_pass(int t)
+{
+    for (int i = 0; i < 60; i++)
+    {
+        int k = rl_front;
+        if (k >= 0 && rl_buf[k] && rl_buf[k]->t0_ms >= t) return rl_buf[k];
+        msleep(50);
+    }
+    return 0;
+}
+
+static int ettr_blocked(void) { return RECORDING || rawrec_running() || !lv || lv_movie_select != LVMS_ENABLE_MOVIE; }
+
+/* one ETTR run; quiet = continuous mode (no message box unless an error); returns 1 if ISO changed */
+static int ettr_run(int quiet, int hyst_x100)
+{
+    if (ettr_blocked()) { snprintf(ettr_last, sizeof(ettr_last), "%s", lv_movie_select != LVMS_ENABLE_MOVIE ? "movie mode only" : RECORDING || rawrec_running() ? "not while recording" : "LiveView off"); return 0; }
+    if (!lens_info.raw_iso) { snprintf(ettr_last, sizeof(ettr_last), "ISO is Auto: set a manual ISO"); if (!quiet) NotifyBox(3000, "ETTR: %s", ettr_last); return 0; }
+    ettr_busy = 1;
+    const int iso0 = lens_info.raw_iso, code0 = ettr_code_of_raw(iso0);
+    const int maxc = ettr_code_of_iso(ettr_max_iso[COERCE(ettr_max_sel, 0, 4)]);
+    const int head = ettr_head_x10[COERCE(ettr_head_sel, 0, 2)] * 10, ign = ettr_ign_x1000[COERCE(ettr_ign_sel, 0, 4)];
+    int code = code0, changed = 0, steps = 0, t = get_ms_clock() - 300, err = 0, st = 0;
+    for (; steps < 5; steps++)
+    {
+        struct rl_res *r = ettr_wait_pass(t);
+        if (!r) { err = 1; snprintf(ettr_last, sizeof(ettr_last), "no raw data (%s)", rl_why); break; }
+        if (ettr_blocked()) { err = 1; snprintf(ettr_last, sizeof(ettr_last), "stopped: recording / mode change"); break; }
+        st = ettr_stops_x100(r, ign);
+        int delta_x100 = st < 0 ? -(100 + head) : st - head;
+        if (st >= 0 && ABS(delta_x100) < (steps ? 20 : hyst_x100)) break;           /* on target */
+        /* 1/3-stop codes, rounded to the safe side: raise at most to the headroom, lower at least to it */
+        int dc = delta_x100 >= 0 ? delta_x100 * 3 / 100 : -((-delta_x100 * 3 + 99) / 100);
+        if (!dc) break;                                 /* within 1/3 stop below the target */
+        int nc = COERCE(code + dc, 15, maxc);
+        if (nc == code) break;                          /* at a limit */
+        lens_set_rawiso(ettr_raw_of_code(nc));
+        msleep(200);
+        if (lens_info.raw_iso != ettr_raw_of_code(nc))
+        { err = 1; snprintf(ettr_last, sizeof(ettr_last), "ISO change not accepted (%d)", raw2iso(lens_info.raw_iso)); break; }
+        code = nc; changed = 1;
+        t = get_ms_clock() + 400;                       /* Canon applies the gain a few frames later */
+    }
+    if (!err)
+    {
+        int ev10 = (code - code0) * 10 / 3;
+        const char *lim = st < 0 && code == 15 ? ", still clipped" : code == maxc && st > head + 20 ? ", max ISO" : "";
+        if (changed) snprintf(ettr_last, sizeof(ettr_last), "ISO %d -> %d (%s%d.%d EV)%s", raw2iso(iso0), raw2iso(lens_info.raw_iso),
+                              ev10 < 0 ? "-" : "+", ABS(ev10) / 10, ABS(ev10) % 10, lim);
+        else snprintf(ettr_last, sizeof(ettr_last), "ISO %d kept%s", raw2iso(iso0), *lim ? lim : " (on target)");
+    }
+    if (!quiet || err) NotifyBox(3000, "ETTR: %s", ettr_last);
+    ettr_busy = 0;
+    return changed;
+}
+
+static void ettr_task(void *unused)
+{
+    int last_half = 0, next_cont = 0;
+    for (;;)
+    {
+        msleep(50);
+        if (ettr_run_req) { while (gui_menu_shown()) msleep(100); ettr_run(0, 20); ettr_run_req = 0; continue; }
+        if (ettr_trig == 1)
+        {
+            int h = get_halfshutter_pressed();
+            if (h && !last_half && !gui_menu_shown() && !ettr_blocked()) ettr_run(0, 20);
+            last_half = h;
+        }
+        else if (ettr_trig == 2 && get_ms_clock() >= next_cont)
+        {
+            next_cont = get_ms_clock() + 2000;
+            if (!gui_menu_shown() && !ettr_blocked() && lens_info.raw_iso && rl_fresh()) ettr_run(1, 70);
+        }
+    }
+}
+
+#ifndef RL_HOST
+static MENU_UPDATE_FUNC(ettr_main_update)
+{
+    MENU_SET_VALUE("%s", ettr_trig == 0 ? "OFF" : ettr_trig == 1 ? "Half-press" : "Continuous");
+    MENU_SET_RINFO("%s", ettr_busy ? "running" : "");
+    MENU_SET_WARNING(MENU_WARN_INFO, "Last: %s", ettr_last);
+}
+static MENU_SELECT_FUNC(ettr_run_now) { ettr_run_req = 1; }
+static struct menu_entry ettr_menu[] = {
+    {
+        .name     = "Auto ETTR (movie)",
+        .priv     = &ettr_trig,
+        .max      = 2,
+        .choices  = CHOICES("OFF", "Half-press", "Continuous"),
+        .update   = ettr_main_update,
+        .help     = "Expose to the right with ISO, from the raw data: highlights just below clipping.",
+        .help2    = "Movie mode, manual ISO. Never changes ISO while recording. Shutter/aperture untouched.",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "Run now",
+                .select  = ettr_run_now,
+                .icon_type = IT_ACTION,
+                .help    = "One ETTR run as soon as the ML menu is closed.",
+            },
+            {
+                .name    = "Highlight ignore",
+                .priv    = &ettr_ign_sel,
+                .max     = 4,
+                .choices = CHOICES("0%", "0.1%", "0.5%", "1%", "2%"),
+                .help    = "Share of the image allowed to clip (light sources, specular highlights).",
+            },
+            {
+                .name    = "Headroom",
+                .priv    = &ettr_head_sel,
+                .max     = 2,
+                .choices = CHOICES("0.3 EV", "0.5 EV", "1.0 EV"),
+                .help    = "How far below clipping the highlights are placed.",
+            },
+            {
+                .name    = "Max ISO",
+                .priv    = &ettr_max_sel,
+                .max     = 4,
+                .choices = CHOICES("800", "1600", "3200", "6400", "12800"),
+                .help    = "ETTR never goes above this ISO (noise).",
+            },
+            MENU_EOL
+        },
+    },
+};
+static void ettr_init(void *unused) { menu_add("Expo", ettr_menu, COUNT(ettr_menu)); }
+INIT_FUNC("r_ettr", ettr_init);
+TASK_CREATE("r_ettr", ettr_task, 0, 0x1e, 0x1000);
+#endif
 
 #ifndef RL_HOST
 TASK_CREATE("r_rawlv", rl_task, 0, 0x1e, 0x1000);
