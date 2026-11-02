@@ -5651,7 +5651,9 @@ static void piggyback_canon_menu()
     if (new_gui_mode != (int)CURRENT_GUI_MODE) 
     { 
         start_redraw_flood();
+        #ifndef CONFIG_R    /* v4.7: on the R this mutes ML's own layer and shows Canon's dialog (0x68) */
         if (lv) bmp_off(); // mask out the underlying Canon menu :)
+        #endif
         SetGUIRequestMode(new_gui_mode); msleep(200); 
         // bmp will be enabled after first redraw
     }
@@ -5664,7 +5666,9 @@ static void close_canon_menu()
     if (CURRENT_GUI_MODE == 0) return;
     if (sensor_cleaning) return;
     if (gui_state == GUISTATE_MENUDISP) return;
+    #ifndef CONFIG_R    /* v4.7: see piggyback_canon_menu */
     if (lv) bmp_off(); // mask out the underlying Canon menu :)
+    #endif
     SetGUIRequestMode(0);
     msleep(100);
     // bitmap will be re-enabled in the caller

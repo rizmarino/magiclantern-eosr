@@ -211,7 +211,36 @@ uint32_t r_refresh_us_last = 0, r_refresh_us_max = 0, r_refresh_count = 0, r_ref
 uint32_t r_conv_us_max = 0, r_ximr_us_max = 0, r_full_count = 0;
 static int r_prev_evf = -1;
 static int r_prev_opaque = -1;
+static int r_prev_scheme = -1;
 static uint32_t r_lut[256];             /* v4.5: indexed -> RGBA for this pass (opaque variant while the ML menu is up) */
+
+/* v4.7: Display > Color scheme on the R. The stock code rewrites DIGIC 4/5 palette registers (EngDrvOut to
+ * LCD_Palette, which doesn't exist here); the R applies the scheme in this table instead (ARGB, opaque pixels only):
+ * 0 Default, 1 Dark (1/3), 2 Bright Gray, 3 Dark Gray, 4 Dark Red, 5 Dark Green. */
+extern int bmp_color_scheme;
+static uint32_t r_scheme_rgb(uint32_t c, int scheme)
+{
+    if (!scheme || !(c >> 24)) return c;
+    int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+    int y = (r * 77 + g * 150 + b * 29) >> 8;
+    switch (scheme)
+    {
+        case 1: r /= 3; g /= 3; b /= 3; break;
+        case 2: r = g = b = y; break;
+        case 3: r = g = b = y / 3; break;
+        case 4: r = y * 3 / 5; g = b = 0; break;
+        case 5: g = y / 3; r = b = 0; break;
+    }
+    return (c & 0xFF000000) | (r << 16) | (g << 8) | b;
+}
+static void r_build_lut(int opaque, int scheme)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        uint32_t c = indexed2rgb(i);
+        r_lut[i] = r_scheme_rgb((opaque && !(c >> 24)) ? 0xFF000000 : c, scheme);
+    }
+}
 
 /* opaque: draw transparent indices as black (ML menu up: Canon's Picture Style dialog is behind the layer, v4.4) */
 static int r_refresh_diff(const uint8_t *b, uint32_t *rgb, int opaque)
@@ -223,24 +252,23 @@ static int r_refresh_diff(const uint8_t *b, uint32_t *rgb, int opaque)
         r_force_full = 1;
     }
     int evf = R_DISP_IS_EVF();
+    int scheme = COERCE(bmp_color_scheme, 0, 5);
     /* v4.6: no periodic safety pass while the ML menu is up: one full pass costs ~0.1-0.4 s, a visible stall in
-     * games (user, v4.5); forced passes (clear, path switch, EVF, menu open/close) still happen */
+     * games (user, v4.5); forced passes (clear, path switch, EVF, menu open/close, scheme change) still happen */
     int periodic = opaque ? 0 : (r_full_countdown-- <= 0);
-    int full = r_force_full || periodic || (rgb != r_shadow_rgb) || (evf != r_prev_evf) || (opaque != r_prev_opaque);
+    int full = r_force_full || periodic || (rgb != r_shadow_rgb) || (evf != r_prev_evf) || (opaque != r_prev_opaque)
+               || (scheme != r_prev_scheme);
     r_force_full = 0;
     r_prev_evf = evf;
     r_prev_opaque = opaque;
+    r_prev_scheme = scheme;
     if (full)
     {
         r_full_count++;
         r_full_countdown = R_FULL_EVERY;
         r_shadow_rgb = rgb;
     }
-    for (int i = 0; i < 256; i++)
-    {
-        uint32_t c = indexed2rgb(i);
-        r_lut[i] = (opaque && !(c >> 24)) ? 0xFF000000 : c;
-    }
+    r_build_lut(opaque, scheme);
 
     const uint32_t *b4 = (const uint32_t *)b;
     uint32_t *s4 = r_shadow;
@@ -340,6 +368,7 @@ void refresh_yuv_from_rgb(void)
          * e.g. arkanoid, which clears the screen and erases with colour 0 (user, v4.3). Draw them opaque black. */
         const int r_menu_opaque = gui_menu_shown();
         r_menu_opaque_pass = r_menu_opaque;
+        r_build_lut(r_menu_opaque, COERCE(bmp_color_scheme, 0, 5));     /* v4.7: opaque + colour scheme */
 #endif
         //SJE FIXME benchmark this loop, it probably wants optimising
         for (size_t n = 0; n < BMP_VRAM_SIZE; n++)
@@ -347,9 +376,10 @@ void refresh_yuv_from_rgb(void)
             // limited alpha support, if dest pixel would be full alpha,
             // don't copy into dest.  This is COLOR_TRANSPARENT_BLACK in
             // the LUT
-            uint32_t rgb = indexed2rgb(*b);
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
-            if (r_menu_opaque && !(rgb >> 24)) rgb = 0xFF000000;
+            uint32_t rgb = r_lut[*b];
+#else
+            uint32_t rgb = indexed2rgb(*b);
 #endif
             if ((rgb && 0xff000000) == 0x00000000)
                 rgb_data++;
@@ -404,6 +434,32 @@ void rgba_buffer_clear()
 }
 
 #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+/* v4.7: ML layer mute (bmp_off/bmp_on, see palette_disable) */
+static volatile int r_muted, r_mute_push;
+void r_bmp_mute(int muted)
+{
+    muted = !!muted;
+    if (muted == r_muted) return;       /* clearscreen_task calls bmp_on/off every 100 ms: act on changes only */
+    r_muted = muted;
+    if (muted) r_mute_push = 1;
+    else { r_force_full = 1; ml_refresh_display_needed = 1; }
+}
+/* in redraw_task: 1 = muted, skip the conversion (pushes one cleared layer first) */
+static int r_mute_step(void)
+{
+    if (!r_muted || gui_menu_shown() || !rgb_vram_info) return 0;
+    if (r_mute_push && DISPLAY_IS_ON)
+    {
+        r_mute_push = 0;
+        rgba_buffer_clear();                    /* menu not shown: transparent; forces the next pass full */
+        take_semaphore(winsys_sem, 0);
+        XimrExe((void *)XIMR_CONTEXT);
+        give_semaphore(winsys_sem);
+    }
+    ml_refresh_display_needed = 0;              /* drawing goes on in the indexed layer; unmute pushes it */
+    return 1;
+}
+
 /* riz v4.2: the ML menu redraws by clearing and repainting the one indexed layer (DOUBLE_BUFFERING is off on RGBA),
  * and redraw_task converts that layer to the screen whenever ml_refresh_display_needed is set - which every
  * bmp_printf of the redraw sets. A conversion that ran during (or was preempted by) a menu redraw pushed a
@@ -448,7 +504,8 @@ void refresh_yuv_from_rgb_task(void *unused)
         #if defined(CONFIG_R)
         extern volatile int r_refresh_hold;     /* riz: LV silent pictures hold refreshes while frames are copied */
         r_in_refresh = 1;                       /* set before testing r_menu_hold: see r_menu_draw_begin */
-        if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON && !r_refresh_hold && !r_menu_hold)
+        if (r_mute_step()) { /* v4.7: ML layer muted (Clear overlays) */ }
+        else if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON && !r_refresh_hold && !r_menu_hold)
         #else
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
         #endif
@@ -1560,6 +1617,13 @@ void bmp_flip_ex(uint8_t* dst, uint8_t* src, uint8_t* mirror, int voffset)
 
 static void palette_disable(uint32_t disabled)
 {
+    #if defined(CONFIG_R) && !defined(CONFIG_INSTALLER)
+    /* v4.7: on the R, bmp_off()/bmp_on() (Clear overlays, idle powersave) mute ML's layer in redraw_task: one cleared
+     * push, then no conversions until unmuted (the menu is never muted). Stock RGBA builds made this a no-op. */
+    extern void r_bmp_mute(int muted);
+    r_bmp_mute(disabled);
+    return;
+    #endif
     #if defined(CONFIG_VXWORKS) || defined(FEATURE_VRAM_RGBA)
     return; // see set_ml_palette
     #endif

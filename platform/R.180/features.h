@@ -83,6 +83,11 @@
 #define FEATURE_SHOW_IMAGE_BUFFERS_INFO
 #define FEATURE_SHOW_CMOS_TEMPERATURE
 
+// riz v4.7 (NOT camera-tested): Display > Clear overlays (bmp_off/bmp_on mute ML's RGBA layer, bmp.c r_bmp_mute)
+// and Display > Color scheme (applied in bmp.c r_build_lut; the stock LCD_Palette pokes are compiled out on the R)
+#define FEATURE_CLEAR_OVERLAYS
+#define FEATURE_COLOR_SCHEME
+
 // keep upstream dev's crash log + ROM autobackup: crash logs are essential
 // for first hardware tests, ROM dumps enable qemu-eos emulation later
 #define CONFIG_CRASH_LOG

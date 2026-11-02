@@ -709,6 +709,30 @@ static MENU_SELECT_FUNC(r_refresh_stats_reset)
 {
     r_refresh_us_max = r_conv_us_max = r_ximr_us_max = 0;
 }
+
+/* v4.7 probe: does the R send PROP_BATTERY_REPORT unasked, and does the DIGIC 5/6 layout fit (5DS R, LP-E6:
+ * level % = buf[1] & 0xFF, buf[0] = batteries)? Copy only; decode in the menu. Read-only: no request is sent. */
+static uint32_t r_batt[8];
+static volatile int r_batt_len, r_batt_n;
+PROP_HANDLER(PROP_BATTERY_REPORT)
+{
+    int n = MIN((int)len, (int)sizeof(r_batt));
+    memcpy(r_batt, buf, n);
+    r_batt_len = len;
+    r_batt_n++;
+}
+static MENU_UPDATE_FUNC(r_batt_display)
+{
+    if (!r_batt_n)
+    {
+        MENU_SET_VALUE("no report yet");
+        MENU_SET_WARNING(MENU_WARN_INFO, "PROP_BATTERY_REPORT not received since power-on.");
+        return;
+    }
+    MENU_SET_VALUE("%d%%", (int)(r_batt[1] & 0xFF));
+    MENU_SET_RINFO("len %d, n %d", r_batt_len, r_batt_n);
+    MENU_SET_WARNING(MENU_WARN_INFO, "raw %x %x %x %x %x", r_batt[0], r_batt[1], r_batt[2], r_batt[3], r_batt[4]);
+}
 #endif
 
 static MENU_UPDATE_FUNC(shuttercount_display)
@@ -1134,6 +1158,12 @@ static struct menu_entry debug_menus[] = {
         .select = r_refresh_stats_reset,
         .icon_type = IT_ACTION,
         .help = "Worst ML screen update since reset: total, conversion, Canon push.",
+    },
+    {
+        .name = "Battery report",
+        .update = r_batt_display,
+        .icon_type = IT_ALWAYS_ON,
+        .help = "R probe: battery % from Canon's battery report (check vs Canon's own %).",
     },
 #endif
 #ifdef FEATURE_SHOW_SHUTTER_COUNT

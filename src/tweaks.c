@@ -2643,7 +2643,7 @@ static void brightness_saturation_reset()
 
 void alter_bitmap_palette_entry(int color, int base_color, int luma_scale_factor, int chroma_scale_factor)
 {
-#ifndef CONFIG_VXWORKS
+#if !defined(CONFIG_VXWORKS) && !defined(CONFIG_R)   /* R: no LCD_Palette; scheme is applied in bmp.c r_build_lut (v4.7) */
     int orig_palette_entry = LCD_Palette[3*base_color + 2];
     int8_t opacity = (orig_palette_entry >> 24) & 0xFF;
     uint8_t orig_y = (orig_palette_entry >> 16) & 0xFF;
@@ -2668,7 +2668,7 @@ void alter_bitmap_palette_entry(int color, int base_color, int luma_scale_factor
 
 static void alter_bitmap_palette(int dim_factor, int grayscale, int u_shift, int v_shift)
 {
-#ifndef CONFIG_VXWORKS
+#if !defined(CONFIG_VXWORKS) && !defined(CONFIG_R)   /* R: no LCD_Palette; scheme is applied in bmp.c r_build_lut (v4.7) */
 
     if (!bmp_is_on()) return;
 
@@ -3602,7 +3602,7 @@ static struct menu_entry display_menus[] = {
         },*/
     },
     #endif
-    #if defined(CONFIG_KILL_FLICKER) || defined(FEATURE_SCREEN_LAYOUT) || defined(FEATURE_IMAGE_POSITION) || defined(FEATURE_UPSIDE_DOWN) || defined(FEATURE_IMAGE_ORIENTATION) || defined(FEATURE_AUTO_MIRRORING_HACK) || defined(FEATURE_FORCE_HDMI_VGA)
+    #if defined(CONFIG_KILL_FLICKER) || defined(FEATURE_SCREEN_LAYOUT) || defined(FEATURE_IMAGE_POSITION) || defined(FEATURE_UPSIDE_DOWN) || defined(FEATURE_IMAGE_ORIENTATION) || defined(FEATURE_AUTO_MIRRORING_HACK) || defined(FEATURE_FORCE_HDMI_VGA) || defined(FEATURE_COLOR_SCHEME)
     {
         .name = "Advanced settings",
         .select         = menu_open_submenu,
