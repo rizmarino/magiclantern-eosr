@@ -16,6 +16,10 @@
 
 #include "zebra.h"
 #include "falsecolor.h"
+#ifdef CONFIG_R
+#include "property.h"
+#include "propvalues.h"
+#endif
 
 
 #if defined(FEATURE_HISTOGRAM)
@@ -341,6 +345,33 @@ void hist_draw_image(
     /* draw histogram border */
     bmp_draw_rect(60, x_origin-1, y_origin-1, HIST_WIDTH+2, hist_height+2);
 
+    #if defined(CONFIG_R) && !defined(FEATURE_RAW_HISTOGRAM)
+    if (histogram.is_raw)       /* v4.9: RAW histogram from rawlv_r.c: 1-EV bars, EV indicator */
+    {
+        for (int ev = 1; ev < 12; ev++)
+        {
+            int x = x_origin + ev * (HIST_WIDTH - 1) / 12;
+            for (int y = y_origin + (ev < 4 ? font_med.height : 0); y < (int)y_origin + hist_height; y += 2)
+                bmp_putpixel(x, y, COLOR_GRAY(50));
+        }
+        char msg[12];
+        extern int r_rawlv_dr_x10(void);
+        int dr = r_rawlv_dr_x10();
+        if (hist_meter == 1 && dr) snprintf(msg, sizeof(msg), "D%d.%d", dr / 10, dr % 10);
+        else if (hist_meter == 2)
+        {
+            /* stops to the right: highest bin holding > 0.01% of the samples (like ML's raw histogram) */
+            uint32_t thr = histogram.total_px / 10000;
+            int top = -1;
+            for (int i = 0; i < HIST_WIDTH; i++)
+                if (histogram.hist_r[i] > thr || histogram.hist_g[i] > thr || histogram.hist_b[i] > thr) top = i;
+            if (top >= HIST_WIDTH - 1) snprintf(msg, sizeof(msg), "OVER");
+            else { int e = (HIST_WIDTH - 1 - MAX(top, 0)) * 120 / (HIST_WIDTH - 1); snprintf(msg, sizeof(msg), "E%d.%d", e / 10, e % 10); }
+        }
+        else snprintf(msg, sizeof(msg), "RAW");
+        bmp_printf(SHADOW_FONT(FONT_MED), x_origin + 4, y_origin, "%s", msg);
+    }
+    #endif
     #ifdef FEATURE_RAW_HISTOGRAM
     if (histogram.is_raw)
     {
@@ -393,6 +424,14 @@ MENU_UPDATE_FUNC(hist_print)
         raw = RAW_HISTOGRAM_ENABLED && can_use_raw_overlays_menu();
         #endif
         
+        #if defined(CONFIG_R) && !defined(FEATURE_RAW_HISTOGRAM)
+        if (hist_type == 2)     /* v4.9 */
+        {
+            MENU_SET_VALUE("RAW RGB%s", hist_log ? ", Log" : ", Linear");
+            if (lv_movie_select != LVMS_ENABLE_MOVIE) MENU_SET_WARNING(MENU_WARN_INFO, "RAW in movie mode only; YUV RGB here.");
+            return;
+        }
+        #endif
         MENU_SET_VALUE(
             "%s%s",
             raw ? (RAW_HISTOBAR_ENABLED ? "RAW HistoBar" : "RAW RGB") :

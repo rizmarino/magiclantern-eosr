@@ -548,6 +548,13 @@ hist_build()
 
     memset(&histogram, 0, sizeof(histogram));
 
+    #ifdef CONFIG_R
+    {
+        extern int r_rawlv_hist_fill(struct Histogram *h);
+        if (hist_draw && hist_type == 2) r_rawlv_hist_fill(&histogram);   /* v4.9: sets is_raw; else YUV RGB fallback */
+    }
+    #endif
+
     #ifdef FEATURE_WAVEFORM
     if (waveform_draw)
     {
@@ -1171,12 +1178,87 @@ static void zebra_update_lut()
 static int zebra_digic_dirty = 0;
 #endif
 
+#ifdef CONFIG_R
+/* v4.9: RAW zebras from the LV raw tap (rawlv_r.c), movie mode. One cell of the 96x54 raw grid per screen block; the
+ * write pattern (bvram + mirror, little_cleanup) is the one the YUV zebras below use. */
+static CONFIG_INT("r.raw.zebra", r_raw_zebra, 0);
+extern int hist_draw, hist_type;
+extern const uint8_t *r_rawlv_cells(int *gw, int *gh);
+int r_rawlv_wanted(void) { return (hist_draw && hist_type == 2) || (zebra_draw && r_raw_zebra); }
+static int r_draw_zebras_raw(uint8_t *bvram)
+{
+    int gw, gh;
+    const uint8_t *cell = r_rawlv_cells(&gw, &gh);
+    if (!cell || !vram_lv.width || !vram_lv.height) return 0;
+    const int over = zebra_level_hi <= 100, under = zebra_level_lo > 0, rgb = zebra_colorspace == 1;
+    int off = get_y_skip_offset_for_overlays();
+    for (int y = os.y0 + off; y < os.y_max - off; y += 2)
+    {
+        int cy = BM2LV_Y(y) * gh / vram_lv.height;
+        if (cy < 0 || cy >= gh) continue;
+        const uint8_t *crow = cell + cy * gw;
+        uint32_t * const b_row = (uint32_t*)(bvram + BM_R(y));
+        uint32_t * const m_row = (uint32_t*)(bvram_mirror + BM_R(y));
+        for (int x = os.x0; x < os.x_max; x += 4)
+        {
+            int cx = BM2LV_X(x) * gw / vram_lv.width;
+            uint32_t *bp = b_row + (x >> 2), *mp = m_row + (x >> 2);
+            #define BP (*bp)
+            #define MP (*mp)
+            #define BN (*(bp + BMPPITCH/4))
+            #define MN (*(mp + BMPPITCH/4))
+            if (BP != 0 && BP != MP) { little_cleanup(bp, mp); continue; }
+            if (BN != 0 && BN != MN) { little_cleanup(bp + (BMPPITCH >> 2), mp + (BMPPITCH >> 2)); continue; }
+            if ((MP & 0x80808080) || (MN & 0x80808080)) continue;
+            int c = (cx >= 0 && cx < gw) ? crow[cx] : 0;
+            int cr = over && (c & 1), cg = over && (c & 2), cb = over && (c & 4), un = under && (c & 8);
+            if (rgb && (cr || cg || cb || un))
+            {
+                BP = MP = zebra_rgb_color(un, cr, cg, cb, y);
+                BN = MN = zebra_rgb_color(un, cr, cg, cb, y + 1);
+            }
+            else if (!rgb && (cr || cg || cb))
+            {
+                BP = MP = zebra_color_word_row(COLOR_RED, y);
+                BN = MN = zebra_color_word_row(COLOR_RED, y + 1);
+            }
+            else if (!rgb && un)
+            {
+                BP = MP = zebra_color_word_row(COLOR_BLUE, y);
+                BN = MN = zebra_color_word_row(COLOR_BLUE, y + 1);
+            }
+            else BN = MN = BP = MP = 0;
+            #undef BP
+            #undef MP
+            #undef BN
+            #undef MN
+        }
+    }
+    return 1;
+}
+#endif
+
+#ifdef CONFIG_R
+extern void r_rawlv_status(char *s, int n, int *ok);
+static MENU_UPDATE_FUNC(r_rawlv_menu_update)
+{
+    char st[64]; int ok;
+    r_rawlv_status(st, sizeof(st), &ok);
+    if (!r_rawlv_wanted()) { MENU_SET_VALUE("not used"); MENU_SET_WARNING(MENU_WARN_INFO, "Select RAW-based histogram or RAW zebras."); return; }
+    MENU_SET_VALUE(ok ? "OK" : "N/A");
+    MENU_SET_WARNING(ok ? MENU_WARN_INFO : MENU_WARN_NOT_WORKING, "%s", st);
+}
+#endif
+
 static void draw_zebras( int Z )
 {
     uint8_t * const bvram = bmp_vram_overlay();
     int zd = Z && zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
     if (zd)
     {
+        #ifdef CONFIG_R
+        if (r_raw_zebra && lv && r_draw_zebras_raw(bvram)) return;   /* v4.9; falls back to YUV zebras */
+        #endif
         #ifdef FEATURE_RAW_ZEBRAS
         if (RAW_ZEBRA_ENABLE && can_use_raw_overlays())
         {
@@ -2840,6 +2922,16 @@ struct menu_entry zebra_menus[] = {
                 .help = "You can hide zebras when recording.",
             },
             #endif
+            #ifdef CONFIG_R
+            {
+                .name = "Use RAW zebras",
+                .priv = &r_raw_zebra,
+                .max = 1,
+                .choices = (const char *[]) {"OFF", "Movie mode"},
+                .help = "Zebras from the sensor's raw data (exact clipping), movie mode LiveView.",
+                .help2 = "Coarse grid. Elsewhere, or while Canon records, the normal zebras are used.",
+            },
+            #endif
             #ifdef FEATURE_RAW_ZEBRAS
             {
                 .name = "Use RAW zebras",
@@ -3116,6 +3208,8 @@ struct menu_entry zebra_menus[] = {
                 #ifdef FEATURE_RAW_HISTOGRAM
                 .update = raw_histo_update,
                 .max = 3,
+                #elif defined(CONFIG_R)
+                .max = 2,               /* v4.9: RAW-based (rawlv_r.c), movie mode */
                 #else
                 .max = 1,
                 #endif
@@ -3129,7 +3223,15 @@ struct menu_entry zebra_menus[] = {
                 .help  = "Choose between YUV-based (JPG) or RAW-based histogram.",
                 .help2 = "If RAW data is not available, it will fall back to YUV-based.",
             },
-            #ifdef FEATURE_RAW_HISTOGRAM
+            #ifdef CONFIG_R
+            {
+                .name = "RAW source",
+                .update = r_rawlv_menu_update,
+                .icon_type = IT_ALWAYS_ON,
+                .help = "Raw data used by the RAW histogram / RAW zebras (movie mode LiveView).",
+            },
+            #endif
+            #if defined(FEATURE_RAW_HISTOGRAM) || defined(CONFIG_R)
             {
                 .name = "RAW EV indicator",
                 .priv = &hist_meter,
