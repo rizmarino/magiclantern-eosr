@@ -130,6 +130,19 @@ static CONFIG_INT("r.rawrec.diag", rr_diag, 0);
 static CONFIG_INT("r.rawrec.card10", rr_card10, 1060);       /* card write speed of the last clip, MiB/s x10 */
 static char rr_base[16];                /* clip name without extension */
 static volatile int rr_full;            /* last clip stopped because the card was nearly full */
+/* v4.8 pre-record (Movie > RAW video > Pre-record): the 1st REC press arms the recorder (capture runs into a ring of
+ * rr_pre_chunks chunks, the writer idles: status PRE-REC), the 2nd starts the clip with the frames still in the ring
+ * (rr_pre_trig, handled in the capture task: rr_pre_go), the 3rd stops. Opening the ML menu while armed cancels (the
+ * empty clip file is removed). The writer starts at the oldest kept chunk (w_wi0) and renumbers the kept frames'
+ * VIDF frame numbers and timestamps from 0 (w_fn0, w_ts0), so the MLV looks like a normal clip. No audio: the audio
+ * path starts with the first video frame (v19), which a pre-recorded clip doesn't have. */
+static CONFIG_INT("r.rawrec.pre", rr_pre_sel, 0);
+static const int rr_pre_ms[] = { 0, 500, 1000, 2000 };
+static volatile int rr_pre, rr_pre_trig, rr_pre_cancel;
+static int rr_pre_chunks, rr_pre_disc, rr_pre_kept, rr_pre_kept_ms;
+static volatile int w_wi0, w_renum;
+static uint32_t w_fn0;
+static uint64_t w_ts0;
 /* v20: LV silent pictures (Shoot > LV silent pictures). A session is one rt_task run with sp_active set: it arms the
  * engine (MEM1 tap, pack unit in ML order, IRQ hook, chunks), copies whole MEM1 frames (4K movie LV: 4256x2214 1:1)
  * while the trigger is held (Burst) or all the time into a short ring (Pre-capture), and sp_writer turns each kept
@@ -1273,11 +1286,40 @@ static int rt_card_low(void)
     return c_free0 && w_bytes + reserve > c_free0;
 }
 
+/* v4.8 pre-record: shift the kept frames' VIDF frame numbers / timestamps (and the NULL block's) to start at 0.
+ * Chunk memory is uncached (rt_alloc_chunks), so these CPU writes need no cache clean before the card write. */
+static void rt_pre_renum(uint32_t base, int n)
+{
+    for (int s = 0; s < n; s++)
+    {
+        uint32_t slot = base + s * slot_bytes;
+        struct rt_vidf v;
+        memcpy(&v, (void *)slot, sizeof(v));
+        if (memcmp(v.type, "VIDF", 4)) continue;
+        v.frame -= w_fn0; v.ts -= w_ts0;
+        memcpy((void *)slot, &v, sizeof(v));
+        if (slot_null)
+        {
+            struct rt_blk b;
+            memcpy(&b, (void *)(slot + RT_VIDF_PRE + frame_bytes), sizeof(b));
+            b.ts -= w_ts0;
+            memcpy((void *)(slot + RT_VIDF_PRE + frame_bytes), &b, sizeof(b));
+        }
+    }
+}
+
 static void rt_writer(void *unused)
 {
-    int wi = 0;
+    int wi = 0, pre_wait = rr_pre;
     for (;;)
     {
+        if (rr_pre)                             /* v4.8: armed (pre-record): nothing is written until the trigger */
+        {
+            if (w_stop) break;
+            take_semaphore(rt_wsem, 50);
+            continue;
+        }
+        if (pre_wait) { RT_DMB(); wi = w_wi0; pre_wait = 0; }
         if (ra_on && ra_ready[ra_widx])        /* v19: prepared audio block first (small, keeps the A/V order) */
         {
             int r = ra_write_one(w_file);
@@ -1305,6 +1347,7 @@ static void rt_writer(void *unused)
                 }
             }
             uint32_t t = rt_us();
+            if (w_renum) rt_pre_renum(ch[wi].base, ch[wi].n);   /* v4.8 */
             int r = FIO_WriteFile(w_file, (void *)ch[wi].base, bytes);
             t = rt_us() - t;
             if (w_n < RT_MAXW) { wl[w_n].t_ms = (rt_us() - rt_t0) / 1000; wl[w_n].us = t; wl[w_n].bytes = bytes; }
@@ -1782,12 +1825,56 @@ out:
     return 0;
 }
 
+/* v4.8 pre-record, capture task (owns the chunk states while armed): a chunk was completed; keep at most
+ * rr_pre_chunks full ones, freeing the oldest (the full chunks are the ones just before next_fill in ring order) */
+static void rr_pre_recycle(void)
+{
+    int full = 0;
+    for (int i = 0; i < nch; i++) full += ch[i].state == CH_FULL;
+    for (int k = 0; k < nch && full > rr_pre_chunks; k++)
+    {
+        int i = (next_fill + k) % nch;
+        if (ch[i].state != CH_FULL) continue;
+        rr_pre_disc += ch[i].n;
+        ch[i].n = 0; ch[i].state = CH_FREE;
+        full--;
+    }
+}
+
+/* v4.8 pre-record trigger (2nd REC press), capture task, before frame nfr (time td) is taken: hand the writer the
+ * oldest kept chunk and the frame number / timestamp the clip starts at. No logging here (rt_printf isn't task-safe):
+ * rt_task logs rr_pre_kept / rr_pre_kept_ms afterwards. */
+static void rr_pre_go(uint32_t td)
+{
+    int start = cur >= 0 ? (cur + 1) % nch : next_fill, oldest = -1;
+    for (int k = 0; k < nch && oldest < 0; k++) if (ch[(start + k) % nch].state == CH_FULL) oldest = (start + k) % nch;
+    if (oldest < 0) oldest = cur >= 0 ? cur : next_fill;
+    int kept = 0;
+    for (int i = 0; i < nch; i++) if (ch[i].state == CH_FULL || i == cur) kept += ch[i].n;
+    if (kept && ch[oldest].n)
+    {
+        struct rt_vidf v;
+        memcpy(&v, (void *)ch[oldest].base, sizeof(v));
+        w_fn0 = v.frame; w_ts0 = v.ts;
+    }
+    else { w_fn0 = nfr; w_ts0 = first_t ? td - first_t : 0; kept = 0; }
+    rr_pre_kept = kept;
+    rr_pre_kept_ms = first_t ? (int)((td - first_t - (uint32_t)w_ts0) / 1000) : 0;
+    w_wi0 = oldest;
+    w_renum = 1;
+    RT_DMB();
+    rr_pre = 0;                             /* the writer starts now (at w_wi0) */
+    rr_t0_ms = get_ms_clock() - rr_pre_kept_ms;   /* on-screen clip time includes the kept part */
+    give_semaphore(rt_wsem);
+}
+
 /* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
  * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
 static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
 {
     if (c_dng) return sp_frame(td, lat_us, flags, top_ref, bot_ref);
     if (!first_t) { first_t = td; next_tl = 0; }
+    if (rr_pre && rr_pre_trig) rr_pre_go(td);  /* v4.8: 2nd REC press: the clip starts with the kept frames */
     uint32_t us = 0;
     if (frames && bot_ref == last_rec_bot)
     {
@@ -1824,6 +1911,7 @@ static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
                 give_semaphore(rt_wsem);
                 next_fill = (cur + 1) % nch;
                 cur = -1;
+                if (rr_pre) rr_pre_recycle();   /* v4.8: armed: keep only the newest rr_pre_chunks */
             }
         }
     }
@@ -1852,6 +1940,7 @@ static void rt_capture_irq(void)
         uint32_t now = rt_us();
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
+        if (rr_pre && gui_menu_shown()) { rr_pre_cancel = 1; break; }   /* v4.8: ML menu cancels an armed pre-record */
         if (sp_active && sp_end) break;                                     /* v20: silent session ends */
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
@@ -1891,6 +1980,7 @@ static void rt_capture_timer(uint32_t est)
         uint32_t now = rt_us();
         if (c_dur_s > 0 && first_t && now - first_t > (uint32_t)c_dur_s * 1000000) break;
         if (rr_stop) { rt_printf("stop requested (REC button)\n"); break; }
+        if (rr_pre && gui_menu_shown()) { rr_pre_cancel = 1; break; }   /* v4.8: ML menu cancels an armed pre-record */
         if (sp_active && sp_end) break;                                     /* v20: silent session ends */
         if (w_err) { rt_printf("writer error %d, stopping\n", w_err); break; }
         if (rt_card_low()) { rt_printf("card nearly full (%d MB written), stopping\n", (uint32_t)(w_bytes >> 20)); rr_full = 1; break; }
@@ -1997,6 +2087,9 @@ static void rt_task(void *unused)
     c_dng = sp_active ? 1 : 0;          /* v20 */
     c_mlv = rt_fmt_sel != 0 && !c_dng;
     c_bpp = c_dng ? (sp_bits ? 12 : 10) : rt_fmt_bpp[rt_fmt_sel];
+    const int pre_on = rr_active && c_mlv && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8 */
+    rr_pre = 0; rr_pre_trig = 0; rr_pre_cancel = 0; rr_pre_disc = rr_pre_kept = rr_pre_kept_ms = 0;
+    w_renum = 0; w_wi0 = 0; w_fn0 = 0; w_ts0 = 0;
     pk_applied = 0;
     if (!rr_active) rr_t0_ms = 0;
     if (RECORDING) rt_printf("!! Canon reports movie recording active at start (H.264 shares the card)\n");
@@ -2102,7 +2195,8 @@ static void rt_task(void *unused)
     if (mode < 0) { snprintf(rt_last, sizeof(rt_last), "RT%02d: no frame sync", rt_run_id); goto done; }
     if (mode == SYNC_TIMER) rt_unhook();
 
-    if (rr_audio && c_mlv && !ra_buf)       /* v19: audio blocks before the video chunks take the memory */
+    if (pre_on && rr_audio) rt_printf("v4.8 pre-record: no audio in this clip\n");
+    if (rr_audio && c_mlv && !ra_buf && !pre_on)   /* v19: audio blocks before the video chunks take the memory */
     {
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
@@ -2114,6 +2208,16 @@ static void rt_task(void *unused)
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
     if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
+    if (pre_on)                         /* v4.8: ring size; 2 chunks stay free so the writer has headroom after the trigger */
+    {
+        uint32_t per = mode == SYNC_IRQ ? sv_irq_med : sv_est;
+        int want = per ? (int)((uint64_t)rr_pre_ms[rr_pre_sel] * 1000 / per) : 30;
+        rr_pre_chunks = MAX(1, MIN((want + kslots - 1) / kslots, nch - 2));
+        if (nch >= 3) rr_pre = 1;
+        rt_printf("v4.8 pre-record %d ms: %d frames wanted, ring %d chunks (%d-%d frames, %d per chunk) of %d%s\n",
+                  rr_pre_ms[rr_pre_sel], want, rr_pre_chunks, rr_pre_chunks * kslots, (rr_pre_chunks + 1) * kslots - 1, kslots, nch,
+                  rr_pre ? "" : ": too little memory, recording at once");
+    }
     w_bytes = 0; w_part = 0;
     if (rt_card_low())                  /* v18 */
     {
@@ -2183,7 +2287,7 @@ static void rt_task(void *unused)
     {
         rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
         mlv_guid = ((uint64_t)rt_us() << 32) ^ (uint64_t)get_ms_clock() * 2654435761u ^ rt_run_id;
-        if (rr_audio && ra_buf) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
+        if (rr_audio && ra_buf && !pre_on) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
         rt_mlv_build_hdr(0, 0);
         if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES)
         { rt_printf("cannot write MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
@@ -2202,7 +2306,7 @@ static void rt_task(void *unused)
     c_mode = mode; c_dur_s = dur_s; c_est = sv_est; c_done = 0;
     uint32_t irq0 = irq_n;
     rt_drain(rt_csem);
-    rr_t0_ms = get_ms_clock();
+    if (!rr_pre) rr_t0_ms = get_ms_clock();   /* v4.8: armed pre-record: set at the trigger (rr_pre_go) */
     sp_mid_on = 0;
     if (c_dng && mode == SYNC_IRQ)      /* v3.11: mid-frame copies (see sp_frame_mid) */
     {
@@ -2228,6 +2332,10 @@ static void rt_task(void *unused)
     else while (!c_done) take_semaphore(rt_csem, 1000);       /* REC run: until stopped or an error */
     uint32_t irq_rec = irq_n - irq0;
     uint32_t dur_us = t_last_ev - first_t;
+    const int pre_armed_end = rr_pre;   /* v4.8: still armed = cancelled or stopped before the trigger */
+    if (pre_on) rt_printf("v4.8 pre-record: %s; %d frames kept from before the trigger (%d ms), %d discarded while armed\n",
+                          !pre_armed_end ? "triggered" : rr_pre_cancel ? "cancelled (ML menu)" : "not triggered",
+                          rr_pre_kept, rr_pre_kept_ms, rr_pre_disc);
 
     /* hand over the partial chunk, stop the writer */
     if (cur >= 0) { if (ch[cur].n) ch[cur].state = CH_FULL; else ch[cur].state = CH_FREE; }
@@ -2322,9 +2430,11 @@ static void rt_task(void *unused)
              rt_sync_name[mode], frames, missed + drops);
     if (rr_active)                      /* v18: clip summary for the user */
     {
-        snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit, %d frames%s", rr_base, crop_w, crop_h, c_bpp, frames,
+        snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
+                 pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
                  missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
         if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
+        if (pre_on && pre_armed_end) snprintf(rt_last, sizeof(rt_last), "pre-record %s", rr_pre_cancel ? "cancelled" : "stopped");
         if (w_n >= 20 && !w_err && card10 > 300) rr_card10 = card10;   /* menu's card speed */
     }
     if (c_dng)                          /* v20: silent session summary, per-frame list, INFO.TXT in the folder */
@@ -2382,6 +2492,7 @@ static void rt_task(void *unused)
 
 done:
     sp_ih_on = 0; sp_mid_on = 0;            /* v3.11 */
+    if (w_done) rr_pre = 0;                 /* v4.8 (never under a live writer) */
     if (ra_started) ra_stop();              /* v19: error paths */
     if (ra_on) rt_printf("audio: %d blocks written (%d KB)\n", (int)ra_count, (int)(ra_bytes_written >> 10));
     ra_on = 0;
@@ -2461,6 +2572,7 @@ static void rr_status_task(void *unused)
             else snprintf(t, sizeof(t), " SILENT arming ");
         }
         else if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
+        else if (rr_pre) snprintf(t, sizeof(t), " PRE-REC %d.%ds ", rr_pre_ms[rr_pre_sel & 3] / 1000, rr_pre_ms[rr_pre_sel & 3] / 100 % 10);   /* v4.8 */
         else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
         else snprintf(t, sizeof(t), " REC %02d:%02d %dx%d %db ", s_rec / 60, s_rec % 60, c_cw, c_ch, c_bpp);   /* v18: + size */
         if (shown && !strcmp(t, last)) continue;
@@ -2677,7 +2789,7 @@ int handle_rawrec_keys(struct event *event)
     if (p != RR_KEY_REC_PRESS && p != RR_KEY_REC_NOTIFY && p != RR_KEY_REC_UNPRESS) return rr_key_log(p, 0);
     if (!lv || gui_menu_shown()) return rr_key_log(p, 0);
     if (p != RR_KEY_REC_PRESS) return rr_key_log(p, RECORDING ? 0 : 1);  /* if Canon records anyway, let its notices through */
-    if (rr_active) { rr_stop = 1; return rr_key_log(p, 1); }
+    if (rr_active) { if (rr_pre) rr_pre_trig = 1; else rr_stop = 1; return rr_key_log(p, 1); }   /* v4.8: armed: 2nd press records */
     if (rt_busy) return rr_key_log(p, 1);   /* a test run is going: ignore, but don't start Canon recording either */
     rt_busy = 1;
     task_create("rr_task", 0x1e, 0x2000, rr_task, 0);
@@ -2883,6 +2995,25 @@ static MENU_UPDATE_FUNC(rr_main_update)
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
+/* v4.8: pre-record length that fits: (RT_MAXCH_VIDEO - 2) chunks of RT_CHUNK_TGT, whole frames per chunk (estimate:
+ * the camera may give fewer chunks; the clip log has the real ring) */
+static MENU_UPDATE_FUNC(rr_pre_update)
+{
+    if (!rr_pre_sel) return;
+    if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
+    int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
+    uint32_t w = rt_crop_wh[rt_crop_sel][0], h = rt_crop_wh[rt_crop_sel][1];
+    if (!w) { w = 2304; h = 1290; }
+    uint32_t slot = (w * h * bpp / 8 + RT_VIDF_PRE + 4095) & ~4095;
+    int fr = (RT_MAXCH_VIDEO - 2) * MAX(1, (int)(RT_CHUNK_TGT / slot));
+    int ms30 = fr * 1001 / 30, want = rr_pre_ms[rr_pre_sel & 3];
+    MENU_SET_RINFO("max %d.%d s", ms30 / 1000, ms30 / 100 % 10);
+    if (want > ms30)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Only ~%d.%d s fit at this size (29.97p): the clip starts that far back.", ms30 / 1000, ms30 / 100 % 10);
+    else
+        MENU_SET_WARNING(MENU_WARN_INFO, "REC: PRE-REC (buffering). REC again: records, from up to %d.%d s before.", want / 1000, want / 100 % 10);
+}
+
 static MENU_UPDATE_FUNC(rr_rate_update)
 {
     if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
@@ -2999,6 +3130,15 @@ static struct menu_entry rr_menu[] = {
                 .max     = 3,
                 .choices = CHOICES("14-bit", "12-bit", "10-bit"),   /* v18.1: ML shows choices[value - min] */
                 .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
+            },
+            {
+                .name    = "Pre-record",
+                .priv    = &rr_pre_sel,
+                .max     = 3,
+                .choices = CHOICES("OFF", "0.5 s", "1 s", "2 s"),
+                .update  = rr_pre_update,
+                .help    = "REC once: PRE-REC, frames kept in memory. REC again: the clip starts this long before.",
+                .help2   = "REC a 3rd time stops. Trash (ML menu) cancels while PRE-REC. No audio in these clips.",
             },
             {
                 .name    = "Audio",
