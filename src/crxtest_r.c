@@ -37,6 +37,12 @@ typedef int (*cx_free_t)(uint32_t *h, int a, int b);
 #define CX_HDR   ((cx_hdr_t)  0xE066B4E5)
 #define CX_FREE  ((cx_free_t) 0xE066B523)
 
+/* v4.18: algsmgr reports its output buffers as physical + 0x80000000 (e.g. 0xBB990000 for shoot memory that ML's
+ * shoot_malloc sees at 0x7B990000); the CPU reads 0x80000000-0xBFFFFFFF as open bus except panel VRAM. v4.17 OR'ed
+ * 0x40000000 onto them -> 0xFB99.../0xC378... (ROM / MMIO) and hung while saving (riz 2026-11-04). CPU uncached view of
+ * any of the three aliases (cached 0x0..., uncached 0x4.../0x7..., encoder 0x8.../0xB...): */
+static inline uint32_t cx_cpu(uint32_t a) { return (a & 0x3FFFFFFF) | CX_UNC; }
+
 static char cx_last[64] = "not run";
 static volatile int cx_running;
 static struct semaphore *cx_sem;
@@ -78,7 +84,7 @@ static uint32_t cx_sum(uint32_t base, uint32_t pitch, uint32_t h)
     for (int k = 1; k <= 3; k++)                /* 3 rows, 256 words each */
     {
         uint32_t row = base + (h * k / 4) * pitch;
-        for (int i = 0; i < 256; i++) s = s * 31 + MEM((row + i * 4) | CX_UNC);
+        for (int i = 0; i < 256; i++) s = s * 31 + MEM(cx_cpu(row + i * 4));
     }
     return s;
 }
@@ -94,7 +100,7 @@ static void cx_task(void *unused)
 {
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
-    cx_log("---- CRX encode test (v4.17)");
+    cx_log("---- CRX encode test (v4.18)");
     snprintf(cx_last, sizeof(cx_last), "running...");
 
     int tap_was = MEM(CX_PATH + 0x40);
@@ -155,7 +161,14 @@ static void cx_task(void *unused)
     uint32_t total = 0;
     if (!r1 && !r2 && n && n <= 64)
     {
-        for (uint32_t i = 0; i < n; i++) { cx_log("  entry %d: %08x size %d", i, ea[i], es[i]); total += es[i]; }
+        for (uint32_t i = 0; i < n; i++)
+        {
+            /* one test read of the first word through the CPU alias, logged before any file write */
+            cx_log("  entry %d: %08x size %d", i, ea[i], es[i]);
+            if (es[i]) cx_log("    cpu %08x first word %08x", cx_cpu(ea[i]), MEM(cx_cpu(ea[i])));
+            total += es[i];
+        }
+        cx_log("main header cpu %08x first word %08x", cx_cpu(ha), hs ? MEM(cx_cpu(ha)) : 0);
         struct cx_hdr H = { {'C','R','X','1'}, sizeof(struct cx_hdr), w, h, bpp, pitch,
                             {pk[0], pk[1], pk[2], pk[3], pk[4]}, addr, frozen, enc_ms, hs, n, {0} };
         for (uint32_t i = 0; i < n; i++) H.entry_size[i] = es[i];
@@ -163,12 +176,13 @@ static void cx_task(void *unused)
         if (f)
         {
             FIO_WriteFile(f, &H, sizeof(H));
-            if (hs) FIO_WriteFile(f, (void *)(ha | CX_UNC), hs);
-            for (uint32_t i = 0; i < n; i++) if (es[i]) FIO_WriteFile(f, (void *)(ea[i] | CX_UNC), es[i]);
+            if (hs) FIO_WriteFile(f, (void *)cx_cpu(ha), hs);
+            for (uint32_t i = 0; i < n; i++) if (es[i]) FIO_WriteFile(f, (void *)cx_cpu(ea[i]), es[i]);
             FIO_CloseFile(f);
         }
         f = FIO_CreateFile("ML/CRXRAW.BIN");
-        if (f) { FIO_WriteFile(f, (void *)(addr | CX_UNC), pitch * h); FIO_CloseFile(f); }
+        if (f) { FIO_WriteFile(f, (void *)cx_cpu(addr), pitch * h); FIO_CloseFile(f); }
+        cx_log("files written");
         uint32_t s4 = cx_sum(addr, pitch, h);
         uint32_t bpp100 = (uint32_t)((uint64_t)total * 800 / (w * h));
         cx_log("saved: compressed %d bytes (%d.%02d bits/px), raw %d bytes; frame still unchanged after save: %s",
