@@ -326,6 +326,10 @@ static unsigned int lua_keypress_cbr_real(unsigned int ctx)
                 /* note: key.wait() will clear the buffer before starting to wait
                  * also msg_queue_post is not blocking, therefore, sending this
                  * to scripts not waiting for a key press should be harmless. */
+                /* riz v4.15: ...except to scripts that never ran: their key_mq is created on first run and is 0
+                 * until then. Posting to queue ID 0 from the GUI task hung the EOS R whenever a script got the
+                 * key it waited for (SET at the end of rtest, 3 times, v4.12-v4.14). Running scripts only. */
+                if (!script->key_mq || !script->L) continue;
                 msg_queue_post(script->key_mq, last_keypress);
 #ifdef LUA_R_TRACE
                 r_lt_posted++;
