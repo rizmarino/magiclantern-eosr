@@ -1674,6 +1674,11 @@ static struct menu_entry mem_menus[] = {
                 .priv = (int *)2,
                 .update = mem_pool_display,
             },
+#ifndef CONFIG_R
+            /* riz v4.12: not on the R. Opening this submenu froze the camera (riz 2026-11-04): these lines start
+             * guess_free_mem_task (task stacks up to 72 KB, all free shoot memory allocated + cleared in LV) and
+             * "shoot total" draws a memory map reading all 32 EDMAC address registers at the DIGIC 4/5 base
+             * 0xC0F04000 (the R's EDMAC is at 0xD04xxxxx). The pool lines above need neither. */
             {
                 .name = "stack space",
                 .icon_type = IT_ALWAYS_ON,
@@ -1702,6 +1707,7 @@ static struct menu_entry mem_menus[] = {
                 .update = meminfo_display,
                 .help = "Free memory from SRM_AllocateMemoryResourceFor1stJob.",
             },
+#endif
             {
                 .name = "AUTOEXEC.BIN",
                 .icon_type = IT_ALWAYS_ON,
