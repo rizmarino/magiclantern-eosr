@@ -28,7 +28,9 @@ static int luaCB_console_show(lua_State * L)
  */
 static int luaCB_console_hide(lua_State * L)
 {
+    R_LT_STEP(4, "console_hide...");
     console_hide();
+    R_LT_STEP(5, "console_hide done");
     return 0;
 }
 

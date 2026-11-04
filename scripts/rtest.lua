@@ -6,11 +6,12 @@
 menu.close()
 console.show()
 
-local log = io.open("ML/LOGS/LUATEST.LOG", "a")
 local pass, fail = 0, 0
+-- open, append, close per line: exFAT only commits the file size on close (a hang would hide unclosed lines)
 local function out(s)
     print(s)
-    if log then log:write(s .. "\n"); log:flush() end
+    local f = io.open("ML/LOGS/LUATEST.LOG", "a")
+    if f then f:write(s .. "\n"); f:close() end
 end
 local function pad(s, n) s = tostring(s); return s .. string.rep(" ", n - #s) end  -- ML's format has no %-16s
 local function check(name, fn)
@@ -99,4 +100,3 @@ local k = key.wait(KEY.SET, 20000)
 out("exit: key.wait returned " .. tostring(k) .. (k == 0 and " (timeout: SET not seen)" or " (SET seen)"))
 console.hide()
 out("exit: console hidden, script ending")
-if log then log:close() end

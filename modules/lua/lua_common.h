@@ -144,4 +144,15 @@ int luaopen_FONT(lua_State * L);
 int luaopen_COLOR(lua_State * L);
 int luaopen_KEY(lua_State * L);
 
+/* v4.14 EOS R exit-freeze trace (lua.c). Modules are built camera-independent (no CONFIG_R here); this fork only
+ * targets the R, whose core exports r_dbg_redraw_*. Temporary: remove with the trace. */
+#define LUA_R_TRACE
+#ifdef LUA_R_TRACE
+void r_lt(const char * fmt, ...);
+extern volatile int r_lt_step;
+#define R_LT_STEP(n, ...) do { r_lt_step = (n); r_lt(__VA_ARGS__); } while (0)
+#else
+#define R_LT_STEP(n, ...) do { } while (0)
+#endif
+
 #endif

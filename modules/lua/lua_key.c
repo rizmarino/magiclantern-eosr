@@ -59,13 +59,16 @@ static int luaCB_key_wait(lua_State * L)
     int v1 = lua_tointeger(L, t1);  /* duration (integer) */
 
     /* let other script tasks run */
+    R_LT_STEP(1, "key.wait key %d timeout %d", key, timeout);
     lua_give_semaphore(L, NULL);
 
     /* wait for key to be pressed, or for timeout */
     int err = lua_msg_queue_receive(L, &pressed_key, timeout);
+    R_LT_STEP(2, "key.wait got err %d key %d", err, pressed_key);
 
     /* other script tasks no longer allowed */
     lua_take_semaphore(L, 0, NULL);
+    R_LT_STEP(3, "key.wait sem retaken");
 
     /* check the stack */
     int t2 = lua_gettop(L);

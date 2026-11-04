@@ -33,6 +33,7 @@
 #include <config.h>
 #include <bmp.h>
 #include <powersave.h>
+#include <stdarg.h>
 #include "lua_common.h"
 #include "umm_malloc/umm_malloc.h"
 
@@ -245,7 +246,66 @@ LUA_CBR_FUNC(vsync_setparam)
 #endif
 
 static struct script_event_entry * keypress_cbr_scripts = NULL;
+/* riz v4.14: EOS R trace for the freeze after SET at the end of a script (v4.12/v4.13, no crash log).
+ * r_lt() appends one line to ML/LOGS/LUATRACE.LOG and closes the file each time, so exFAT commits the size even if
+ * the camera hangs right after. Called only from Lua tasks (never the GUI task). The watchdog task logs the
+ * GUI-side counters every 500 ms while a script is running and for 10 s after it ends: if its lines stop, the
+ * whole camera hung; if they continue, only something (GUI / Lua task) is stuck. */
+#ifdef LUA_R_TRACE
+extern volatile int r_dbg_redraw_in, r_dbg_redraw_out, r_dbg_redraw_req;
+static volatile int r_lt_key_in, r_lt_key_out, r_lt_key_last, r_lt_posted, r_lt_wd_until;
+volatile int r_lt_step;
+static volatile int r_lt_wd_running;
+void r_lt(const char * fmt, ...)
+{
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "%6d ", get_ms_clock() % 1000000);
+    va_list ap; va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 2) n = sizeof(buf) - 2;
+    buf[n++] = '\n';
+    FILE * f = FIO_CreateFileOrAppend("ML/LOGS/LUATRACE.LOG");
+    if (f) { FIO_WriteFile(f, buf, n); FIO_CloseFile(f); }
+}
+static void r_lt_watchdog(void * unused)
+{
+    int last = -1;
+    while (get_ms_clock() < r_lt_wd_until)
+    {
+        int sig = r_lt_key_in * 7 + r_lt_key_out * 11 + r_lt_posted * 13 + r_dbg_redraw_req * 17
+                + r_dbg_redraw_in * 19 + r_dbg_redraw_out * 23 + r_lt_step * 29;
+        static int beat;
+        if (sig != last || ++beat % 4 == 0)
+            r_lt("wd step %d key in/out %d/%d last 0x%x posted %d redraw req/in/out %d/%d/%d", r_lt_step,
+                 r_lt_key_in, r_lt_key_out, r_lt_key_last, r_lt_posted, r_dbg_redraw_req, r_dbg_redraw_in, r_dbg_redraw_out);
+        last = sig;
+        msleep(500);
+    }
+    r_lt("wd end");
+    r_lt_wd_running = 0;
+}
+static void r_lt_start(const char * name)
+{
+    r_lt_wd_until = get_ms_clock() + 600000;   /* while running (max 10 min); cut to +10 s at the end */
+    r_lt("---- script %s start", name);
+    if (!r_lt_wd_running) { r_lt_wd_running = 1; task_create("lua_wdog", 0x1e, 0x1000, r_lt_watchdog, 0); }
+}
+#endif
+
+static unsigned int lua_keypress_cbr_real(unsigned int ctx);
 static unsigned int lua_keypress_cbr(unsigned int ctx)
+{
+#ifdef LUA_R_TRACE
+    r_lt_key_in++; r_lt_key_last = ctx;
+    unsigned int r = lua_keypress_cbr_real(ctx);
+    r_lt_key_out++;
+    return r;
+#else
+    return lua_keypress_cbr_real(ctx);
+#endif
+}
+static unsigned int lua_keypress_cbr_real(unsigned int ctx)
 {
     /* ignore unknown button codes */
     if (!ctx) return 1;
@@ -267,6 +327,9 @@ static unsigned int lua_keypress_cbr(unsigned int ctx)
                  * also msg_queue_post is not blocking, therefore, sending this
                  * to scripts not waiting for a key press should be harmless. */
                 msg_queue_post(script->key_mq, last_keypress);
+#ifdef LUA_R_TRACE
+                r_lt_posted++;
+#endif
             }
 
             /* done waiting */
@@ -804,6 +867,9 @@ static void load_script(struct lua_script * script)
     char full_path[MAX_PATH_LEN];
     snprintf(full_path, MAX_PATH_LEN, SCRIPTS_DIR "/%s", script->filename);
     printf("[%s] script starting.\n", script->filename);
+#ifdef LUA_R_TRACE
+    r_lt_start(script->filename);
+#endif
 
     int status = luaL_loadfile(L, full_path);
     if (status == LUA_OK) {
@@ -818,7 +884,9 @@ static void load_script(struct lua_script * script)
         lua_save_last_error(L);
     }
 
+    R_LT_STEP(10, "script returned, status %d", status);
     give_semaphore(script->sem);
+    R_LT_STEP(11, "sem given, cant_unload 0x%x", script->cant_unload);
 
     /* allow simple scripts to use config_save events */
     if (config_save_cbr_scripts && (script->cant_unload & (1 << config_save_cbr_scripts->mask)))
@@ -858,8 +926,9 @@ static void load_script(struct lua_script * script)
 
         /* unregister the config_save event, if any */
         set_event_script_entry(&config_save_cbr_scripts, L, LUA_NOREF);
-
+        R_LT_STEP(12, "lua_close...");
         lua_close(L);
+        R_LT_STEP(13, "lua_close done");
         script->L = NULL;
         script->menu_entry->icon_type = IT_ACTION;
         script->state = SCRIPT_STATE_NOT_RUNNING;
@@ -869,9 +938,14 @@ static void load_script(struct lua_script * script)
 
     /* print available memory */
     lua_print_free_mem();
+    R_LT_STEP(14, "free mem printed");
 
     /* script finished or loaded in background; allow auto power off */
     powersave_permit();
+    R_LT_STEP(15, "load_script done");
+#ifdef LUA_R_TRACE
+    r_lt_wd_until = get_ms_clock() + 10000;
+#endif
 }
 
 static MENU_UPDATE_FUNC(script_print_state)

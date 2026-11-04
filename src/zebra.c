@@ -4080,7 +4080,19 @@ CONFIG_INT("display.dont.mirror", display_dont_mirror, 1);
 // this should be synchronized with
 // * graphics code (like zebra); otherwise zebras will remain frozen on screen
 // * gui_main_task (to make sure Canon won't call redraw in parallel => crash)
+#ifdef CONFIG_R
+volatile int r_dbg_redraw_in, r_dbg_redraw_out, r_dbg_redraw_req;   /* v4.14 Lua exit-freeze trace (lua.c watchdog) */
+static void _redraw_do_r();
 void _redraw_do()
+{
+    r_dbg_redraw_in++;
+    _redraw_do_r();
+    r_dbg_redraw_out++;
+}
+static void _redraw_do_r()
+#else
+void _redraw_do()
+#endif
 {
     extern int ml_started;
     if (!ml_started) return;
@@ -4181,6 +4193,9 @@ BMP_LOCK (
 
 void redraw()
 {
+#ifdef CONFIG_R
+    r_dbg_redraw_req++;
+#endif
     fake_simple_button(MLEV_REDRAW);
 }
 
