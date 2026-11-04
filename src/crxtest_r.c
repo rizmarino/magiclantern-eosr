@@ -42,6 +42,10 @@ typedef int (*cx_free_t)(uint32_t *h, int a, int b);
  * 0x40000000 onto them -> 0xFB99.../0xC378... (ROM / MMIO) and hung while saving (riz 2026-11-04). CPU uncached view of
  * any of the three aliases (cached 0x0..., uncached 0x4.../0x7..., encoder 0x8.../0xB...): */
 static inline uint32_t cx_cpu(uint32_t a) { return (a & 0x3FFFFFFF) | CX_UNC; }
+/* v4.19: that alias held only 0xFF on the camera (v4.18: headers fine, every chunk byte 0xFF), so the chunks are not
+ * physical + 0x80000000 as seen by the CPU. Canon's stills code hands these addresses straight to the card writer
+ * (CreateMemorySuite on each ring entry, e055c7ba), whose DMA reads them. v4.19 saves the chunks the same way: ML's
+ * FIO_WriteFile passes addresses >= 0x40000000 through unchanged to Canon's _FIO_WriteFile. */
 
 static char cx_last[64] = "not run";
 static volatile int cx_running;
@@ -100,7 +104,7 @@ static void cx_task(void *unused)
 {
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
-    cx_log("---- CRX encode test (v4.18)");
+    cx_log("---- CRX encode test (v4.19)");
     snprintf(cx_last, sizeof(cx_last), "running...");
 
     int tap_was = MEM(CX_PATH + 0x40);
@@ -141,6 +145,13 @@ static void cx_task(void *unused)
     int to = take_semaphore(cx_sem, 8000);
     uint32_t enc_ms = get_ms_clock() - te;
     cx_mgr_log("after");
+    {   /* algsmgr's allocation table from the resource manager (completion e02f1c30 copies 0x248 B to mgr+0x188):
+         * lower +0x188, upper +0x218, sizes +0x2A8, flags +0x338, count +0x3C8 */
+        uint32_t m = MEM(CX_MGR);
+        for (int k = 0; m && k < 4; k++)
+            cx_log("alloc[%d]: lower %08x upper %08x size %08x flags %08x", k, MEM(m + 0x188 + 4 * k),
+                   MEM(m + 0x218 + 4 * k), MEM(m + 0x2A8 + 4 * k), MEM(m + 0x338 + 4 * k));
+    }
     if (to)
     {
         snprintf(cx_last, sizeof(cx_last), "TIMEOUT after 8 s - restart the camera");
@@ -165,7 +176,8 @@ static void cx_task(void *unused)
         {
             /* one test read of the first word through the CPU alias, logged before any file write */
             cx_log("  entry %d: %08x size %d", i, ea[i], es[i]);
-            if (es[i]) cx_log("    cpu %08x first word %08x", cx_cpu(ea[i]), MEM(cx_cpu(ea[i])));
+            if (es[i]) cx_log("    first word: raw %08x = %08x | alias %08x = %08x", ea[i], MEM(ea[i]), cx_cpu(ea[i]),
+                              MEM(cx_cpu(ea[i])));   /* 32-bit reads of 0x8...-0xB... are safe (v8 probe) */
             total += es[i];
         }
         cx_log("main header cpu %08x first word %08x", cx_cpu(ha), hs ? MEM(cx_cpu(ha)) : 0);
@@ -177,7 +189,7 @@ static void cx_task(void *unused)
         {
             FIO_WriteFile(f, &H, sizeof(H));
             if (hs) FIO_WriteFile(f, (void *)cx_cpu(ha), hs);
-            for (uint32_t i = 0; i < n; i++) if (es[i]) FIO_WriteFile(f, (void *)cx_cpu(ea[i]), es[i]);
+            for (uint32_t i = 0; i < n; i++) if (es[i]) FIO_WriteFile(f, (void *)ea[i], es[i]);   /* as Canon */
             FIO_CloseFile(f);
         }
         f = FIO_CreateFile("ML/CRXRAW.BIN");
