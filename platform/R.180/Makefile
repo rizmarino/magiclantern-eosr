@@ -24,6 +24,7 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o $(BUILD_DIR)/test_feature
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
 # v4.9: RAW histogram / RAW zebras in movie mode (LV raw tap)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crxtest_r.o   # v4.17 lossless 4K step 2
 # v3.16: audprobe_r.o (Debug > Audio probe) and memsurvey_r.o (Debug > Memory survey) left out: finished test
 # tools; ML footprint is Canon heap (silent-burst lock-up when the buffer clears)
 
