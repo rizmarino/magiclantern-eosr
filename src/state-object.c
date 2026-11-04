@@ -330,3 +330,19 @@ void update_state_fps() {
 #endif
 
 #endif
+
+#if defined(CONFIG_R) && !defined(CONFIG_STATE_OBJECT_HOOKS)
+/* riz v4.11: the R has no state-object vsync hook (CONFIG_STATE_OBJECT_HOOKS off) and the DIGIC 4/5 FPS timer
+ * register behind fps_get_current_x1000 doesn't apply, so this waits by time: 34 ms per frame (29.97p; movie 23.98p
+ * frames are 42 ms, so up to ~20% short). Needed by the Lua module (lv.wait). Returns 0 if LV is off or goes off. */
+int wait_lv_frames(int num_frames)
+{
+    if (!lv) return 0;
+    for (int i = 0; i < num_frames; i++)
+    {
+        msleep(34);
+        if (!lv) return 0;
+    }
+    return 1;
+}
+#endif

@@ -29,3 +29,8 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete
+
+# v4.11: Lua scripts not suited to the R: api_test.lua (photos, 10 s bulb, LV pause), recdelay.lua (movie.start,
+# no route on the R), copy2m.lua (writes raw property values; R byte-1 encodings unchecked). Runs after the copies.
+zip_contents:: | $(BUILD_DIR)
+	rm -f $(ZIP_DIR)/ML/scripts/api_test.lua $(ZIP_DIR)/ML/scripts/recdelay.lua $(ZIP_DIR)/ML/scripts/copy2m.lua

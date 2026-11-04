@@ -4953,6 +4953,12 @@ static void press_rec_button()
 
 void movie_start()
 {
+#ifdef CONFIG_R
+    /* riz v4.11: no record-start route on the R (PROP_MVR_REC_START crashes, BGMT_LV is a placeholder): say so
+     * instead of pressing a button that doesn't exist and waiting 3.5 s (Lua movie.start, ML features) */
+    NotifyBox(3000, "Movie start/stop from ML: not supported on EOS R");
+    return;
+#endif
 #ifdef CONFIG_MOVIE
     while (get_halfshutter_pressed()) msleep(100);
     if (!job_state_ready_to_take_pic()) return; 
@@ -4989,6 +4995,10 @@ void movie_start()
 
 void movie_end()
 {
+#ifdef CONFIG_R
+    NotifyBox(3000, "Movie start/stop from ML: not supported on EOS R");   /* v4.11, see movie_start */
+    return;
+#endif
 #ifdef CONFIG_MOVIE
     if (shooting_type != 3 && !is_movie_mode())
     {

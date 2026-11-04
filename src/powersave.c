@@ -45,6 +45,17 @@ void PauseLiveView() // this should not include "display off" command
     {
         //~ ASSERT(DISPLAY_IS_ON);
         int x = 1;
+        #ifdef CONFIG_R
+        /* riz v4.11: PROP_LV_ACTION isn't in the R's write whitelist: the request is refused, so don't mark LV
+         * paused (ML would stop its overlays while LV keeps running; Lua lv.pause) */
+        int ok = 0;
+        BMP_LOCK(
+            lv_zoom_before_pause = lv_dispsize;
+            ok = prop_request_change_wait(PROP_LV_ACTION, &x, 4, 1000);
+            if (ok) { msleep(100); clrscr(); lv_paused = 1; }
+        )
+        if (ok) ASSERT(LV_PAUSED);
+        #else
         BMP_LOCK(
             lv_zoom_before_pause = lv_dispsize;
             prop_request_change_wait(PROP_LV_ACTION, &x, 4, 1000);
@@ -53,6 +64,7 @@ void PauseLiveView() // this should not include "display off" command
             lv_paused = 1;
         )
         ASSERT(LV_PAUSED);
+        #endif
     }
 }
 
