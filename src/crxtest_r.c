@@ -111,7 +111,7 @@ static void cx_task(void *unused)
 {
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
-    cx_log("---- CRX encode test (v4.22)");
+    cx_log("---- CRX encode test (v4.23)");
     snprintf(cx_last, sizeof(cx_last), "running...");
 
     int tap_was = MEM(CX_PATH + 0x40);
@@ -325,6 +325,22 @@ static void cx_release_cfg(void)
     cx_log("encoder config released (id 0 init flag cleared for Canon's next encode)");
 }
 
+/* v4.23: v4.22 hung in the 14-bit frozen burst after frame 2 (riz 2026-11-04) - the same stage ran 46 frames in
+ * v4.21, so back-to-back encodes hang intermittently. Canon frees asynchronously (event 4) and drives the codec core
+ * through an 8-slot command ring; Canon's own users never restart within ms of a free (the single test, 5/5 OK,
+ * waits 200 ms). Free, then wait until algsmgr's outstanding-result count (mgr+0x108) is 0, plus a 10 ms gap. */
+static uint32_t cx_free_wait(uint32_t *hd)
+{
+    uint32_t m = MEM(CX_MGR);
+    uint64_t t = get_us_clock();
+    CX_FREE(hd, 0, 0);
+    while (m && MEM(m + 0x108) && get_us_clock() - t < 500000) msleep(2);
+    uint32_t us = (uint32_t)(get_us_clock() - t);
+    if (m && MEM(m + 0x108)) cx_log("  free not done after %d us (bufs %d)", us, MEM(m + 0x108));
+    msleep(10);
+    return us;
+}
+
 /* CMP1 bit depth byte (offset 24) of a result, from the CPU-readable main header */
 static int cx_hdr_bits(uint32_t *hd)
 {
@@ -405,7 +421,7 @@ static int cx_save1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, int fro
         cx_log("saved %d-bit frame (%s): %d us, %d B, %d entries -> CRXT%d/CRXR%d.BIN", bpp,
                frozen ? "static" : "MOVED", us, tot, n, bpp, bpp);
     }
-    CX_FREE(hd, 0, 0);
+    cx_free_wait(hd);
     return 0;
 }
 
@@ -428,8 +444,9 @@ static int cx_burst(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_
         if (!hd) return -1;
         uint32_t b = cx_frame_bytes(hd, 0);
         CX_L(k, "  p2 frame %d: %d us %d B, free", k, us, b);
-        CX_FREE(hd, 0, 0);
-        cx_rec(2, bpp, k, us, 0, b);
+        uint32_t fw = cx_free_wait(hd);
+        CX_L(k, "  p2 frame %d: freed in %d us", k, fw);
+        cx_rec(2, bpp, k, us, fw, b);
     }
     cx_stats(2, bpp, w, h, from, get_ms_clock() - ts);
     return 0;
@@ -442,7 +459,7 @@ static int cx_pipe(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t
     cx_log("  p3: create CRXSTRM.BIN");
     FILE *f = FIO_CreateFile("ML/CRXSTRM.BIN");
     if (!f) return -1;
-    int from = cx_nf, done = cx_cb_count, pipelined = 1, k = 0, ret = 0;
+    int from = cx_nf, done = cx_cb_count, pipelined = 0, k = 0, ret = 0;   /* v4.23: sequential only */
     uint64_t total = 0, tstart = get_us_clock(), tsub = tstart;
     uint32_t ts = get_ms_clock();
     CX_L(0, "  p3 frame 0: start");
@@ -476,7 +493,7 @@ static int cx_pipe(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t
         }
         uint32_t wr_us = (uint32_t)(get_us_clock() - tw);
         CX_L(k, "  p3 frame %d: written %d B in %d us, free", k, bytes, wr_us);
-        CX_FREE(hd, 0, 0);
+        cx_free_wait(hd);
         total += bytes;
         cx_rec(3, bpp, k, enc_us, wr_us, bytes);
         k++;
@@ -514,7 +531,7 @@ static int cx_live_copy(uint32_t w, uint32_t h, uint32_t ms)
         if (!hd) { ret = -1; break; }
         uint32_t b = cx_frame_bytes(hd, 0);
         CX_L(k, "  p4 frame %d: %d us %d B, free", k, us, b);
-        CX_FREE(hd, 0, 0);
+        cx_free_wait(hd);
         cx_rec(4, 14, k, us, cu, b);
     }
     cx_stats(4, 14, w, h, from, get_ms_clock() - ts);
@@ -543,7 +560,7 @@ static void cx_stream_task(void *unused)
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
     cx_nf = 0;
-    cx_log("---- CRX stream test (v4.22)");
+    cx_log("---- CRX stream test (v4.23)");
     cx_f = malloc(CX_MAXF * sizeof(struct cx_fr));
     if (!cx_f) { snprintf(cx_last, sizeof(cx_last), "no memory for stats"); cx_log("%s", cx_last); cx_running = 0; return; }
     snprintf(cx_last, sizeof(cx_last), "running...");
