@@ -10,16 +10,17 @@ local log = io.open("ML/LOGS/LUATEST.LOG", "a")
 local pass, fail = 0, 0
 local function out(s)
     print(s)
-    if log then log:write(s .. "\n") end
+    if log then log:write(s .. "\n"); log:flush() end
 end
+local function pad(s, n) s = tostring(s); return s .. string.rep(" ", n - #s) end  -- ML's format has no %-16s
 local function check(name, fn)
     local ok, res = pcall(fn)
     if ok and res ~= false then
         pass = pass + 1
-        out(string.format("PASS %-16s %s", name, tostring(res)))
+        out("PASS " .. pad(name, 12) .. tostring(res))
     else
         fail = fail + 1
-        out(string.format("FAIL %-16s %s", name, tostring(res)))
+        out("FAIL " .. pad(name, 12) .. tostring(res))
     end
 end
 
@@ -32,7 +33,11 @@ check("exposure", function()
                          tostring(camera.aperture.value))
 end)
 check("lens", function() return tostring(lens.name) .. " " .. tostring(lens.focal_length) .. " mm" end)
-check("battery", function() return tostring(battery.level) .. " %" end)
+check("battery", function()
+    local ok, r = pcall(function() return battery.level end)
+    if not ok then return "n/a on the R (" .. tostring(r):gsub("^.*: ", "") .. ")" end
+    return tostring(r) .. " %"
+end)
 check("liveview", function() return "enabled " .. tostring(lv.enabled) .. ", running " .. tostring(lv.running) end)
 check("card", function() return tostring(dryos.shooting_card.free_space) .. " MB free" end)
 
@@ -67,7 +72,8 @@ check("lens.focus", function()
     local ok, r = pcall(lens.focus, 1, 1)
     local ms = dryos.ms_clock - t0
     if ms > 500 then error("took " .. ms .. " ms") end
-    return "returned " .. tostring(ok and r or "error: " .. tostring(r)) .. " in " .. ms .. " ms (expected false)"
+    if not ok then return "error '" .. tostring(r) .. "' in " .. ms .. " ms" end
+    return "returned " .. tostring(r) .. " in " .. ms .. " ms (expected false)"
 end)
 
 check("menu", function() return "Global Draw = " .. tostring(menu.get("Overlay", "Global Draw")) end)
@@ -87,7 +93,10 @@ end)
 check("memory", function() return string.format("Lua uses %d KB", math.floor(collectgarbage("count"))) end)
 
 out(string.format("---- %d PASS, %d FAIL", pass, fail))
-if log then log:close() end
-print("Press SET to exit.")
-key.wait(KEY.SET)
+-- v4.13: the camera froze after this point once (v4.12). Log each exit step so the card shows where it stops.
+out("exit: press SET (closes by itself after 20 s)")
+local k = key.wait(KEY.SET, 20000)
+out("exit: key.wait returned " .. tostring(k) .. (k == 0 and " (timeout: SET not seen)" or " (SET seen)"))
 console.hide()
+out("exit: console hidden, script ending")
+if log then log:close() end
