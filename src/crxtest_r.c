@@ -49,6 +49,8 @@ static inline uint32_t cx_cpu(uint32_t a) { return (a & 0x3FFFFFFF) | CX_UNC; }
  * FIO_WriteFile passes addresses >= 0x40000000 through unchanged to Canon's _FIO_WriteFile. */
 
 static char cx_last[64] = "not run";
+static void cx_reinit(int bpp);
+static void cx_release_cfg(void);
 static volatile int cx_running;
 static struct semaphore *cx_sem;
 static volatile uint32_t *cx_handle;
@@ -109,7 +111,7 @@ static void cx_task(void *unused)
 {
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
-    cx_log("---- CRX encode test (v4.21)");
+    cx_log("---- CRX encode test (v4.22)");
     snprintf(cx_last, sizeof(cx_last), "running...");
 
     int tap_was = MEM(CX_PATH + 0x40);
@@ -140,6 +142,7 @@ static void cx_task(void *unused)
            live1 == live2 ? "static!" : "changing", s1, s2, s3, frozen ? "FROZEN" : "still changing");
 
     cx_mgr_log("before");
+    cx_reinit(bpp);
     uint32_t desc[11] = { 0, w, h, 0, 0, bpp, addr, w, 0, 0, 0 };   /* type 0 = Canon lossless CR3 profile */
     cx_handle = 0; cx_cb_count = 0;
     uint32_t te = get_ms_clock();
@@ -212,6 +215,7 @@ static void cx_task(void *unused)
     cx_log("FreeEncBuffer %d", rf);
     msleep(200);
     cx_mgr_log("freed");
+    cx_release_cfg();
 
 out_tap:
     if (tap_was) call("lv_save_raw", 1);    /* the RAW overlays take it back over otherwise */
@@ -288,6 +292,47 @@ static uint32_t cx_frame_bytes(uint32_t *hd, uint32_t *n_out)
 
 static int cx_wait(int ms) { return take_semaphore(cx_sem, ms); }
 
+/* v4.22: algsmgrEncInit (e02f4136) configures encoder id N only while mgr+0x124+4N is 0, then sets it to 1, and
+ * nothing in Canon's code clears it (stills are always 14-bit, one size). So the first encode after boot fixes the
+ * bit depth: v4.21's 12-bit run came out as 14-bit CMP1 at 14.02 bpp (noise) and its 10-bit encode hung the camera
+ * (riz 2026-11-04). Type 0 = encoder id 0. Clear the flag while no encode is in flight -> the next StartEncode
+ * re-runs Canon's own init (e0361c70) with the new depth. */
+static int cx_cfg_bpp;                    /* depth algsmgr was last configured with by ML (0 = not by ML) */
+static void cx_reinit(int bpp)
+{
+    uint32_t m = MEM(CX_MGR);
+    if (!m) return;
+    cx_log("enc init flags: %d %d %d %d (configured %d-bit, want %d)", MEM(m + 0x124), MEM(m + 0x128), MEM(m + 0x12C),
+           MEM(m + 0x130), cx_cfg_bpp, bpp);
+    if (MEM(m + 0x124) && cx_cfg_bpp != bpp)
+    {
+        msleep(100);                      /* the last FreeEncBuffer event is processed first */
+        MEM(m + 0x124) = 0;
+        cx_log("  cleared id 0 init flag -> re-init at %d-bit", bpp);
+    }
+    cx_cfg_bpp = bpp;
+}
+
+/* hand the encoder back: Canon's stills use the same algsmgr encoder, and would otherwise run with ML's 4K
+ * frame size / depth; cleared, Canon's next encode re-inits from its own descriptor */
+static void cx_release_cfg(void)
+{
+    uint32_t m = MEM(CX_MGR);
+    if (!m) return;
+    msleep(100);
+    MEM(m + 0x124) = 0;
+    cx_cfg_bpp = 0;
+    cx_log("encoder config released (id 0 init flag cleared for Canon's next encode)");
+}
+
+/* CMP1 bit depth byte (offset 24) of a result, from the CPU-readable main header */
+static int cx_hdr_bits(uint32_t *hd)
+{
+    uint32_t ha = 0, hs = 0;
+    if (CX_HDR(hd, &ha, &hs) || hs < 28) return -1;
+    return *(volatile uint8_t *)(cx_cpu(ha) + 24);
+}
+
 /* one encode of the current MEM1 at bpp; returns handle or 0 */
 static uint32_t *cx_enc1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t *us)
 {
@@ -328,12 +373,15 @@ static int cx_freeze(uint32_t addr, uint32_t pitch, uint32_t h)
     return s1 == s2;
 }
 
-static void cx_save1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, int frozen)
+static int cx_save1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, int frozen)
 {
     uint32_t pitch = w * bpp / 8, us = 0;
     cx_log("save %d-bit: encode", bpp);
     uint32_t *hd = cx_enc1(w, h, bpp, addr, &us);
-    if (!hd) return;
+    if (!hd) return -1;
+    int hb = cx_hdr_bits(hd);
+    cx_log("save %d-bit: done %d us, CMP1 says %d-bit", bpp, us, hb);
+    if (hb != (int)bpp) { cx_log("  depth NOT applied - stopping before more encodes of this frame"); CX_FREE(hd, 0, 0); return -1; }
     uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
     if (!CX_HDR(hd, &ha, &hs) && !CX_RING(hd, &n, &ea, &es) && n && n <= 64)
     {
@@ -358,6 +406,7 @@ static void cx_save1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, int fr
                frozen ? "static" : "MOVED", us, tot, n, bpp, bpp);
     }
     CX_FREE(hd, 0, 0);
+    return 0;
 }
 
 static void cx_rec(int phase, int bpp, int k, uint32_t enc_us, uint32_t wr_us, uint32_t bytes)
@@ -494,7 +543,7 @@ static void cx_stream_task(void *unused)
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
     cx_nf = 0;
-    cx_log("---- CRX stream test (v4.21)");
+    cx_log("---- CRX stream test (v4.22)");
     cx_f = malloc(CX_MAXF * sizeof(struct cx_fr));
     if (!cx_f) { snprintf(cx_last, sizeof(cx_last), "no memory for stats"); cx_log("%s", cx_last); cx_running = 0; return; }
     snprintf(cx_last, sizeof(cx_last), "running...");
@@ -521,7 +570,8 @@ static void cx_stream_task(void *unused)
         uint32_t addr = MEM(CX_PATH + 0x58);
         int frozen = cx_freeze(addr, w * bpp / 8, h);
         cx_log("%d-bit: MEM1 %08x frozen %d", bpp, addr, frozen);
-        cx_save1(w, h, bpp, addr, frozen);
+        cx_reinit(bpp);
+        if (cx_save1(w, h, bpp, addr, frozen)) { snprintf(cx_last, sizeof(cx_last), "%d-bit not applied/failed", bpp); goto out_pack; }
         if (cx_burst(w, h, bpp, addr, 2000)) { snprintf(cx_last, sizeof(cx_last), "%d-bit encode failed", bpp); goto out_pack; }
         if (bpp == 10)
         {
@@ -530,6 +580,7 @@ static void cx_stream_task(void *unused)
         }
         call("lv_save_raw", 1); msleep(300);
         cx_pack_restore();
+        cx_write_tsv();                   /* v4.22: keep each depth's numbers even if a later one hangs */
     }
     ok = 1;
 
@@ -543,6 +594,7 @@ out_pack:
     {
         NotifyBox(4000, "CRX stream test: live copy (last step)...");
         cx_log("phase 4: live frames via a copy (tap on)");
+        cx_reinit(14);
         if (cx_live_copy(w, h, 2000)) snprintf(cx_last, sizeof(cx_last), "phase 4 failed");
         cx_write_tsv();
     }
@@ -551,6 +603,7 @@ out_pack:
         msleep(1000);
         cx_log("FreeAllEncBuffer %d", rfa);
         cx_mgr_log("after FreeAll");
+        cx_release_cfg();
         mem2 = cx_probe_mem("after FreeAll");
     }
     if (ok && !strcmp(cx_last, "running..."))
