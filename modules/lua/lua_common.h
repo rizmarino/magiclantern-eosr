@@ -146,7 +146,7 @@ int luaopen_KEY(lua_State * L);
 
 /* v4.14 EOS R exit-freeze trace (lua.c). Modules are built camera-independent (no CONFIG_R here); this fork only
  * targets the R, whose core exports r_dbg_redraw_*. Temporary: remove with the trace. */
-#define LUA_R_TRACE
+/* #define LUA_R_TRACE */   /* off since v4.16: the SET freeze is fixed (v4.15, camera-verified 2026-11-04) */
 #ifdef LUA_R_TRACE
 void r_lt(const char * fmt, ...);
 extern volatile int r_lt_step;
