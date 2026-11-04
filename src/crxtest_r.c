@@ -20,6 +20,7 @@
 #include "menu.h"
 #include "bmp.h"
 #include "property.h"
+#include "timer.h"
 
 extern volatile int r_crx_busy;          /* rectest_r.c: rawrec_running() includes it */
 
@@ -75,9 +76,13 @@ static void cx_mgr_log(const char *when)
 }
 
 /* called from the algsmgr task when every tile is done */
+static uint32_t *volatile cx_hq[16];      /* v4.20: handles in completion order (stream test pipelines 2) */
+static volatile uint64_t cx_hq_us[16];
 static void cx_cb(void *ctx, uint32_t *handles)
 {
     cx_handle = handles ? (uint32_t *)handles[0] : 0;
+    cx_hq[cx_cb_count & 15] = (uint32_t *)cx_handle;
+    cx_hq_us[cx_cb_count & 15] = get_us_clock();
     cx_cb_count++;
     give_semaphore(cx_sem);
 }
@@ -104,7 +109,7 @@ static void cx_task(void *unused)
 {
     cx_running = 1;
     uint32_t t0 = get_ms_clock();
-    cx_log("---- CRX encode test (v4.19)");
+    cx_log("---- CRX encode test (v4.20)");
     snprintf(cx_last, sizeof(cx_last), "running...");
 
     int tap_was = MEM(CX_PATH + 0x40);
@@ -217,6 +222,288 @@ out:
     cx_running = 0;
 }
 
+/* ======================= v4.20: Debug > "CRX stream test" (lossless 4K step 3) =======================
+ * 1. memory: how much shoot memory ML's recorder could get (16 MB contiguous chunks, the recorder's own
+ *    allocation, capped at 24 = 384 MB, freed at once) - before the first encode, after the encodes, and after
+ *    ALGSMGR_FreeAllEncBuffer e066b592 (what Canon's ENCDRWRAP_ShutdownEncoder calls)
+ * 2. for 14, 12, 10-bit (Canon's LSB-first packing, the recorder's pack switch with f3=1): back-to-back encodes of
+ *    the live MEM1 for 3 s (encoder speed / size per frame), then one frozen frame saved as ML/CRXT<b>.BIN +
+ *    CRXR<b>.BIN for a bit-exact check of that depth on the PC
+ * 3. 10-bit, 4 s: encode frame k+1 while writing frame k's chunks to ML/CRXSTRM.BIN (the recorder's pipeline)
+ * Per-frame numbers go to ML/LOGS/CRXSTRM.TSV, the summary to ML/LOGS/CRXTEST.LOG. */
+
+#define CX_FREEALL ((int (*)(void))0xE066B593)
+#define CX_MAXF 600
+static struct cx_fr { uint8_t phase, bpp; uint16_t n; uint32_t enc_us, wr_us, bytes; } *cx_f;   /* malloc'd per run */
+static int cx_nf;
+static uint32_t cx_pk_orig[5], cx_pk_w0; static int cx_pk_applied;
+
+static int cx_pack_apply(int bpp)          /* rectest_r.c rt_pack_apply(bpp, 0): Canon bit order */
+{
+    for (int i = 0; i < 5; i++) cx_pk_orig[i] = MEM(CX_PATH + 0x64 + 4 * i);
+    cx_pk_w0 = MEM(CX_PATH + 0x18);
+    uint32_t md = MEM(CX_PATH);
+    if (cx_pk_orig[0] != 0 || cx_pk_orig[1] != 1 || cx_pk_orig[2] != 2 || cx_pk_orig[3] != 1 || cx_pk_orig[4] != 0)
+    { cx_log("pack cfg not Canon's default"); return -1; }
+    if (md >= 0x14 || (MEM(CX_PATH + 0x28) && (md == 0xb || md == 0xf || md == 9)) || cx_pk_w0 != MEM(CX_PATH + 0x10))
+    { cx_log("Mem1Path mode %d / width %d vs %d: untested layout", md, cx_pk_w0, MEM(CX_PATH + 0x10)); return -1; }
+    if (bpp == 14) return 0;
+    uint32_t lb = cx_pk_w0 * bpp / 8, wset = (lb * 8 + 13) / 14;
+    if (((wset * 14) >> 3) != lb || (cx_pk_w0 * bpp) % 8) { cx_log("no width field for %d B/line", lb); return -1; }
+    uint32_t old = cli();
+    MEM(CX_PATH + 0x18) = wset; MEM(CX_PATH + 0x64 + 8) = bpp == 12 ? 1 : 0; MEM(CX_PATH + 0x64 + 12) = 1;
+    sei(old);
+    cx_pk_applied = 1;
+    msleep(300);
+    cx_log("pack %d-bit: f2=%d f3=1 width field %d -> %d", bpp, bpp == 12 ? 1 : 0, cx_pk_w0, wset);
+    return 0;
+}
+static void cx_pack_restore(void)
+{
+    if (!cx_pk_applied) return;
+    uint32_t old = cli();
+    MEM(CX_PATH + 0x18) = cx_pk_w0; MEM(CX_PATH + 0x64 + 8) = cx_pk_orig[2]; MEM(CX_PATH + 0x64 + 12) = cx_pk_orig[3];
+    sei(old);
+    cx_pk_applied = 0;
+    msleep(150);
+}
+
+static int cx_probe_mem(const char *when)
+{
+    struct memSuite *s[24]; int n = 0;
+    for (; n < 24; n++) if (!(s[n] = shoot_malloc_suite_contig(16 * 1024 * 1024))) break;
+    for (int i = 0; i < n; i++) shoot_free_suite(s[i]);
+    cx_log("memory %s: recorder could get %d x 16 MB%s", when, n, n == 24 ? " (cap reached)" : "");
+    return n;
+}
+
+static uint32_t cx_frame_bytes(uint32_t *hd, uint32_t *n_out)
+{
+    uint32_t n = 0, *ea = 0, *es = 0, t = 0;
+    if (CX_RING(hd, &n, &ea, &es) || n > 64) n = 0;
+    for (uint32_t i = 0; i < n; i++) t += es[i];
+    if (n_out) *n_out = n;
+    return t;
+}
+
+static int cx_wait(int ms) { return take_semaphore(cx_sem, ms); }
+
+/* one encode of the current MEM1 at bpp; returns handle or 0 */
+static uint32_t *cx_enc1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t *us)
+{
+    uint32_t desc[11] = { 0, w, h, 0, 0, bpp, addr, w, 0, 0, 0 };
+    int c0 = cx_cb_count;
+    uint64_t t = get_us_clock();
+    int rc = CX_START(desc, 1, cx_cb, 0);
+    if (rc & 1) { cx_log("StartEncode %d", rc); return 0; }
+    if (cx_wait(2000)) { cx_log("TIMEOUT waiting for encode (%d bpp)", bpp); return 0; }
+    *us = (uint32_t)(cx_hq_us[c0 & 15] - t);
+    return cx_hq[c0 & 15];
+}
+
+static void cx_stats(int phase, int bpp, uint32_t w, uint32_t h, int from, uint32_t wall_ms)
+{
+    uint32_t n = cx_nf - from, mn = ~0u, mx = 0; uint64_t se = 0, sb = 0, sw = 0;
+    for (int i = from; i < cx_nf; i++)
+    { uint32_t e = cx_f[i].enc_us; mn = MIN(mn, e); mx = MAX(mx, e); se += e; sb += cx_f[i].bytes; sw += cx_f[i].wr_us; }
+    if (!n) { cx_log("phase %d %d-bit: no frames", phase, bpp); return; }
+    uint32_t bp100 = (uint32_t)(sb * 800 / ((uint64_t)n * w * h));
+    uint32_t fps10 = wall_ms ? n * 10000 / wall_ms : 0;
+    cx_log("phase %d %d-bit: %d frames in %d ms = %d.%d fps; encode us min %d avg %d max %d; avg %d B = %d.%02d bpp;"
+           " write avg %d us", phase, bpp, n, wall_ms, fps10 / 10, fps10 % 10, mn, (uint32_t)(se / n), mx,
+           (uint32_t)(sb / n), bp100 / 100, bp100 % 100, (uint32_t)(sw / n));
+}
+
+static void cx_save_frozen(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr)
+{
+    uint32_t pitch = w * bpp / 8;
+    call("lv_save_raw", 0); msleep(250);
+    uint32_t s1 = cx_sum(addr, pitch, h); msleep(150);
+    uint32_t s2 = cx_sum(addr, pitch, h);
+    uint32_t us = 0, *hd = cx_enc1(w, h, bpp, addr, &us);
+    if (hd)
+    {
+        uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
+        if (!CX_HDR(hd, &ha, &hs) && !CX_RING(hd, &n, &ea, &es) && n && n <= 64)
+        {
+            uint32_t pk[5]; for (int i = 0; i < 5; i++) pk[i] = MEM(CX_PATH + 0x64 + 4 * i);
+            struct cx_hdr H = { {'C','R','X','1'}, sizeof(struct cx_hdr), w, h, bpp, pitch,
+                                {pk[0], pk[1], pk[2], pk[3], pk[4]}, addr, s1 == s2, us / 1000, hs, n, {0} };
+            uint32_t tot = 0;
+            for (uint32_t i = 0; i < n; i++) { H.entry_size[i] = es[i]; tot += es[i]; }
+            char fn[32]; snprintf(fn, sizeof(fn), "ML/CRXT%d.BIN", bpp);
+            FILE *f = FIO_CreateFile(fn);
+            if (f)
+            {
+                FIO_WriteFile(f, &H, sizeof(H));
+                FIO_WriteFile(f, (void *)cx_cpu(ha), hs);
+                for (uint32_t i = 0; i < n; i++) if (es[i]) FIO_WriteFile(f, (void *)ea[i], es[i]);
+                FIO_CloseFile(f);
+            }
+            snprintf(fn, sizeof(fn), "ML/CRXR%d.BIN", bpp);
+            f = FIO_CreateFile(fn);
+            if (f) { FIO_WriteFile(f, (void *)cx_cpu(addr), pitch * h); FIO_CloseFile(f); }
+            cx_log("frozen %d-bit frame (%s): %d us, %d B, %d entries -> CRXT%d/CRXR%d.BIN", bpp,
+                   s1 == s2 ? "static" : "MOVED", us, tot, n, bpp, bpp);
+        }
+        CX_FREE(hd, 0, 0);
+    }
+    call("lv_save_raw", 1); msleep(400);
+}
+
+static void cx_stream_task(void *unused)
+{
+    cx_running = 1;
+    uint32_t t0 = get_ms_clock();
+    cx_nf = 0;
+    cx_log("---- CRX stream test (v4.20)");
+    cx_f = malloc(CX_MAXF * sizeof(struct cx_fr));
+    if (!cx_f) { snprintf(cx_last, sizeof(cx_last), "no memory for stats"); cx_log("%s", cx_last); cx_running = 0; return; }
+    snprintf(cx_last, sizeof(cx_last), "running...");
+    int tap_was = MEM(CX_PATH + 0x40), ok = 0;
+    r_crx_busy = 1;
+    if (!cx_sem) cx_sem = create_named_semaphore("crx_test", 0);
+    while (!take_semaphore(cx_sem, 1)) ;    /* drain */
+    if (!lv || RECORDING) { snprintf(cx_last, sizeof(cx_last), "needs movie LV, not recording"); goto out; }
+    if (!tap_was) { call("lv_save_raw", 1); msleep(600); }
+    uint32_t w = MEM(CX_PATH + 0x10), h = MEM(CX_PATH + 0x14);
+    if (w != 4256 || h != 2214 || !MEM(CX_PATH + 0x40))
+    { snprintf(cx_last, sizeof(cx_last), "MEM1 %dx%d: set 4K movie mode", w, h); cx_log("abort: %s", cx_last); goto out; }
+
+    cx_mgr_log("start");
+    int mem0 = cx_probe_mem("before encoding");
+
+    static const int depths[3] = { 14, 12, 10 };
+    for (int d = 0; d < 3; d++)
+    {
+        int bpp = depths[d];
+        NotifyBox(4000, "CRX stream test: %d-bit...", bpp);
+        if (cx_pack_apply(bpp)) { snprintf(cx_last, sizeof(cx_last), "pack %d-bit failed", bpp); goto out_pack; }
+        uint32_t addr = MEM(CX_PATH + 0x58);
+        int from = cx_nf; uint32_t ts = get_ms_clock();
+        while (get_ms_clock() - ts < 3000 && cx_nf < CX_MAXF)
+        {
+            uint32_t us = 0, *hd = cx_enc1(w, h, bpp, addr, &us);
+            if (!hd) { snprintf(cx_last, sizeof(cx_last), "encode failed at %d-bit", bpp); goto out_pack; }
+            cx_f[cx_nf].phase = 2; cx_f[cx_nf].bpp = bpp; cx_f[cx_nf].n = cx_nf - from;
+            cx_f[cx_nf].enc_us = us; cx_f[cx_nf].wr_us = 0; cx_f[cx_nf].bytes = cx_frame_bytes(hd, 0);
+            cx_nf++;
+            CX_FREE(hd, 0, 0);
+        }
+        cx_stats(2, bpp, w, h, from, get_ms_clock() - ts);
+        cx_save_frozen(w, h, bpp, addr);
+        cx_pack_restore();
+    }
+
+    /* phase 3: 10-bit, encode k+1 while writing k */
+    NotifyBox(5000, "CRX stream test: 10-bit encode + write...");
+    if (cx_pack_apply(10)) { snprintf(cx_last, sizeof(cx_last), "pack 10-bit failed"); goto out_pack; }
+    {
+        uint32_t addr = MEM(CX_PATH + 0x58);
+        uint32_t desc[11] = { 0, w, h, 0, 0, 10, addr, w, 0, 0, 0 };
+        FILE *f = FIO_CreateFile("ML/CRXSTRM.BIN");
+        if (!f) { snprintf(cx_last, sizeof(cx_last), "can't create CRXSTRM.BIN"); goto out_pack; }
+        int from = cx_nf, done = cx_cb_count, pipelined = 1;
+        uint64_t total = 0, tstart = get_us_clock();
+        uint32_t ts = get_ms_clock();
+        uint64_t tsub = get_us_clock();
+        int rc = CX_START(desc, 1, cx_cb, 0);
+        while (!(rc & 1) && cx_nf < CX_MAXF)
+        {
+            if (cx_wait(2000)) { cx_log("TIMEOUT in phase 3"); snprintf(cx_last, sizeof(cx_last), "phase 3 TIMEOUT"); break; }
+            uint32_t *hd = cx_hq[done & 15];
+            uint32_t enc_us = (uint32_t)(cx_hq_us[done & 15] - tsub);
+            done++;
+            int more = get_ms_clock() - ts < 4000;
+            if (more && pipelined)                        /* next frame encodes while this one is written */
+            {
+                tsub = get_us_clock();
+                rc = CX_START(desc, 1, cx_cb, 0);
+                if (rc & 1) { cx_log("pipelined StartEncode refused (%d): sequential from here", rc); pipelined = 0; rc = 0; }
+            }
+            uint32_t n = 0, *ea = 0, *es = 0, bytes = 0;
+            uint64_t tw = get_us_clock();
+            if (!CX_RING(hd, &n, &ea, &es) && n <= 64)
+            {
+                uint32_t rec[2] = { 0x46585243 /* CRXF */, n };
+                FIO_WriteFile(f, rec, 8); FIO_WriteFile(f, es, 4 * n);
+                for (uint32_t i = 0; i < n; i++) if (es[i])
+                {
+                    int wr = FIO_WriteFile(f, (void *)ea[i], es[i]);
+                    if (wr != (int)es[i]) { cx_log("short write %d of %d", wr, es[i]); more = 0; }
+                    bytes += es[i];
+                }
+            }
+            uint32_t wr_us = (uint32_t)(get_us_clock() - tw);
+            CX_FREE(hd, 0, 0);
+            total += bytes;
+            cx_f[cx_nf].phase = 3; cx_f[cx_nf].bpp = 10; cx_f[cx_nf].n = cx_nf - from;
+            cx_f[cx_nf].enc_us = enc_us; cx_f[cx_nf].wr_us = wr_us; cx_f[cx_nf].bytes = bytes; cx_nf++;
+            if (!more) break;
+            if (!pipelined) { tsub = get_us_clock(); rc = CX_START(desc, 1, cx_cb, 0); }
+        }
+        FIO_CloseFile(f);
+        uint32_t el = (uint32_t)((get_us_clock() - tstart) / 1000);
+        cx_stats(3, 10, w, h, from, el);
+        uint32_t mbs10 = el ? (uint32_t)(total * 10000 / (el * 1048576ull)) : 0;
+        cx_log("phase 3: %s, %d MB written in %d ms = %d.%d MiB/s", pipelined ? "pipelined" : "sequential",
+               (uint32_t)(total >> 20), el, mbs10 / 10, mbs10 % 10);
+        ok = cx_nf - from;
+    }
+
+out_pack:
+    cx_pack_restore();
+    cx_mgr_log("after encoding");
+    {
+        uint32_t m = MEM(CX_MGR);
+        for (int k = 0; m && k < 2; k++)
+            cx_log("alloc[%d]: lower %08x upper %08x size %08x", k, MEM(m + 0x188 + 4 * k), MEM(m + 0x218 + 4 * k),
+                   MEM(m + 0x2A8 + 4 * k));
+    }
+    int mem1 = cx_probe_mem("after encoding");
+    int rfa = CX_FREEALL();
+    msleep(1000);
+    cx_log("FreeAllEncBuffer %d", rfa);
+    cx_mgr_log("after FreeAll");
+    int mem2 = cx_probe_mem("after FreeAll");
+    {
+        FILE *f = FIO_CreateFile("ML/LOGS/CRXSTRM.TSV");
+        if (f)
+        {
+            char ln[96];
+            int k = snprintf(ln, sizeof(ln), "phase\tbpp\tframe\tenc_us\twrite_us\tbytes\n"); FIO_WriteFile(f, ln, k);
+            for (int i = 0; i < cx_nf; i++)
+            {
+                k = snprintf(ln, sizeof(ln), "%d\t%d\t%d\t%d\t%d\t%d\n", cx_f[i].phase, cx_f[i].bpp, cx_f[i].n,
+                             cx_f[i].enc_us, cx_f[i].wr_us, cx_f[i].bytes);
+                FIO_WriteFile(f, ln, k);
+            }
+            FIO_CloseFile(f);
+        }
+    }
+    if (ok) snprintf(cx_last, sizeof(cx_last), "done, %d frames; mem %d/%d/%d x16MB", cx_nf, mem0, mem1, mem2);
+out:
+    if (tap_was) call("lv_save_raw", 1); else call("lv_save_raw", 0);
+    r_crx_busy = 0;
+    free(cx_f); cx_f = 0;
+    cx_log("stream test done in %d ms: %s", get_ms_clock() - t0, cx_last);
+    NotifyBox(6000, "CRX stream: %s", cx_last);
+    cx_running = 0;
+}
+
+static MENU_SELECT_FUNC(cx_stream_select)
+{
+    if (cx_running) return;
+    task_create("crx_strm", 0x1e, 0x8000, cx_stream_task, 0);
+}
+
+static MENU_UPDATE_FUNC(cx_stream_update)
+{
+    MENU_SET_VALUE("%s", cx_last);
+    MENU_SET_HELP("~20 s: encoder speed/size at 14/12/10-bit, 10-bit encode+write to card, memory before/after.");
+    MENU_SET_WARNING(MENU_WARN_INFO, "4K movie mode, LV on, not recording. Writes ~300 MB to ML/CRXSTRM.BIN.");
+}
+
 static MENU_SELECT_FUNC(cx_select)
 {
     if (cx_running) return;
@@ -232,6 +519,7 @@ static MENU_UPDATE_FUNC(cx_update)
 
 static struct menu_entry cx_menu[] = {
     { .name = "CRX encode test", .select = cx_select, .update = cx_update, .icon_type = IT_ACTION },
+    { .name = "CRX stream test", .select = cx_stream_select, .update = cx_stream_update, .icon_type = IT_ACTION },
 };
 
 static void cx_init(void *unused) { menu_add("Debug", cx_menu, COUNT(cx_menu)); }
