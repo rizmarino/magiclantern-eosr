@@ -117,6 +117,7 @@ static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920,
  * (algsmgr type 0 = Canon's lossless CR3 profile, crxtest_r.c) into MLV VIDF blocks; a PC tool (crx2mlv.py)
  * turns the clip into a standard uncompressed MLV. No audio and no pre-record with it yet. */
 static CONFIG_INT("r.rawrec.crx", rr_crx, 0);
+static CONFIG_INT("r.rawrec.crxsrc", rr_crx_src, 0);    /* v4.28: 0 copy, 1 direct, 2 direct + RAWC verify frames */
 #define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -717,9 +718,9 @@ static uint8_t *mlv_hdr;                /* RT_HDR_BYTES, malloc'd per MLV run */
  * address alignment (chunk bases are 4 KiB-aligned like MEM1 at 0x...A940 mod 64 = 0). In 4K movie mode the
  * 4256-px rows are only 8-byte aligned at 10/14-bit; every camera-verified copy before had 16-byte aligned rows.
  * Copies a 64-row pattern from chunk 0 to chunk 1 and compares every word. 0 = exact, -1 = mismatch, -2 = DMA timeout. */
-static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes)
+static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes, uint32_t db)   /* v4.28: db passed in (direct source has 1 chunk) */
 {
-    uint32_t rows = 64, sb = ch[0].base, db = ch[1].base;
+    uint32_t rows = 64, sb = ch[0].base;
     rows = MIN(rows, MIN(chunk_bytes / pitch, chunk_bytes / c_rb));
     for (uint32_t r = 0; r < rows; r++)
         for (uint32_t i = 0; i < pitch / 4; i++) MEM(sb + r * pitch + 4 * i) = 0xA5000000u ^ (r << 16) ^ i;
@@ -1407,6 +1408,8 @@ static void rt_writer(void *unused)
  * 4 KiB multiple, so every card write stays 4 KiB-aligned in the file (RT_HDR_BYTES note). */
 extern int crx_rec_begin(void);
 extern uint32_t *crx_rec_encode(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t *us);
+extern int crx_rec_start(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t line);   /* v4.28 */
+extern uint32_t *crx_rec_wait(uint32_t *us);
 extern int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es);
 extern uint32_t crx_rec_free(uint32_t *hd);
 extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
@@ -1429,6 +1432,14 @@ static uint64_t x_bytes, x_enc_sum, x_cp_sum;
 static volatile int x_go, w_xs0, w_fn0_set;
 static volatile uint32_t x_trig_fn, x_trig_ts, x_written, x_kb, w_pre_cnt;
 static int rr_pre_want;
+/* v4.28 direct source: the capture task starts the encoder on MEM1 right after the frame-end IRQ (x_dstate 1), the
+ * compressor waits for the result, stages it and frees it (x_dstate 0). A frame arriving while the encoder is still
+ * busy is dropped. Direct+verify: about once a second the same frame is also EDMAC-copied into ch[0] and written as
+ * a 'RAWC' block (an uncompressed VIDF under another name) for the PC to compare with the decoded CRX frame. */
+static int c_crxd;
+static volatile int x_dstate;
+static volatile uint32_t x_dfn, x_dts, x_dbusy, x_vn, x_vnext;
+#define RT_XVERIFY_EVERY 30
 
 static void rt_alloc_staging(void)
 {
@@ -1525,12 +1536,79 @@ static void rt_x_renum(uint32_t base, uint32_t len)
     }
 }
 
+/* one encoded frame (handle hd, VIDF fields in v) into the staging buffers, then free it. 0 = ok, else w_err code.
+ * Hands a full staging buffer to the writer and waits for the next one to be free. (v4.28: from rt_crx_task) */
+static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uint32_t *ppos, uint32_t *pnfr)
+{
+    uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
+    if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { crx_rec_free(hd); return -11; }
+    uint32_t need = 64 + 192 + AL64(hs);
+    for (uint32_t i = 0; i < n; i++) need += AL64(es[i]);
+    if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; crx_rec_free(hd); return -12; }
+    if (*ppos + need + 4096 + 16 > RT_XSB_BYTES)   /* this staging buffer is full: hand it to the writer */
+    {
+        rt_x_close(*psi, *ppos, *pnfr);
+        if (rr_pre) rt_x_pre_trim(*psi);        /* v4.26: armed: keep only the newest frames */
+        *psi = (*psi + 1) % nsb; *ppos = 0; *pnfr = 0;
+        uint32_t tw = get_ms_clock();
+        while (xsb[*psi].state != SB_FREE && !w_err) take_semaphore(rt_xsem, 50);
+        x_wait_ms += get_ms_clock() - tw;
+        if (w_err) { crx_rec_free(hd); return w_err; }
+    }
+    uint32_t b = xsb[*psi].base + *ppos;
+    struct rt_vidf v = *pv;
+    v.size = need; v.space = 32;
+    memcpy((void *)b, &v, sizeof(v));
+    uint32_t *xh = (uint32_t *)(b + 64);
+    memset(xh, 0, 192);
+    xh[0] = 0x56585243; xh[1] = 1; xh[2] = n; xh[3] = hs; xh[4] = us;   /* 'CRXV' */
+    for (uint32_t i = 0; i < n; i++) xh[8 + i] = es[i];
+    uint32_t o = b + 64 + 192, tc = (uint32_t)get_us_clock();
+    int r = crx_rec_copy(o, ha, AL64(hs));
+    o += AL64(hs);
+    for (uint32_t i = 0; i < n && !r; i++) if (es[i]) { r = crx_rec_copy(o, ea[i], AL64(es[i])); o += AL64(es[i]); }
+    tc = (uint32_t)get_us_clock() - tc;
+    if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
+    uint32_t fu = crx_rec_free(hd);
+    if (r) return -13;
+    *ppos += need; (*pnfr)++;
+    x_kb += need >> 10;                         /* v4.26: status line rate */
+    x_frames++; x_bytes += need - 64 - 192 - AL64(hs);
+    x_enc_sum += us; if (us > x_enc_max) x_enc_max = us;
+    x_cp_sum += tc; if (tc > x_cp_max) x_cp_max = tc;
+    if (fu > x_free_max) x_free_max = fu;
+    return 0;
+}
+
 static void rt_crx_task(void *unused)
 {
     int ri = 0, si = 0;
     uint32_t pos = 0, nfr = 0;
+    while (c_crxd)                              /* v4.28 direct source: the capture task started the encode */
+    {
+        if (w_err) break;
+        if (!x_go && !rr_pre) rt_x_go(si);
+        if (x_dstate != 1)
+        {
+            if (x_stop) break;
+            take_semaphore(rt_xsem, 50);
+            continue;
+        }
+        uint32_t us = 0;
+        uint32_t *hd = crx_rec_wait(&us);
+        if (!hd) { w_err = -10; break; }        /* x_dstate stays 1: no more encodes start */
+        struct rt_vidf v;
+        memset(&v, 0, sizeof(v));
+        memcpy(v.type, "VIDF", 4); v.ts = x_dts; v.frame = x_dfn;
+        v.crop_x = c_x0 & ~7; v.crop_y = c_y0; v.pan_x = c_x0; v.pan_y = c_y0;
+        int e = rt_x_put(hd, us, &v, &si, &pos, &nfr);
+        RT_DMB();
+        x_dstate = 0;
+        if (e) { w_err = e; break; }
+    }
     for (;;)
     {
+        if (c_crxd) break;
         if (w_err) break;
         if (!x_go && !rr_pre) rt_x_go(si);     /* v4.26: pre-record triggered */
         if (ch[ri].state != CH_FULL)
@@ -1544,44 +1622,10 @@ static void rt_crx_task(void *unused)
             uint32_t slot = ch[ri].base + s * slot_bytes, us = 0;
             uint32_t *hd = crx_rec_encode(c_cw, c_ch, c_bpp, slot + slot_pre, &us);
             if (!hd) { w_err = -10; break; }
-            uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
-            if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { crx_rec_free(hd); w_err = -11; break; }
-            uint32_t need = 64 + 192 + AL64(hs);
-            for (uint32_t i = 0; i < n; i++) need += AL64(es[i]);
-            if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; crx_rec_free(hd); w_err = -12; break; }
-            if (pos + need + 4096 + 16 > RT_XSB_BYTES)  /* this staging buffer is full: hand it to the writer */
-            {
-                rt_x_close(si, pos, nfr);
-                if (rr_pre) rt_x_pre_trim(si);  /* v4.26: armed: keep only the newest frames */
-                si = (si + 1) % nsb; pos = 0; nfr = 0;
-                uint32_t tw = get_ms_clock();
-                while (xsb[si].state != SB_FREE && !w_err) take_semaphore(rt_xsem, 50);
-                x_wait_ms += get_ms_clock() - tw;
-                if (w_err) { crx_rec_free(hd); break; }
-            }
-            uint32_t b = xsb[si].base + pos;
             struct rt_vidf v;
             memcpy(&v, (void *)slot, sizeof(v));       /* frame number / timestamp / crop from the capture's VIDF */
-            v.size = need; v.space = 32;
-            memcpy((void *)b, &v, sizeof(v));
-            uint32_t *xh = (uint32_t *)(b + 64);
-            memset(xh, 0, 192);
-            xh[0] = 0x56585243; xh[1] = 1; xh[2] = n; xh[3] = hs; xh[4] = us;   /* 'CRXV' */
-            for (uint32_t i = 0; i < n; i++) xh[8 + i] = es[i];
-            uint32_t o = b + 64 + 192, tc = (uint32_t)get_us_clock();
-            int r = crx_rec_copy(o, ha, AL64(hs));
-            o += AL64(hs);
-            for (uint32_t i = 0; i < n && !r; i++) if (es[i]) { r = crx_rec_copy(o, ea[i], AL64(es[i])); o += AL64(es[i]); }
-            tc = (uint32_t)get_us_clock() - tc;
-            if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
-            uint32_t fu = crx_rec_free(hd);
-            if (r) { w_err = -13; break; }
-            pos += need; nfr++;
-            x_kb += need >> 10;                 /* v4.26: status line rate */
-            x_frames++; x_bytes += need - 64 - 192 - AL64(hs);
-            x_enc_sum += us; if (us > x_enc_max) x_enc_max = us;
-            x_cp_sum += tc; if (tc > x_cp_max) x_cp_max = tc;
-            if (fu > x_free_max) x_free_max = fu;
+            int e = rt_x_put(hd, us, &v, &si, &pos, &nfr);
+            if (e) { w_err = e; break; }
         }
         int used = 0;
         for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
@@ -1594,6 +1638,22 @@ static void rt_crx_task(void *unused)
     if (pos) rt_x_close(si, pos, nfr);      /* also after an encoder error: the frames already compressed are valid */
     x_done = 1;
     give_semaphore(rt_wsem);
+}
+
+/* new part file when the next write would pass RT_SPLIT. 0 = ok, else w_err code */
+static int rt_x_part_check(uint32_t bytes)
+{
+    if (w_fsize + bytes <= RT_SPLIT) return 0;
+    rt_mlv_close(w_file, w_part, w_part_frames);
+    ra_part_count = 0;
+    rt_part_name(w_name, rt_run_id, ++w_part);
+    w_file = FIO_CreateFile(w_name);
+    w_fsize = 0; w_part_frames = 0;
+    if (!w_file) return -2;
+    rt_mlv_build_hdr(w_part, 0);
+    if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES) return -3;
+    w_fsize = RT_HDR_BYTES;
+    return 0;
 }
 
 static void rt_writer_crx(void *unused)
@@ -1615,21 +1675,24 @@ static void rt_writer_crx(void *unused)
             w_fsize += r; w_bytes += r;
             continue;
         }
+        if (c_crxd == 2 && nch && ch[0].state == CH_FULL)   /* v4.28 verify frame (RAWC block, whole slot) */
+        {
+            int e = rt_x_part_check(slot_bytes);
+            if (e) { w_err = e; break; }
+            if (w_renum) { struct rt_vidf v; memcpy(&v, (void *)ch[0].base, sizeof(v)); v.frame -= w_fn0; v.ts -= w_ts0; memcpy((void *)ch[0].base, &v, sizeof(v)); }
+            int r = FIO_WriteFile(w_file, (void *)ch[0].base, slot_bytes);
+            if (r != (int)slot_bytes) { w_err = r ? r : -1; break; }
+            w_fsize += slot_bytes; w_bytes += slot_bytes;
+            ch[0].n = 0;
+            RT_DMB();
+            ch[0].state = CH_FREE;
+            continue;
+        }
         if (xsb[wi].state == SB_FULL)
         {
             uint32_t bytes = xsb[wi].len;
-            if (w_fsize + bytes > RT_SPLIT)
-            {
-                rt_mlv_close(w_file, w_part, w_part_frames);
-                ra_part_count = 0;
-                rt_part_name(w_name, rt_run_id, ++w_part);
-                w_file = FIO_CreateFile(w_name);
-                w_fsize = 0; w_part_frames = 0;
-                if (!w_file) { w_err = -2; break; }
-                rt_mlv_build_hdr(w_part, 0);
-                if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES) { w_err = -3; break; }
-                w_fsize = RT_HDR_BYTES;
-            }
+            int e = rt_x_part_check(bytes);
+            if (e) { w_err = e; break; }
             if (w_renum) rt_x_renum(xsb[wi].base, bytes);   /* v4.26 */
             uint32_t t = rt_us();
             int r = FIO_WriteFile(w_file, (void *)xsb[wi].base, bytes);
@@ -2166,6 +2229,65 @@ static void rr_pre_go_crx(uint32_t td)
     give_semaphore(rt_xsem);
 }
 
+/* v4.28 direct source, capture task: start the encoder on this frame in MEM1 (it reads ~3x faster than the sensor
+ * writes, so started right after the frame-end IRQ it stays ahead of the next readout); verify frames are EDMAC-copied
+ * at the same time. Encoder still busy with the previous frame -> dropped. */
+static int rt_frame_direct(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
+{
+    uint32_t us = 0;
+    if (frames && bot_ref == last_rec_bot) { flags |= F_DUP; dups++; }
+    else if (x_dstate)
+    {
+        flags |= F_DROP; drops++; x_dbusy++;
+        if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+    }
+    else
+    {
+        uint32_t top0 = rt_probe(r_top);
+        if (top0 != top_ref) { flags |= F_TEAR; tears++; }
+        x_dfn = nfr; x_dts = td - first_t;
+        x_dstate = 1;
+        RT_DMB();
+        if (crx_rec_start(c_cw, c_ch, c_bpp, c_src, pitch * 8 / c_bpp))
+        {
+            x_dstate = 0; w_err = -14;
+            rt_printf("!! encoder start failed at frame %d, stopping\n", nfr);
+            rt_fail();
+            return -1;
+        }
+        give_semaphore(rt_xsem);
+        if (c_crxd == 2 && !rr_pre && nch && (uint32_t)nfr >= x_vnext && ch[0].state == CH_FREE)   /* verify copy of the same frame */
+        {
+            uint32_t dst = ch[0].base;
+            rt_mlv_slot(dst, nfr, td - first_t);
+            memcpy((void *)dst, "RAWC", 4);
+            if (rt_copy(c_src, pitch, dst + slot_pre, c_rb, c_ch, &us))
+            {
+                rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
+                rt_fail();
+                return -1;
+            }
+            if (rt_probe(r_top) != top0) { flags |= F_TOPCHG; topchg++; }
+            ch[0].n = 1;
+            RT_DMB();
+            ch[0].state = CH_FULL;
+            give_semaphore(rt_wsem);
+            x_vn++; x_vnext = nfr + RT_XVERIFY_EVERY;
+        }
+        if (rt_probe(r_bot) != bot_ref) { flags |= F_BOTCHG; botchg++; }
+        frames++; dsum += us; if (us > dmax) dmax = us;
+        last_rec_bot = bot_ref;
+    }
+    if (flags & F_LATE) late++;
+    if (nfr < RT_MAXFR)
+    {
+        fl[nfr].t_us = td - first_t; fl[nfr].dma_us = MIN(us, 65535);
+        fl[nfr].lat = MIN(lat_us / 100, 255); fl[nfr].flags = flags;
+    }
+    nfr++;
+    return 0;
+}
+
 /* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
  * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
 static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
@@ -2173,6 +2295,7 @@ static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
     if (c_dng) return sp_frame(td, lat_us, flags, top_ref, bot_ref);
     if (!first_t) { first_t = td; next_tl = 0; }
     if (rr_pre && rr_pre_trig) { if (c_crx) rr_pre_go_crx(td); else rr_pre_go(td); }  /* v4.8: 2nd REC press: the clip starts with the kept frames */
+    if (c_crxd) return rt_frame_direct(td, lat_us, flags, top_ref, bot_ref);   /* v4.28 */
     uint32_t us = 0;
     if (frames && bot_ref == last_rec_bot)
     {
@@ -2386,8 +2509,9 @@ static void rt_task(void *unused)
     c_mlv = rt_fmt_sel != 0 && !c_dng;
     c_bpp = c_dng ? (sp_bits ? 12 : 10) : rt_fmt_bpp[rt_fmt_sel];
     c_crx = rr_crx && c_mlv;            /* v4.25 */
+    c_crxd = c_crx ? rr_crx_src : 0;    /* v4.28 */
     const int pre_on = rr_active && c_mlv && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8; v4.26 also lossless */
-    if (c_crx) rt_printf("v4.26 lossless (CRX) clip\n");
+    if (c_crx) rt_printf("v4.26 lossless (CRX) clip, source %s\n", c_crxd == 2 ? "direct + verify (v4.28)" : c_crxd ? "direct (v4.28)" : "copy");
     rr_pre = 0; rr_pre_trig = 0; rr_pre_cancel = 0; rr_pre_disc = rr_pre_kept = rr_pre_kept_ms = 0;
     w_renum = 0; w_wi0 = 0; w_fn0 = 0; w_ts0 = 0;
     pk_applied = 0;
@@ -2503,11 +2627,11 @@ static void rt_task(void *unused)
     }
     /* v3.14: SRM "Extra memory" removed: Canon's 1st-job buffer is carved from the same shoot memory (no gain), and an
      * unanswered request in LV blocks all later allocations until a power cycle (lv-survey.md "SRM static RE"). */
-    rt_alloc_chunks(c_dng ? RT_MAXCH : c_crx ? RT_XRAW : RT_MAXCH_VIDEO);
+    rt_alloc_chunks(c_dng ? RT_MAXCH : c_crxd ? 1 : c_crx ? RT_XRAW : RT_MAXCH_VIDEO);   /* v4.28 direct: 1 = verify slot */
     (void)sp_srm_carve; (void)sp_srm_alloc; (void)sp_srm_sel;
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
     rt_flush();
-    if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
+    if (nch < (c_crxd ? 1 : 2)) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
     if (c_crx)                          /* v4.25 staging buffers; v4.26: after the RT_XRAW raw chunks, all the rest */
     {
         if (!rt_xsem) rt_xsem = create_named_semaphore("rt_crx", SEM_CREATE_LOCKED);
@@ -2516,6 +2640,7 @@ static void rt_task(void *unused)
         if (crx_rec_begin()) { snprintf(rt_last, sizeof(rt_last), "CRX encoder not found"); goto done; }
         x_stop = 0; x_done = 0; x_frames = x_enc_max = x_cp_max = x_free_max = x_wait_ms = x_big = x_max_used = 0;
         x_bytes = x_enc_sum = x_cp_sum = 0;
+        x_dstate = 0; x_dbusy = x_vn = x_vnext = 0;   /* v4.28 */
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
     if (pre_on && c_crx)                /* v4.26: kept compressed, in staging buffers (rt_x_pre_trim) */
@@ -2547,7 +2672,7 @@ static void rt_task(void *unused)
 
     rt_begin();
     {
-        int s = rt_copy_selftest(c_x0 * c_bpp / 8, kslots * slot_bytes);
+        int s = rt_copy_selftest(c_x0 * c_bpp / 8, kslots * slot_bytes, nch > 1 ? ch[1].base : xsb[0].base);   /* v4.28: staging 0 is idle here */
         if (s == -2) { rt_fail(); snprintf(rt_last, sizeof(rt_last), "DMA timeout (self-test)"); goto done; }
         if (s) { snprintf(rt_last, sizeof(rt_last), "RT%02d: copy self-test failed", rt_run_id); NotifyBox(6000, "Record test: %s", rt_last); goto done; }
     }
@@ -2778,6 +2903,8 @@ static void rt_task(void *unused)
                   frame_bytes && x_frames ? (uint32_t)(x_bytes * 100 / x_frames / frame_bytes) : 0, xneed10 / 10, xneed10 % 10,
                   x_frames ? (uint32_t)(x_enc_sum / x_frames) : 0, x_enc_max, x_frames ? (uint32_t)(x_cp_sum / x_frames) : 0, x_cp_max,
                   x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_written, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
+        if (c_crxd) rt_printf("v4.28 direct source: MEM1 crop at %08x, line %d px; %d frames dropped (encoder busy), %d verify frames (RAWC)\n",
+                              c_src, pitch * 8 / c_bpp, x_dbusy, x_vn);
     }
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
@@ -2785,7 +2912,7 @@ static void rt_task(void *unused)
     {
         snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit%s, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
                  c_crx ? " lossless" : "", c_crx ? (int)x_written : pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
-                 w_err <= -10 && w_err >= -13 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
+                 w_err <= -10 && w_err >= -14 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
                  missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
         if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
         if (pre_on && pre_armed_end) snprintf(rt_last, sizeof(rt_last), "pre-record %s", rr_pre_cancel ? "cancelled" : "stopped");
@@ -3503,6 +3630,14 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("OFF", "Lossless"),
                 .help    = "Lossless: Canon's CR3 lossless encoder, ~45% of raw at 10-bit. 3840x2160 10-bit fits.",
                 .help2   = "PC: crx2mlv.py makes a normal MLV. Pre-record holds ~0.8 s at 3840x2160.",
+            },
+            {
+                .name    = "Lossless source",
+                .priv    = &rr_crx_src,
+                .max     = 2,
+                .choices = CHOICES("Copy", "Direct (test)", "Direct+verify"),
+                .help    = "Copy: each frame is copied, then compressed (tested). Direct: the encoder reads Canon's",
+                .help2   = "frame buffer itself (less memory traffic, for 29.97p). +verify: 1 raw frame/s for the PC check.",
             },
             {
                 .name    = "Pre-record",

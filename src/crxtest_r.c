@@ -972,6 +972,24 @@ uint32_t *crx_rec_encode(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, ui
 {
     return cx_enc1(w, h, bpp, addr, us);
 }
+/* v4.28 direct source: start without waiting (called from the recorder's capture task right after the frame-end
+ * IRQ, so the encoder reads MEM1 ahead of the next frame's readout; no logging here), wait in the compressor task.
+ * line = MEM1 line length in pixels (crop: addr points at the crop's first pixel, line = full MEM1 width). */
+static int cx_rec_c0;
+static uint64_t cx_rec_t0;
+int crx_rec_start(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t line)
+{
+    uint32_t desc[11] = { 0, w, h, 0, 0, bpp, addr, line, 0, 0, 0 };
+    cx_rec_c0 = cx_cb_count;
+    cx_rec_t0 = get_us_clock();
+    return CX_START(desc, 1, cx_cb, 0) & 1;
+}
+uint32_t *crx_rec_wait(uint32_t *us)
+{
+    if (take_semaphore(cx_sem, 2000)) return 0;
+    *us = (uint32_t)(cx_hq_us[cx_rec_c0 & 15] - cx_rec_t0);
+    return cx_hq[cx_rec_c0 & 15];
+}
 int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es)
 {
     if (CX_HDR(hd, ha, hs)) return -1;
