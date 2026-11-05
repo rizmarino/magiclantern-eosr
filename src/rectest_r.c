@@ -306,6 +306,30 @@ static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_
     return 0;
 }
 
+/* v4.24: the m2m EDMAC copy for crxtest_r.c (lossless step 3b), same lock / setup / cleanup as the recorder.
+ * Only while the recorder is idle: crxtest sets r_crx_busy, and rt_busy gates the recorder's own use. */
+int r_m2m_open(void)
+{
+    if (rt_busy || rt_begun) return -2;
+    if (!rt_dsem) rt_dsem = create_named_semaphore("rt_dma", SEM_CREATE_LOCKED);
+    int st = rt_lock();
+    if (st) { rt_unlock(); return st; }
+    rt_begin();
+    return 0;
+}
+int r_m2m_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us)
+{
+    if (!rt_begun) return -3;
+    int r = rt_copy(src, src_pitch, dst, row_bytes, rows, dma_us);
+    if (r) rt_fail();                   /* resets the ports and ends the session: open again before reuse */
+    return r;
+}
+void r_m2m_close(void)
+{
+    rt_end();
+    rt_unlock();
+}
+
 /* ---- buffers: contiguous shoot_malloc chunks ---- */
 struct rt_chunk { struct memSuite *suite; uint32_t base; volatile int state; volatile int n;
                   uint32_t seq, t_us; int fl; uint32_t cp_us; };   /* v20 silent pictures (1 frame per chunk): frame event no., time, flags; v3.10 survey copy time */
