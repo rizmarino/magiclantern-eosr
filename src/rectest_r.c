@@ -111,7 +111,12 @@ static const int rt_fmt_bpp[] = { 14, 14, 12, 10 };
 /* v17: crops as width x height; 0 x 0 = the whole MEM1 frame (FHD movie 2304x1290, 4K movie 4256x2214).
  * The 2560 crops need Canon's 4K movie size (MEM1 4256 px wide, 1:1); in FHD they clamp to 2304. */
 static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920, 800 }, { 0, 0 }, { 2560, 1080 }, { 2560, 1440 },
-                                          { 2880, 1216 } };     /* v17.2: 2.37:1, 10-bit 23.98p needs 100.1 MiB/s */
+                                          { 2880, 1216 },       /* v17.2: 2.37:1, 10-bit 23.98p needs 100.1 MiB/s */
+                                          { 3840, 2160 } };     /* v4.25: UHD (4K movie mode), for lossless */
+/* v4.25 lossless (Movie > RAW video > Compression): each captured frame is compressed by Canon's CRX encoder
+ * (algsmgr type 0 = Canon's lossless CR3 profile, crxtest_r.c) into MLV VIDF blocks; a PC tool (crx2mlv.py)
+ * turns the clip into a standard uncompressed MLV. No audio and no pre-record with it yet. */
+static CONFIG_INT("r.rawrec.crx", rr_crx, 0);
 #define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -701,6 +706,7 @@ struct __attribute__((packed)) rt_vidf
 };
 struct __attribute__((packed)) rt_blk { char type[4]; uint32_t size; uint64_t ts; };
 static int c_bpp = 14, c_mlv, c_dng, pk_applied;   /* v20: c_dng = silent-picture session (DNG per frame) */
+static int c_crx;                       /* v4.25: lossless CRX clip */
 static uint32_t c_rb, c_ch;
 static uint32_t slot_pre, slot_null, c_x0, c_y0, c_cw, mlv_fps_nom, mlv_fps_den;
 static uint64_t mlv_guid;
@@ -798,7 +804,7 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     memset(mlv_hdr, 0, RT_HDR_BYTES);
     struct rt_mlvi *m = (struct rt_mlvi *)mlv_hdr;
     memcpy(m->magic, "MLVI", 4); m->size = 52; memcpy(m->ver, "v2.0", 5); m->guid = mlv_guid;
-    m->file_num = file_num; m->file_count = 0; m->vclass = 1; m->vframes = vframes;
+    m->file_num = file_num; m->file_count = 0; m->vclass = c_crx ? (1 | 0x1000) : 1; m->vframes = vframes;   /* v4.25: 0x1000 = CRX (ours) */
     m->fps_nom = mlv_fps_nom; m->fps_den = mlv_fps_den;
     if (ra_on) { m->aclass = 1; m->aframes = ra_part_count; }
     uint8_t *p = mlv_hdr + 52;
@@ -1393,6 +1399,175 @@ static void rt_writer(void *unused)
     w_done = 1;
 }
 
+/* ---- v4.25 lossless: compressor task (raw chunks -> CRX VIDF blocks in staging buffers) + its writer ----
+ * Frame record in a staging buffer (all offsets 64-aligned, staging bases 4 KiB-aligned):
+ *   VIDF header (32) + frameSpace 32 | CRXV header 192: 'CRXV', version 1, n entries, main header size, encode us,
+ *   3 x 0, sizes[32] | CMP1 main header (padded to 64) | entries (mdat header + tile/plane chunks), each padded to 64.
+ * The CR3 sample = the entries concatenated at their real sizes. A staging buffer is closed with a NULL block to a
+ * 4 KiB multiple, so every card write stays 4 KiB-aligned in the file (RT_HDR_BYTES note). */
+extern int crx_rec_begin(void);
+extern uint32_t *crx_rec_encode(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t *us);
+extern int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es);
+extern uint32_t crx_rec_free(uint32_t *hd);
+extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
+extern void crx_rec_end(void);
+#define RT_XSB_BYTES (16 * 1024 * 1024)
+#define RT_XSB_MAX   3
+#define AL64(x) (((x) + 63) & ~63u)
+enum { SB_FREE = 0, SB_FULL };
+struct rt_sb { struct memSuite *suite; uint32_t base, len, nfr; volatile int state; };
+static struct rt_sb xsb[RT_XSB_MAX];
+static int nsb;
+static struct semaphore *rt_xsem;
+static volatile int x_stop, x_done;
+static uint32_t x_frames, x_enc_max, x_cp_max, x_free_max, x_wait_ms, x_big, x_hdr0[4], x_max_used;
+static uint64_t x_bytes, x_enc_sum, x_cp_sum;
+
+static void rt_alloc_staging(void)
+{
+    nsb = 0;
+    for (int i = 0; i < RT_XSB_MAX; i++)
+    {
+        struct memSuite *s = shoot_malloc_suite_contig(RT_XSB_BYTES + 4096);
+        if (!s) break;
+        uint32_t a = (uint32_t)GetMemoryAddressOfMemoryChunk(GetFirstChunkFromSuite(s));
+        xsb[i].suite = s; xsb[i].base = ((uint32_t)UNCACHEABLE(a) + 4095) & ~4095u;
+        xsb[i].len = xsb[i].nfr = 0; xsb[i].state = SB_FREE;
+        rt_printf("lossless staging %d at %08x\n", i, xsb[i].base);
+        nsb++;
+    }
+}
+static void rt_free_staging(void)
+{
+    for (int i = 0; i < RT_XSB_MAX; i++) if (xsb[i].suite) shoot_free_suite(xsb[i].suite);
+    memset(xsb, 0, sizeof(xsb));
+    nsb = 0;
+}
+
+static void rt_x_close(int si, uint32_t pos, uint32_t nfr)
+{
+    uint32_t end = (pos + 4095) & ~4095u;
+    if (end != pos && end - pos < 16) end += 4096;
+    if (end != pos)
+    {
+        struct rt_blk n = { { 'N', 'U', 'L', 'L' }, end - pos, 0 };
+        memcpy((void *)(xsb[si].base + pos), &n, sizeof(n));
+    }
+    xsb[si].len = end; xsb[si].nfr = nfr;
+    RT_DMB();
+    xsb[si].state = SB_FULL;
+    give_semaphore(rt_wsem);
+}
+
+static void rt_crx_task(void *unused)
+{
+    int ri = 0, si = 0;
+    uint32_t pos = 0, nfr = 0;
+    for (;;)
+    {
+        if (w_err) break;
+        if (ch[ri].state != CH_FULL)
+        {
+            if (x_stop) break;
+            take_semaphore(rt_xsem, 50);
+            continue;
+        }
+        for (int s = 0; s < ch[ri].n && !w_err; s++)
+        {
+            uint32_t slot = ch[ri].base + s * slot_bytes, us = 0;
+            uint32_t *hd = crx_rec_encode(c_cw, c_ch, c_bpp, slot + slot_pre, &us);
+            if (!hd) { w_err = -10; break; }
+            uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
+            if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { crx_rec_free(hd); w_err = -11; break; }
+            uint32_t need = 64 + 192 + AL64(hs);
+            for (uint32_t i = 0; i < n; i++) need += AL64(es[i]);
+            if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; crx_rec_free(hd); w_err = -12; break; }
+            if (pos + need + 4096 + 16 > RT_XSB_BYTES)  /* this staging buffer is full: hand it to the writer */
+            {
+                rt_x_close(si, pos, nfr);
+                si = (si + 1) % nsb; pos = 0; nfr = 0;
+                uint32_t tw = get_ms_clock();
+                while (xsb[si].state != SB_FREE && !w_err) take_semaphore(rt_xsem, 50);
+                x_wait_ms += get_ms_clock() - tw;
+                if (w_err) { crx_rec_free(hd); break; }
+            }
+            uint32_t b = xsb[si].base + pos;
+            struct rt_vidf v;
+            memcpy(&v, (void *)slot, sizeof(v));       /* frame number / timestamp / crop from the capture's VIDF */
+            v.size = need; v.space = 32;
+            memcpy((void *)b, &v, sizeof(v));
+            uint32_t *xh = (uint32_t *)(b + 64);
+            memset(xh, 0, 192);
+            xh[0] = 0x56585243; xh[1] = 1; xh[2] = n; xh[3] = hs; xh[4] = us;   /* 'CRXV' */
+            for (uint32_t i = 0; i < n; i++) xh[8 + i] = es[i];
+            uint32_t o = b + 64 + 192, tc = (uint32_t)get_us_clock();
+            int r = crx_rec_copy(o, ha, AL64(hs));
+            o += AL64(hs);
+            for (uint32_t i = 0; i < n && !r; i++) if (es[i]) { r = crx_rec_copy(o, ea[i], AL64(es[i])); o += AL64(es[i]); }
+            tc = (uint32_t)get_us_clock() - tc;
+            if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
+            uint32_t fu = crx_rec_free(hd);
+            if (r) { w_err = -13; break; }
+            pos += need; nfr++;
+            x_frames++; x_bytes += need - 64 - 192 - AL64(hs);
+            x_enc_sum += us; if (us > x_enc_max) x_enc_max = us;
+            x_cp_sum += tc; if (tc > x_cp_max) x_cp_max = tc;
+            if (fu > x_free_max) x_free_max = fu;
+        }
+        int used = 0;
+        for (int i = 0; i < nch; i++) if (ch[i].state != CH_FREE) used += ch[i].n;
+        if ((uint32_t)used > x_max_used) x_max_used = used;
+        ch[ri].n = 0;
+        RT_DMB();
+        ch[ri].state = CH_FREE;                         /* the raw slots can take new frames */
+        ri = (ri + 1) % nch;
+    }
+    if (pos) rt_x_close(si, pos, nfr);      /* also after an encoder error: the frames already compressed are valid */
+    x_done = 1;
+    give_semaphore(rt_wsem);
+}
+
+static void rt_writer_crx(void *unused)
+{
+    int wi = 0;
+    for (;;)
+    {
+        if (xsb[wi].state == SB_FULL)
+        {
+            uint32_t bytes = xsb[wi].len;
+            if (w_fsize + bytes > RT_SPLIT)
+            {
+                rt_mlv_close(w_file, w_part, w_part_frames);
+                rt_part_name(w_name, rt_run_id, ++w_part);
+                w_file = FIO_CreateFile(w_name);
+                w_fsize = 0; w_part_frames = 0;
+                if (!w_file) { w_err = -2; break; }
+                rt_mlv_build_hdr(w_part, 0);
+                if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES) { w_err = -3; break; }
+                w_fsize = RT_HDR_BYTES;
+            }
+            uint32_t t = rt_us();
+            int r = FIO_WriteFile(w_file, (void *)xsb[wi].base, bytes);
+            t = rt_us() - t;
+            if (w_n < RT_MAXW) { wl[w_n].t_ms = (rt_us() - rt_t0) / 1000; wl[w_n].us = t; wl[w_n].bytes = bytes; }
+            w_n++;
+            w_us_sum += t; if (t < w_us_min) w_us_min = t; if (t > w_us_max) w_us_max = t;
+            if (r != (int)bytes) { w_err = r ? r : -1; break; }
+            w_fsize += bytes; w_bytes += bytes;
+            w_part_frames += xsb[wi].nfr;
+            RT_DMB();
+            xsb[wi].state = SB_FREE;
+            give_semaphore(rt_xsem);
+            wi = (wi + 1) % nsb;
+            continue;
+        }
+        if (w_stop && x_done) break;
+        take_semaphore(rt_wsem, 50);
+    }
+    w_done = 1;
+    give_semaphore(rt_xsem);
+}
+
 /* ---- capture ---- */
 struct rt_frame { uint32_t t_us; uint16_t dma_us; uint8_t lat; uint8_t flags; };   /* lat: 0.1 ms, 255 = >= 25.5 ms */
 struct rt_tl { uint16_t t_ms4; uint16_t frames; uint16_t drops; uint16_t used; uint32_t mb_written; };
@@ -1933,7 +2108,7 @@ static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
             if (++ch[cur].n == kslots)
             {
                 ch[cur].state = CH_FULL;
-                give_semaphore(rt_wsem);
+                give_semaphore(c_crx ? rt_xsem : rt_wsem);   /* v4.25: lossless: compressor first */
                 next_fill = (cur + 1) % nch;
                 cur = -1;
                 if (rr_pre) rr_pre_recycle();   /* v4.8: armed: keep only the newest rr_pre_chunks */
@@ -2112,7 +2287,10 @@ static void rt_task(void *unused)
     c_dng = sp_active ? 1 : 0;          /* v20 */
     c_mlv = rt_fmt_sel != 0 && !c_dng;
     c_bpp = c_dng ? (sp_bits ? 12 : 10) : rt_fmt_bpp[rt_fmt_sel];
-    const int pre_on = rr_active && c_mlv && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8 */
+    c_crx = rr_crx && c_mlv;            /* v4.25 */
+    const int pre_on = rr_active && c_mlv && !c_crx && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8 */
+    if (c_crx) rt_printf("v4.25 lossless (CRX) clip%s%s\n", rr_pre_sel ? ", pre-record off (not with lossless yet)" : "",
+                         rr_audio ? ", no audio (not with lossless yet)" : "");
     rr_pre = 0; rr_pre_trig = 0; rr_pre_cancel = 0; rr_pre_disc = rr_pre_kept = rr_pre_kept_ms = 0;
     w_renum = 0; w_wi0 = 0; w_fn0 = 0; w_ts0 = 0;
     pk_applied = 0;
@@ -2165,7 +2343,7 @@ static void rt_task(void *unused)
               MEM(RT_PATH + 0x68), MEM(RT_PATH + 0x6C), MEM(RT_PATH + 0x70), MEM(RT_PATH + 0x74));
     if ((c_mlv || c_dng) && m1_w && m1_h)
     {
-        if (rt_pack_apply(c_bpp, 1))
+        if (rt_pack_apply(c_bpp, c_crx ? 0 : 1))   /* v4.25: the CRX encoder reads Canon's LSB-first order */
         { snprintf(rt_last, sizeof(rt_last), "RT%02d: pack cfg unexpected", rt_run_id); NotifyBox(6000, "Record test: %s", rt_last); goto done; }
     }
     uint32_t a = MEM(RT_PATH + 0x58);
@@ -2221,13 +2399,22 @@ static void rt_task(void *unused)
     if (mode == SYNC_TIMER) rt_unhook();
 
     if (pre_on && rr_audio) rt_printf("v4.8 pre-record: no audio in this clip\n");
-    if (rr_audio && c_mlv && !ra_buf && !pre_on)   /* v19: audio blocks before the video chunks take the memory */
+    if (rr_audio && c_mlv && !c_crx && !ra_buf && !pre_on)   /* v19: audio blocks before the video chunks take the memory */
     {
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
     }
     /* v3.14: SRM "Extra memory" removed: Canon's 1st-job buffer is carved from the same shoot memory (no gain), and an
      * unanswered request in LV blocks all later allocations until a power cycle (lv-survey.md "SRM static RE"). */
+    if (c_crx)                          /* v4.25: staging buffers for the compressed frames first */
+    {
+        if (!rt_xsem) rt_xsem = create_named_semaphore("rt_crx", SEM_CREATE_LOCKED);
+        rt_alloc_staging();
+        if (nsb < 2) { rt_printf("lossless: only %d staging buffers\n", nsb); snprintf(rt_last, sizeof(rt_last), "not enough memory (staging)"); goto done; }
+        if (crx_rec_begin()) { snprintf(rt_last, sizeof(rt_last), "CRX encoder not found"); goto done; }
+        x_stop = 0; x_done = 0; x_frames = x_enc_max = x_cp_max = x_free_max = x_wait_ms = x_big = x_max_used = 0;
+        x_bytes = x_enc_sum = x_cp_sum = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
+    }
     rt_alloc_chunks(c_dng ? RT_MAXCH : RT_MAXCH_VIDEO);
     (void)sp_srm_carve; (void)sp_srm_alloc; (void)sp_srm_sel;
     rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
@@ -2312,7 +2499,7 @@ static void rt_task(void *unused)
     {
         rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
         mlv_guid = ((uint64_t)rt_us() << 32) ^ (uint64_t)get_ms_clock() * 2654435761u ^ rt_run_id;
-        if (rr_audio && ra_buf && !pre_on) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
+        if (rr_audio && ra_buf && !pre_on && !c_crx) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
         rt_mlv_build_hdr(0, 0);
         if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES)
         { rt_printf("cannot write MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
@@ -2321,6 +2508,11 @@ static void rt_task(void *unused)
     }
     rt_t0 = rt_us();
     if (c_dng) task_create("sp_writer", 0x1c, 0x2000, sp_writer, 0);
+    else if (c_crx)                     /* v4.25: compressor above the writer, below capture (0x12) */
+    {
+        task_create("rt_writer", 0x1c, 0x1000, rt_writer_crx, 0);
+        task_create("rt_crx", 0x1b, 0x1000, rt_crx_task, 0);
+    }
     else task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
     rt_flush();
 
@@ -2394,6 +2586,13 @@ static void rt_task(void *unused)
         }
     }
     uint32_t ts = rt_us();
+    if (c_crx)                          /* v4.25: compress what's left, then let the writer finish */
+    {
+        x_stop = 1;
+        give_semaphore(rt_xsem);
+        for (int i = 0; i < 3000 && !x_done; i++) msleep(10);
+        if (!x_done) rt_printf("!! compressor still busy after 30 s\n");
+    }
     w_stop = 1;
     give_semaphore(rt_wsem);
     for (int i = 0; i < (c_dng ? 60000 : 3000) && !w_done; i++) msleep(10);   /* v20: DNGs take ~1-2 s each */
@@ -2440,7 +2639,7 @@ static void rt_task(void *unused)
     rt_printf("RESULT run %d: sync %s, %dx%d, %d.%03d s, %d frame events, %d recorded, %d dropped (first drop at %d ms), "
               "%d missed, %d duplicates skipped, %d written to card\n", rt_run_id, rt_sync_name[mode], crop_w, crop_h,
               dur_us / 1000000, dur_us / 1000 % 1000, nfr, frames, drops, first_drop_ms, missed, dups,
-              (uint32_t)(wb / slot_bytes));
+              c_crx ? x_frames : (uint32_t)(wb / slot_bytes));
     rt_printf("RESULT data rate needed %d.%d MiB/s; card %d.%d MiB/s while writing, %d.%d MiB/s overall; "
               "%d writes, min %d max %d us; buffer peak %d of %d frames; drain %d ms\n",
               need10 / 10, need10 % 10, card10 / 10, card10 % 10, wall10 / 10, wall10 % 10,
@@ -2449,14 +2648,27 @@ static void rt_task(void *unused)
               "topchg %d, botchg(torn) %d; IRQs during capture %d, IRQ timeouts %d; writer err %d\n",
               frames ? dsum / frames : 0, dmax, l50 / 10, l50 % 10, l90 / 10, l90 % 10, lmax / 10, lmax % 10,
               late, tears, topchg, botchg, irq_rec, irq_timeouts, w_err);
-    if (!c_dng) rt_printf("files: %s (last part %d), %d MB total, format %s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
-              rt_fmt_name[rt_fmt_sel], RECORDING ? 1 : 0);
+    if (!c_dng) rt_printf("files: %s (last part %d), %d MB total, format %s%s; Canon recording now: %d\n", w_name, w_part, (uint32_t)(wb >> 20),
+              rt_fmt_name[rt_fmt_sel], c_crx ? " lossless" : "", RECORDING ? 1 : 0);
+    uint32_t x_bpp100 = 0;
+    if (c_crx)                          /* v4.25 */
+    {
+        x_bpp100 = x_frames ? (uint32_t)(x_bytes * 800 / ((uint64_t)x_frames * c_cw * c_ch)) : 0;
+        uint32_t xneed10 = est && x_frames ? (uint32_t)(x_bytes / x_frames * 10000000ULL / est / (1024 * 1024)) : 0;
+        rt_printf("RESULT lossless: %d frames compressed, %d.%02d bits/px (%d%% of raw), needs %d.%d MiB/s; encode avg %d max %d us, "
+                  "HPCopy avg %d max %d us, free max %d us; compressor waited %d ms for staging, raw buffer peak %d of %d frames; "
+                  "%d staging buffers; CMP1 %08x %08x %08x %08x; err %d\n", x_frames, x_bpp100 / 100, x_bpp100 % 100,
+                  frame_bytes && x_frames ? (uint32_t)(x_bytes * 100 / x_frames / frame_bytes) : 0, xneed10 / 10, xneed10 % 10,
+                  x_frames ? (uint32_t)(x_enc_sum / x_frames) : 0, x_enc_max, x_frames ? (uint32_t)(x_cp_sum / x_frames) : 0, x_cp_max,
+                  x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
+    }
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
     if (rr_active)                      /* v18: clip summary for the user */
     {
-        snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
-                 pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
+        snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit%s, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
+                 c_crx ? " lossless" : "", c_crx ? (int)x_frames : pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
+                 w_err <= -10 && w_err >= -13 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
                  missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
         if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
         if (pre_on && pre_armed_end) snprintf(rt_last, sizeof(rt_last), "pre-record %s", rr_pre_cancel ? "cancelled" : "stopped");
@@ -2526,6 +2738,7 @@ done:
     rt_pack_restore();
     if (lv_raw) call("lv_save_raw", 0);
     if (rt_begun) rt_end();
+    if (c_crx && (w_done || !nch)) { crx_rec_end(); rt_free_staging(); c_crx = 0; }   /* v4.25: encoder back to Canon */
     if (w_done) rt_free_chunks();
     if (w_done) sp_srm_free();              /* v3.13: after the writer is done with its slots */
     rt_unlock();
@@ -3007,6 +3220,7 @@ static uint32_t rr_rate10(int sel, int bpp, int fps30)
     uint32_t w = rt_crop_wh[sel][0], h = rt_crop_wh[sel][1];
     if (!w) { w = 2304; h = 1290; }
     uint64_t b = (uint64_t)w * h * bpp / 8;
+    if (rr_crx) b = (uint64_t)w * h * (bpp == 10 ? 449 : bpp == 12 ? 645 : 844) / 800;   /* v4.25: lossless, typical scene */
     return (uint32_t)(b * 10 * (fps30 ? 30000 : 24000) / 1001 / (1024 * 1024));
 }
 
@@ -3143,10 +3357,10 @@ static struct menu_entry rr_menu[] = {
             {
                 .name    = "Resolution",
                 .priv    = &rt_crop_sel,
-                .max     = 6,
-                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216"),
+                .max     = 7,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216", "3840x2160"),
                 .help    = "2560 and 2880 need Canon movie size 4K (1:1 pixels, narrower view). In FHD they shrink",
-                .help2   = "to 2304 wide. Full frame: FHD 2304x1290 (4K full frame is too fast to record).",
+                .help2   = "to 2304 wide. Full frame: FHD 2304x1290; 4K 4256x2214 and 3840x2160 need Compression: Lossless.",
             },
             {
                 .name    = "Bit depth",
@@ -3155,6 +3369,14 @@ static struct menu_entry rr_menu[] = {
                 .max     = 3,
                 .choices = CHOICES("14-bit", "12-bit", "10-bit"),   /* v18.1: ML shows choices[value - min] */
                 .help    = "Fewer bits = lower data rate. 10-bit keeps slightly less shadow detail.",
+            },
+            {
+                .name    = "Compression",
+                .priv    = &rr_crx,
+                .max     = 1,
+                .choices = CHOICES("OFF", "Lossless"),
+                .help    = "Lossless: Canon's CR3 lossless encoder, ~45% of raw at 10-bit. 3840x2160 10-bit fits.",
+                .help2   = "PC: crx2mlv.py makes a normal MLV. No audio / pre-record with it yet.",
             },
             {
                 .name    = "Pre-record",
@@ -3262,8 +3484,8 @@ static struct menu_entry rt_menu[] = {
             {
                 .name    = "Crop",
                 .priv    = &rt_crop_sel,
-                .max     = 6,
-                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216"),
+                .max     = 7,
+                .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216", "3840x2160"),
                 .help    = "Full frame: whole LV raw frame (FHD movie 2304x1290, 4K movie 4256x2214, incl. black borders)",
                 .help2   = "2560/2880 crops need Canon movie size 4K (1:1 pixels); 2880x1216: 10-bit 23.98p only",
             },

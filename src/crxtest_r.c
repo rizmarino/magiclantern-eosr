@@ -954,6 +954,53 @@ static MENU_UPDATE_FUNC(pl_update)
     MENU_SET_WARNING(MENU_WARN_INFO, "4K movie mode, LV on, not recording. Writes ~250 MB under ML/.");
 }
 
+/* ======================= v4.25: lossless recorder API (rectest_r.c, Movie > RAW video > Compression) =============
+ * Same rules the tests proved (STEP1.md steps 2-3b): encode a copy, never the live MEM1; re-init the encoder for the
+ * clip's size/depth (flag cleared at begin); wait for each free before the next start; HPCopy the output out (the CPU
+ * can't read the chunks); hand the encoder back to Canon at the end. Errors go to ML/LOGS/CRXTEST.LOG. */
+int crx_rec_begin(void)
+{
+    if (!cx_sem) cx_sem = create_named_semaphore("crx_test", 0);
+    while (!take_semaphore(cx_sem, 1)) ;
+    uint32_t m = MEM(CX_MGR);
+    if (!m) return -1;
+    MEM(m + 0x124) = 0;                   /* next StartEncode re-runs Canon's init with the clip's descriptor */
+    cx_cfg_bpp = 0;
+    return 0;
+}
+uint32_t *crx_rec_encode(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, uint32_t *us)
+{
+    return cx_enc1(w, h, bpp, addr, us);
+}
+int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es)
+{
+    if (CX_HDR(hd, ha, hs)) return -1;
+    if (CX_RING(hd, n, ea, es) || !*n || *n > 32) return -2;
+    return 0;
+}
+uint32_t crx_rec_free(uint32_t *hd)        /* free, wait until algsmgr has processed it (no extra gap) */
+{
+    uint32_t m = MEM(CX_MGR);
+    uint64_t t = get_us_clock();
+    CX_FREE(hd, 0, 0);
+    while (m && MEM(m + 0x108) && get_us_clock() - t < 500000) msleep(1);
+    return (uint32_t)(get_us_clock() - t);
+}
+int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len)   /* HPCopy (XDMAC); 1 = no free channel, retried */
+{
+    int r, tries = 0;
+    while ((r = HPCopy((void *)dst, (void *)src, len)) == 1 && tries++ < 100) msleep(1);
+    return r;
+}
+void crx_rec_end(void)
+{
+    CX_FREEALL();
+    msleep(300);
+    uint32_t m = MEM(CX_MGR);
+    if (m) MEM(m + 0x124) = 0;            /* Canon's next encode (stills) re-inits from its own descriptor */
+    cx_cfg_bpp = 0;
+}
+
 static MENU_SELECT_FUNC(cx_select)
 {
     if (cx_running) return;
