@@ -1412,7 +1412,8 @@ extern uint32_t crx_rec_free(uint32_t *hd);
 extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
 extern void crx_rec_end(void);
 #define RT_XSB_BYTES (16 * 1024 * 1024)
-#define RT_XSB_MAX   3
+#define RT_XSB_MAX   12                 /* v4.26: was 3; the raw ring is now only RT_XRAW chunks, the rest is staging */
+#define RT_XRAW      3                  /* v4.26: raw chunks for a lossless clip (compressor keeps up: peak 1 at 23.98p) */
 #define AL64(x) (((x) + 63) & ~63u)
 enum { SB_FREE = 0, SB_FULL };
 struct rt_sb { struct memSuite *suite; uint32_t base, len, nfr; volatile int state; };
@@ -1422,6 +1423,12 @@ static struct semaphore *rt_xsem;
 static volatile int x_stop, x_done;
 static uint32_t x_frames, x_enc_max, x_cp_max, x_free_max, x_wait_ms, x_big, x_hdr0[4], x_max_used;
 static uint64_t x_bytes, x_enc_sum, x_cp_sum;
+/* v4.26 pre-record with lossless: while armed the compressor keeps the newest ~rr_pre_want frames in FULL staging
+ * buffers (rt_x_pre_trim); at the trigger (capture task: rr_pre_go_crx) it hands the writer the oldest kept buffer
+ * (w_xs0, x_go), and the writer renumbers frames from the first one it writes (rt_x_renum). */
+static volatile int x_go, w_xs0, w_fn0_set;
+static volatile uint32_t x_trig_fn, x_trig_ts, x_written, x_kb, w_pre_cnt;
+static int rr_pre_want;
 
 static void rt_alloc_staging(void)
 {
@@ -1459,6 +1466,65 @@ static void rt_x_close(int si, uint32_t pos, uint32_t nfr)
     give_semaphore(rt_wsem);
 }
 
+/* v4.26 armed: drop the oldest FULL staging buffers while the rest still holds rr_pre_want frames, and so that the
+ * buffer the compressor fills next is free. After the trigger the compressor needs the oldest kept buffer back after
+ * ~3 frames, the writer frees it in ~110 ms, and the RT_XRAW raw chunks cover the difference. Writer idle. */
+static void rt_x_pre_trim(int si)
+{
+    for (;;)
+    {
+        int full = 0, frames = 0, old = -1;
+        for (int k = 1; k <= nsb; k++)          /* ring order from the oldest; si (just closed) is the newest */
+        {
+            int i = (si + k) % nsb;
+            if (xsb[i].state != SB_FULL) continue;
+            if (old < 0) old = i;
+            full++; frames += xsb[i].nfr;
+        }
+        if (old < 0 || old == si) return;
+        if (full <= nsb - 1 && frames - (int)xsb[old].nfr < rr_pre_want) return;
+        rr_pre_disc += xsb[old].nfr;
+        xsb[old].len = xsb[old].nfr = 0;
+        RT_DMB();
+        xsb[old].state = SB_FREE;
+    }
+}
+
+/* v4.26 triggered: the clip starts at the oldest kept buffer (else the one being filled) */
+static void rt_x_go(int si)
+{
+    int st = si;
+    for (int k = 1; k < nsb; k++) { int i = (si + k) % nsb; if (xsb[i].state == SB_FULL) { st = i; break; } }
+    w_xs0 = st;
+    RT_DMB();
+    x_go = 1;
+    give_semaphore(rt_wsem);
+}
+
+/* v4.26 writer, pre-record clip: frame numbers / timestamps from the first frame written; counts the kept frames */
+static void rt_x_renum(uint32_t base, uint32_t len)
+{
+    for (uint32_t o = 0; o + 16 <= len; )
+    {
+        struct rt_vidf v;
+        memcpy(&v, (void *)(base + o), sizeof(v));
+        if (v.size < 16) break;
+        if (!memcmp(v.type, "VIDF", 4))
+        {
+            if (!w_fn0_set)
+            {
+                w_fn0 = v.frame; w_ts0 = v.ts; w_fn0_set = 1;
+                rr_pre_kept_ms = x_trig_ts > (uint32_t)v.ts ? (int)((x_trig_ts - (uint32_t)v.ts) / 1000) : 0;
+                rr_t0_ms -= rr_pre_kept_ms;     /* on-screen clip time includes the kept part */
+            }
+            if (v.frame < x_trig_fn) w_pre_cnt++;
+            v.frame -= w_fn0; v.ts -= w_ts0;
+            memcpy((void *)(base + o), &v, sizeof(v));
+        }
+        o += v.size;
+    }
+}
+
 static void rt_crx_task(void *unused)
 {
     int ri = 0, si = 0;
@@ -1466,6 +1532,7 @@ static void rt_crx_task(void *unused)
     for (;;)
     {
         if (w_err) break;
+        if (!x_go && !rr_pre) rt_x_go(si);     /* v4.26: pre-record triggered */
         if (ch[ri].state != CH_FULL)
         {
             if (x_stop) break;
@@ -1485,6 +1552,7 @@ static void rt_crx_task(void *unused)
             if (pos + need + 4096 + 16 > RT_XSB_BYTES)  /* this staging buffer is full: hand it to the writer */
             {
                 rt_x_close(si, pos, nfr);
+                if (rr_pre) rt_x_pre_trim(si);  /* v4.26: armed: keep only the newest frames */
                 si = (si + 1) % nsb; pos = 0; nfr = 0;
                 uint32_t tw = get_ms_clock();
                 while (xsb[si].state != SB_FREE && !w_err) take_semaphore(rt_xsem, 50);
@@ -1509,6 +1577,7 @@ static void rt_crx_task(void *unused)
             uint32_t fu = crx_rec_free(hd);
             if (r) { w_err = -13; break; }
             pos += need; nfr++;
+            x_kb += need >> 10;                 /* v4.26: status line rate */
             x_frames++; x_bytes += need - 64 - 192 - AL64(hs);
             x_enc_sum += us; if (us > x_enc_max) x_enc_max = us;
             x_cp_sum += tc; if (tc > x_cp_max) x_cp_max = tc;
@@ -1529,15 +1598,30 @@ static void rt_crx_task(void *unused)
 
 static void rt_writer_crx(void *unused)
 {
-    int wi = 0;
+    int wi = 0, started = 0;
     for (;;)
     {
+        if (!x_go)                              /* v4.26: armed pre-record: nothing is written until the trigger */
+        {
+            if (w_stop && x_done) break;
+            take_semaphore(rt_wsem, 50);
+            continue;
+        }
+        if (!started) { RT_DMB(); wi = w_xs0; started = 1; }
+        if (ra_on && ra_ready[ra_widx])        /* v4.26: audio as in rt_writer (prepared block first) */
+        {
+            int r = ra_write_one(w_file);
+            if (r < 0) { w_err = r; break; }
+            w_fsize += r; w_bytes += r;
+            continue;
+        }
         if (xsb[wi].state == SB_FULL)
         {
             uint32_t bytes = xsb[wi].len;
             if (w_fsize + bytes > RT_SPLIT)
             {
                 rt_mlv_close(w_file, w_part, w_part_frames);
+                ra_part_count = 0;
                 rt_part_name(w_name, rt_run_id, ++w_part);
                 w_file = FIO_CreateFile(w_name);
                 w_fsize = 0; w_part_frames = 0;
@@ -1546,6 +1630,7 @@ static void rt_writer_crx(void *unused)
                 if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES) { w_err = -3; break; }
                 w_fsize = RT_HDR_BYTES;
             }
+            if (w_renum) rt_x_renum(xsb[wi].base, bytes);   /* v4.26 */
             uint32_t t = rt_us();
             int r = FIO_WriteFile(w_file, (void *)xsb[wi].base, bytes);
             t = rt_us() - t;
@@ -1555,6 +1640,7 @@ static void rt_writer_crx(void *unused)
             if (r != (int)bytes) { w_err = r ? r : -1; break; }
             w_fsize += bytes; w_bytes += bytes;
             w_part_frames += xsb[wi].nfr;
+            x_written += xsb[wi].nfr;
             RT_DMB();
             xsb[wi].state = SB_FREE;
             give_semaphore(rt_xsem);
@@ -2068,13 +2154,25 @@ static void rr_pre_go(uint32_t td)
     give_semaphore(rt_wsem);
 }
 
+/* v4.26 lossless pre-record trigger (capture task): the compressor picks the start buffer (rt_x_go), the writer the
+ * first frame number (rt_x_renum); frames numbered below x_trig_fn are the kept ones */
+static void rr_pre_go_crx(uint32_t td)
+{
+    x_trig_fn = nfr;
+    x_trig_ts = first_t ? td - first_t : 0;
+    RT_DMB();
+    rr_pre = 0;
+    rr_t0_ms = get_ms_clock();
+    give_semaphore(rt_xsem);
+}
+
 /* one new frame: dedupe, take a slot, copy, check. td = frame time (rt_us);
  * lat_us = frame event -> now; top_ref/bot_ref = crop rows at the frame event */
 static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
 {
     if (c_dng) return sp_frame(td, lat_us, flags, top_ref, bot_ref);
     if (!first_t) { first_t = td; next_tl = 0; }
-    if (rr_pre && rr_pre_trig) rr_pre_go(td);  /* v4.8: 2nd REC press: the clip starts with the kept frames */
+    if (rr_pre && rr_pre_trig) { if (c_crx) rr_pre_go_crx(td); else rr_pre_go(td); }  /* v4.8: 2nd REC press: the clip starts with the kept frames */
     uint32_t us = 0;
     if (frames && bot_ref == last_rec_bot)
     {
@@ -2111,7 +2209,7 @@ static int rt_frame(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, u
                 give_semaphore(c_crx ? rt_xsem : rt_wsem);   /* v4.25: lossless: compressor first */
                 next_fill = (cur + 1) % nch;
                 cur = -1;
-                if (rr_pre) rr_pre_recycle();   /* v4.8: armed: keep only the newest rr_pre_chunks */
+                if (rr_pre && !c_crx) rr_pre_recycle();   /* v4.8: armed: keep only the newest rr_pre_chunks (v4.26: lossless keeps compressed frames instead) */
             }
         }
     }
@@ -2288,9 +2386,8 @@ static void rt_task(void *unused)
     c_mlv = rt_fmt_sel != 0 && !c_dng;
     c_bpp = c_dng ? (sp_bits ? 12 : 10) : rt_fmt_bpp[rt_fmt_sel];
     c_crx = rr_crx && c_mlv;            /* v4.25 */
-    const int pre_on = rr_active && c_mlv && !c_crx && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8 */
-    if (c_crx) rt_printf("v4.25 lossless (CRX) clip%s%s\n", rr_pre_sel ? ", pre-record off (not with lossless yet)" : "",
-                         rr_audio ? ", no audio (not with lossless yet)" : "");
+    const int pre_on = rr_active && c_mlv && rr_pre_sel > 0 && rr_pre_sel < COUNT(rr_pre_ms);   /* v4.8; v4.26 also lossless */
+    if (c_crx) rt_printf("v4.26 lossless (CRX) clip\n");
     rr_pre = 0; rr_pre_trig = 0; rr_pre_cancel = 0; rr_pre_disc = rr_pre_kept = rr_pre_kept_ms = 0;
     w_renum = 0; w_wi0 = 0; w_fn0 = 0; w_ts0 = 0;
     pk_applied = 0;
@@ -2399,28 +2496,37 @@ static void rt_task(void *unused)
     if (mode == SYNC_TIMER) rt_unhook();
 
     if (pre_on && rr_audio) rt_printf("v4.8 pre-record: no audio in this clip\n");
-    if (rr_audio && c_mlv && !c_crx && !ra_buf && !pre_on)   /* v19: audio blocks before the video chunks take the memory */
+    if (rr_audio && c_mlv && !ra_buf && !pre_on)   /* v19: audio blocks before the video chunks take the memory */
     {
         ra_buf = fio_malloc(RA_NBUF * RA_BLK);
         if (!ra_buf) rt_printf("audio: no memory for the audio blocks, no audio\n");
     }
     /* v3.14: SRM "Extra memory" removed: Canon's 1st-job buffer is carved from the same shoot memory (no gain), and an
      * unanswered request in LV blocks all later allocations until a power cycle (lv-survey.md "SRM static RE"). */
-    if (c_crx)                          /* v4.25: staging buffers for the compressed frames first */
+    rt_alloc_chunks(c_dng ? RT_MAXCH : c_crx ? RT_XRAW : RT_MAXCH_VIDEO);
+    (void)sp_srm_carve; (void)sp_srm_alloc; (void)sp_srm_sel;
+    rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
+    rt_flush();
+    if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
+    if (c_crx)                          /* v4.25 staging buffers; v4.26: after the RT_XRAW raw chunks, all the rest */
     {
         if (!rt_xsem) rt_xsem = create_named_semaphore("rt_crx", SEM_CREATE_LOCKED);
         rt_alloc_staging();
         if (nsb < 2) { rt_printf("lossless: only %d staging buffers\n", nsb); snprintf(rt_last, sizeof(rt_last), "not enough memory (staging)"); goto done; }
         if (crx_rec_begin()) { snprintf(rt_last, sizeof(rt_last), "CRX encoder not found"); goto done; }
         x_stop = 0; x_done = 0; x_frames = x_enc_max = x_cp_max = x_free_max = x_wait_ms = x_big = x_max_used = 0;
-        x_bytes = x_enc_sum = x_cp_sum = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
+        x_bytes = x_enc_sum = x_cp_sum = 0;
+        x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
-    rt_alloc_chunks(c_dng ? RT_MAXCH : RT_MAXCH_VIDEO);
-    (void)sp_srm_carve; (void)sp_srm_alloc; (void)sp_srm_sel;
-    rt_printf("buffer: %d chunks = %d frames (%d MB)\n", nch, nch * kslots, nch * kslots * slot_bytes >> 20);
-    rt_flush();
-    if (nch < 2) { snprintf(rt_last, sizeof(rt_last), "not enough memory (%d)", nch); goto done; }
-    if (pre_on)                         /* v4.8: ring size; 2 chunks stay free so the writer has headroom after the trigger */
+    if (pre_on && c_crx)                /* v4.26: kept compressed, in staging buffers (rt_x_pre_trim) */
+    {
+        uint32_t per = mode == SYNC_IRQ ? sv_irq_med : sv_est;
+        rr_pre_want = per ? (int)((uint64_t)rr_pre_ms[rr_pre_sel] * 1000 / per) : 30;
+        if (nsb >= 3) rr_pre = 1;
+        rt_printf("v4.26 lossless pre-record %d ms: %d frames wanted, kept in up to %d of %d staging buffers%s\n",
+                  rr_pre_ms[rr_pre_sel], rr_pre_want, nsb - 1, nsb, rr_pre ? "" : ": too little memory, recording at once");
+    }
+    else if (pre_on)                    /* v4.8: ring size; 2 chunks stay free so the writer has headroom after the trigger */
     {
         uint32_t per = mode == SYNC_IRQ ? sv_irq_med : sv_est;
         int want = per ? (int)((uint64_t)rr_pre_ms[rr_pre_sel] * 1000 / per) : 30;
@@ -2499,7 +2605,7 @@ static void rt_task(void *unused)
     {
         rt_fps_of(mode == SYNC_IRQ ? sv_irq_med : sv_est, &mlv_fps_nom, &mlv_fps_den);
         mlv_guid = ((uint64_t)rt_us() << 32) ^ (uint64_t)get_ms_clock() * 2654435761u ^ rt_run_id;
-        if (rr_audio && ra_buf && !pre_on && !c_crx) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
+        if (rr_audio && ra_buf && !pre_on) ra_start();     /* v19: sets ra_on, so the header gets WAVI */
         rt_mlv_build_hdr(0, 0);
         if (FIO_WriteFile(w_file, mlv_hdr, RT_HDR_BYTES) != RT_HDR_BYTES)
         { rt_printf("cannot write MLV header\n"); FIO_CloseFile(w_file); w_file = 0; goto done; }
@@ -2510,6 +2616,8 @@ static void rt_task(void *unused)
     if (c_dng) task_create("sp_writer", 0x1c, 0x2000, sp_writer, 0);
     else if (c_crx)                     /* v4.25: compressor above the writer, below capture (0x12) */
     {
+        x_go = !rr_pre; w_renum = rr_pre;   /* v4.26 */
+        RT_DMB();
         task_create("rt_writer", 0x1c, 0x1000, rt_writer_crx, 0);
         task_create("rt_crx", 0x1b, 0x1000, rt_crx_task, 0);
     }
@@ -2550,7 +2658,7 @@ static void rt_task(void *unused)
     uint32_t irq_rec = irq_n - irq0;
     uint32_t dur_us = t_last_ev - first_t;
     const int pre_armed_end = rr_pre;   /* v4.8: still armed = cancelled or stopped before the trigger */
-    if (pre_on) rt_printf("v4.8 pre-record: %s; %d frames kept from before the trigger (%d ms), %d discarded while armed\n",
+    if (pre_on && !c_crx) rt_printf("v4.8 pre-record: %s; %d frames kept from before the trigger (%d ms), %d discarded while armed\n",
                           !pre_armed_end ? "triggered" : rr_pre_cancel ? "cancelled (ML menu)" : "not triggered",
                           rr_pre_kept, rr_pre_kept_ms, rr_pre_disc);
 
@@ -2597,6 +2705,13 @@ static void rt_task(void *unused)
     give_semaphore(rt_wsem);
     for (int i = 0; i < (c_dng ? 60000 : 3000) && !w_done; i++) msleep(10);   /* v20: DNGs take ~1-2 s each */
     uint32_t drain_ms = (rt_us() - ts) / 1000;
+    if (pre_on && c_crx)                    /* v4.26: kept frames are counted by the writer */
+    {
+        rr_pre_kept = w_pre_cnt;
+        rt_printf("v4.26 pre-record: %s; %d frames kept from before the trigger (%d ms), %d discarded while armed\n",
+                  !pre_armed_end ? "triggered" : rr_pre_cancel ? "cancelled (ML menu)" : "not triggered",
+                  rr_pre_kept, rr_pre_kept_ms, rr_pre_disc);
+    }
     if (w_done && !c_dng)
     {
         if (c_mlv) rt_mlv_close(w_file, w_part, w_part_frames);
@@ -2659,17 +2774,17 @@ static void rt_task(void *unused)
          * every later value of this line by one on the v4.25 camera run */
         rt_printf("RESULT lossless: %d frames compressed, %d.%02d bits/px (%d pct of raw), needs %d.%d MiB/s; encode avg %d max %d us, "
                   "HPCopy avg %d max %d us, free max %d us; compressor waited %d ms for staging, raw buffer peak %d of %d frames; "
-                  "%d staging buffers; CMP1 %08x %08x %08x %08x; err %d\n", x_frames, x_bpp100 / 100, x_bpp100 % 100,
+                  "%d staging buffers; %d frames written; CMP1 %08x %08x %08x %08x; err %d\n", x_frames, x_bpp100 / 100, x_bpp100 % 100,
                   frame_bytes && x_frames ? (uint32_t)(x_bytes * 100 / x_frames / frame_bytes) : 0, xneed10 / 10, xneed10 % 10,
                   x_frames ? (uint32_t)(x_enc_sum / x_frames) : 0, x_enc_max, x_frames ? (uint32_t)(x_cp_sum / x_frames) : 0, x_cp_max,
-                  x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
+                  x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_written, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
     }
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
     if (rr_active)                      /* v18: clip summary for the user */
     {
         snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit%s, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
-                 c_crx ? " lossless" : "", c_crx ? (int)x_frames : pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
+                 c_crx ? " lossless" : "", c_crx ? (int)x_written : pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
                  w_err <= -10 && w_err >= -13 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
                  missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
         if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
@@ -2786,6 +2901,7 @@ static void rr_key_flush(void);
 
 #define RR_STATUS_Y 8                   /* v19.3: meters sit to the right of it (RA_M_X) */
 #define RR_STATUS_CLEAR_W (RA_M_X - 12)   /* clearing the status never touches the meters */
+static uint32_t x_ms_last, x_kb_last, x_rate;   /* v4.26 status line rate (status task only) */
 static void rr_status_task(void *unused)
 {
     /* on-screen status while a REC-button run is active. v16 redrew every 250 ms and that run wrote
@@ -2798,9 +2914,16 @@ static void rr_status_task(void *unused)
         msleep(250);
         if (++tick % 4 == 0 && !rr_active && !rt_osd_run && !rt_busy && (rr_diag || sp_mode)) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics; v20: or silent pictures on */
         int on = rr_active || rt_osd_run || sp_active;
+        if (!on) { x_ms_last = 0; x_rate = 0; }       /* v4.26 */
         if (!on) { if (shown) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); shown = 0; last[0] = 0; } continue; }
         if (gui_menu_shown() || (tick % 4 && !sp_active)) continue;   /* v20: silent status every 250 ms */
         char t[40];
+        if (c_crx && !sp_active)        /* v4.26: compressed data rate over the last ~1 s (also while pre-record is armed) */
+        {
+            uint32_t now = get_ms_clock(), kb = x_kb;
+            if (!x_ms_last || kb < x_kb_last) { x_ms_last = now; x_kb_last = kb; }
+            else if (now - x_ms_last >= 900) { x_rate = (kb - x_kb_last) * 1000 / (now - x_ms_last) / 1024; x_ms_last = now; x_kb_last = kb; }
+        }
         uint32_t s_rec = !rr_t0_ms ? 0 : (get_ms_clock() - rr_t0_ms) / 1000;
         int red = rr_t0_ms && !rr_stop;
         if (sp_active)
@@ -2814,6 +2937,7 @@ static void rr_status_task(void *unused)
         else if (rr_stop) snprintf(t, sizeof(t), " stopping... ");
         else if (rr_pre) snprintf(t, sizeof(t), " PRE-REC %d.%ds ", rr_pre_ms[rr_pre_sel & 3] / 1000, rr_pre_ms[rr_pre_sel & 3] / 100 % 10);   /* v4.8 */
         else if (!rr_t0_ms) snprintf(t, sizeof(t), " raw: starting ");
+        else if (c_crx) snprintf(t, sizeof(t), " REC %02d:%02d LL%d %dMB/s ", s_rec / 60, s_rec % 60, c_bpp, x_rate);   /* v4.26: lossless: compressed rate instead of the size */
         else snprintf(t, sizeof(t), " REC %02d:%02d %dx%d %db ", s_rec / 60, s_rec % 60, c_cw, c_ch, c_bpp);   /* v18: + size */
         if (shown && !strcmp(t, last)) continue;
         if (shown && strlen(t) != strlen(last)) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); }
@@ -3378,7 +3502,7 @@ static struct menu_entry rr_menu[] = {
                 .max     = 1,
                 .choices = CHOICES("OFF", "Lossless"),
                 .help    = "Lossless: Canon's CR3 lossless encoder, ~45% of raw at 10-bit. 3840x2160 10-bit fits.",
-                .help2   = "PC: crx2mlv.py makes a normal MLV. No audio / pre-record with it yet.",
+                .help2   = "PC: crx2mlv.py makes a normal MLV. Pre-record holds ~0.8 s at 3840x2160.",
             },
             {
                 .name    = "Pre-record",
