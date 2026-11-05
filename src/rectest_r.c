@@ -2655,7 +2655,9 @@ static void rt_task(void *unused)
     {
         x_bpp100 = x_frames ? (uint32_t)(x_bytes * 800 / ((uint64_t)x_frames * c_cw * c_ch)) : 0;
         uint32_t xneed10 = est && x_frames ? (uint32_t)(x_bytes / x_frames * 10000000ULL / est / (1024 * 1024)) : 0;
-        rt_printf("RESULT lossless: %d frames compressed, %d.%02d bits/px (%d%% of raw), needs %d.%d MiB/s; encode avg %d max %d us, "
+        /* v4.26: no "%%" in camera format strings: the R's vsnprintf consumes an argument for it, which shifted
+         * every later value of this line by one on the v4.25 camera run */
+        rt_printf("RESULT lossless: %d frames compressed, %d.%02d bits/px (%d pct of raw), needs %d.%d MiB/s; encode avg %d max %d us, "
                   "HPCopy avg %d max %d us, free max %d us; compressor waited %d ms for staging, raw buffer peak %d of %d frames; "
                   "%d staging buffers; CMP1 %08x %08x %08x %08x; err %d\n", x_frames, x_bpp100 / 100, x_bpp100 % 100,
                   frame_bytes && x_frames ? (uint32_t)(x_bytes * 100 / x_frames / frame_bytes) : 0, xneed10 / 10, xneed10 % 10,

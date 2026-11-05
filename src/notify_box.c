@@ -21,6 +21,22 @@ static int notify_box_dirty = 0;
 static char notify_box_msg[100];
 static char notify_box_msg_tmp[100];
 
+#if defined(CONFIG_R)
+/* riz v4.26: on DIGIC 8 _redraw_do() redraws Canon's LiveViewApp dialog, which doesn't touch ML's own overlay layer
+ * (it only clrscr()s when that dialog is missing), so in live view a finished NotifyBox stayed on screen until a
+ * view change cleared the layer (riz 2026-11-05). Erase exactly the area the last message used, then push. */
+static char notify_box_drawn[100];
+static void notify_box_erase(void)
+{
+    if (!notify_box_drawn[0]) return;
+    int w = bmp_string_width(FONT_LARGE, notify_box_drawn), h = fontspec_height(FONT_LARGE);
+    bmp_fill(COLOR_EMPTY, 50, 50, MIN(w + 8, 720 - 50), h + 4);
+    notify_box_drawn[0] = 0;
+    extern uint32_t ml_refresh_display_needed;
+    ml_refresh_display_needed = 1;
+}
+#endif
+
 static void NotifyBox_task(void* priv)
 {
     TASK_LOOP
@@ -41,15 +57,24 @@ static void NotifyBox_task(void* priv)
             if (notify_box_dirty)
             {
                 /* clear old message */
+#if defined(CONFIG_R)
+                notify_box_erase();
+#endif
                 redraw();
                 notify_box_dirty = 0;
             }
             bmp_printf(FONT_LARGE,  50,  50, notify_box_msg);
+#if defined(CONFIG_R)
+            memcpy(notify_box_drawn, notify_box_msg, sizeof(notify_box_drawn));
+#endif
             msleep(50);
             if (notify_box_stop_request)
                 break;
         }
         notify_box_timeout = 0;
+#if defined(CONFIG_R)
+        notify_box_erase();
+#endif
         redraw();
     }
 }
