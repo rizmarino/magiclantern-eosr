@@ -1429,6 +1429,34 @@ static volatile int x_stop, x_done;
 static uint32_t x_last_cp, x_last_fr;   /* v4.29 */
 static int c_xpar, c_xch;               /* v4.30: HPCopy copies in flight, XDMAC channel count */
 static uint32_t x_cp_lost;
+/* v4.31 split copy-out (Direct source only: there the m2m EDMAC is otherwise idle during a clip). The camera's
+ * HPCopy pool has only 2 XDMAC channels (v4.30), so the second engine is the EDMAC: task rt_xcp copies the first
+ * xe_f64/64 of each frame's bytes (4 KiB rows) while the compressor HPCopies the rest; the share follows whichever
+ * finished later. Any EDMAC error or timeout redoes its part with HPCopy and turns the split off for the clip. */
+#define XE_MAX 34
+static struct semaphore *xe_go, *xe_done;
+static volatile int xe_n, xe_err, xe_quit, xe_alive;
+static uint32_t xe_d[XE_MAX], xe_s[XE_MAX], xe_r[XE_MAX];
+static volatile uint32_t xe_us;
+static int c_xsplit, xe_f64, x_split_ok = 1;   /* x_split_ok: host harness A/B switch (RR_XSPLIT=0) */
+static uint32_t xe_fail, xe_frames, xe_sum_e, xe_sum_h;
+static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us);
+static void rt_fail(void);
+static void rt_xcp_task(void *unused)
+{
+    while (!xe_quit)
+    {
+        if (take_semaphore(xe_go, 100)) continue;
+        if (xe_quit) break;
+        uint32_t t0 = (uint32_t)get_us_clock(), us = 0;
+        int err = 0;
+        for (int i = 0; i < xe_n && !err; i++) if (rt_copy(xe_s[i], 4096, xe_d[i], 4096, xe_r[i], &us)) err = 1;
+        if (err) rt_fail();                     /* ports reset, session ended; the compressor stops using the split */
+        xe_us = (uint32_t)get_us_clock() - t0; xe_err = err;
+        give_semaphore(xe_done);
+    }
+    xe_alive = 0;
+}
 static uint32_t x_frames, x_enc_max, x_cp_max, x_free_max, x_wait_ms, x_big, x_hdr0[4], x_max_used;
 static uint64_t x_bytes, x_enc_sum, x_cp_sum;
 /* v4.26 pre-record with lossless: while armed the compressor keeps the newest ~rr_pre_want frames in FULL staging
@@ -1590,7 +1618,46 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     uint32_t cd[33], cs[33], cl[33]; int nc = 0;     /* v4.30: one list, copied with up to c_xpar in flight */
     cd[nc] = o; cs[nc] = ha; cl[nc++] = AL64(hs); o += AL64(hs);
     for (uint32_t i = 0; i < n; i++) if (es[i]) { cd[nc] = o; cs[nc] = ea[i]; cl[nc++] = AL64(es[i]); o += AL64(es[i]); }
-    int r = crx_rec_copy_n(nc, cd, cs, cl, c_xpar);
+    int r;
+    if (c_xsplit)                               /* v4.31 */
+    {
+        uint64_t tot = 0; for (int i = 0; i < nc; i++) tot += cl[i];
+        uint32_t want = (uint32_t)(tot * (uint32_t)xe_f64 / 64), got = 0, hd[33], hsrc[33], hl[33], th, te = 0;
+        int nh = 0; xe_n = 0;
+        for (int i = 0; i < nc; i++)
+        {
+            uint32_t take = 0, off = 0;
+            if (got < want && !((cd[i] | cs[i]) & 7))   /* EDMAC rows from 8-byte aligned addresses are exact (v17); encoder chunks are 16-aligned */ take = MIN(cl[i], want - got) & ~4095u;
+            while (take - off >= 4096 && xe_n < XE_MAX)
+            {
+                uint32_t rows = MIN((take - off) >> 12, 2048);
+                xe_d[xe_n] = cd[i] + off; xe_s[xe_n] = cs[i] + off; xe_r[xe_n++] = rows; off += rows << 12;
+            }
+            got += off;
+            if (cl[i] > off) { hd[nh] = cd[i] + off; hsrc[nh] = cs[i] + off; hl[nh++] = cl[i] - off; }
+        }
+        if (xe_n) give_semaphore(xe_go);
+        uint32_t t1 = (uint32_t)get_us_clock();
+        r = crx_rec_copy_n(nh, hd, hsrc, hl, 1);
+        th = (uint32_t)get_us_clock() - t1;
+        if (xe_n)
+        {
+            if (take_semaphore(xe_done, 1000)) { c_xsplit = 0; xe_fail++; if (!r) r = -2; }
+            else if (xe_err)
+            {
+                c_xsplit = 0; xe_fail++;
+                for (int i = 0; i < xe_n && !r; i++) r = crx_rec_copy(xe_d[i], xe_s[i], xe_r[i] << 12);
+            }
+            else te = xe_us;
+        }
+        if (te && th)
+        {
+            if (te > th + 500 && xe_f64 > 4) xe_f64--;
+            else if (th > te + 500 && xe_f64 < 60) xe_f64++;
+            xe_sum_e += te; xe_sum_h += th; xe_frames++;
+        }
+    }
+    else r = crx_rec_copy_n(nc, cd, cs, cl, c_xpar);
     if (r == -2) x_cp_lost++;
     tc = (uint32_t)get_us_clock() - tc;
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
@@ -2720,6 +2787,8 @@ static void rt_task(void *unused)
         x_plan = 0; x_started_fn = 0; x_late = x_rel_bad = 0; x_logn = 0; x_primed = x_counted = 0;   /* v4.29 */
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
+        c_xsplit = c_crxd == 1 && x_split_ok; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
+        if (c_xsplit) rt_printf("v4.31 copy-out split HPCopy + EDMAC, EDMAC share starts at %d/64\n", xe_f64);
         if (c_crxd && !x_log) x_log = fio_malloc(X_LOGMAX * sizeof(struct x_flog));
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
@@ -2824,6 +2893,14 @@ static void rt_task(void *unused)
         x_go = !rr_pre; w_renum = rr_pre;   /* v4.26 */
         RT_DMB();
         task_create("rt_writer", 0x1c, 0x1000, rt_writer_crx, 0);
+        if (c_xsplit)                   /* v4.31: above the compressor that waits for it */
+        {
+            if (!xe_go) { xe_go = create_named_semaphore("rt_xgo", 0); xe_done = create_named_semaphore("rt_xdone", 0); }
+            while (!take_semaphore(xe_go, 1)) ;
+            while (!take_semaphore(xe_done, 1)) ;
+            xe_quit = 0; xe_alive = 1;
+            task_create("rt_xcp", 0x1a, 0x1000, rt_xcp_task, 0);
+        }
         task_create("rt_crx", 0x1b, 0x1000, rt_crx_task, 0);
     }
     else task_create("rt_writer", 0x1c, 0x1000, rt_writer, 0);
@@ -2905,6 +2982,8 @@ static void rt_task(void *unused)
         give_semaphore(rt_xsem);
         for (int i = 0; i < 3000 && !x_done; i++) msleep(10);
         if (!x_done) rt_printf("!! compressor still busy after 30 s\n");
+        if (xe_alive) { xe_quit = 1; give_semaphore(xe_go); for (int i = 0; i < 200 && xe_alive; i++) msleep(10); }   /* v4.31 */
+        if (xe_alive) rt_printf("!! EDMAC copy task still busy after 2 s\n");
     }
     w_stop = 1;
     give_semaphore(rt_wsem);
@@ -2988,6 +3067,9 @@ static void rt_task(void *unused)
                               c_src, pitch * 8 / c_bpp, X_LEAD_US, (sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800) - X_LAT_US,
                               sv_irq_to_top, x_dbusy, x_late, x_vn, x_rel_bad);
         if (c_crx) rt_printf("v4.30 HPCopy: %d channels, %d in flight, %d lost completions\n", c_xch, c_xpar, x_cp_lost);
+        if (c_crxd == 1) rt_printf("v4.31 split copy-out: %d frames, EDMAC avg %d us, HPCopy avg %d us, EDMAC share at the end %d/64, %d failures%s\n",
+                                   xe_frames, xe_frames ? xe_sum_e / xe_frames : 0, xe_frames ? xe_sum_h / xe_frames : 0, xe_f64, xe_fail,
+                                   xe_fail ? " (split turned off, rest of the clip HPCopy only)" : "");
         if (c_crxd && x_log && x_logn)    /* v4.29: per-frame timing, appended per clip */
         {
             FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXREC.TSV");
