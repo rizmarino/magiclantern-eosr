@@ -117,7 +117,8 @@ static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920,
  * (algsmgr type 0 = Canon's lossless CR3 profile, crxtest_r.c) into MLV VIDF blocks; a PC tool (crx2mlv.py)
  * turns the clip into a standard uncompressed MLV. No audio and no pre-record with it yet. */
 static CONFIG_INT("r.rawrec.crx", rr_crx, 0);
-static CONFIG_INT("r.rawrec.crxsrc", rr_crx_src, 0);    /* v4.28: 0 copy, 1 direct, 2 direct + RAWC verify frames */
+static CONFIG_INT("r.rawrec.crxsrc", rr_crx_src, 0);
+static CONFIG_INT("r.rawrec.xsplit", rr_xsplit, 1);   /* v4.32: Direct copy-out on HPCopy + EDMAC (v4.31) or HPCopy only */    /* v4.28: 0 copy, 1 direct, 2 direct + RAWC verify frames */
 #define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -1442,6 +1443,20 @@ static int c_xsplit, xe_f64, x_split_ok = 1;   /* x_split_ok: host harness A/B s
 static uint32_t xe_fail, xe_frames, xe_sum_e, xe_sum_h;
 static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us);
 static void rt_fail(void);
+/* v4.32 breadcrumbs (v4.31 froze in the first frames of a 12-bit 29.97p Direct clip): the compressor appends one
+ * line per step of the first XB_N frames of each clip to ML/LOGS/CRXBC.TXT and closes the file each time, so after a
+ * battery pull the last line says how far it got (no line for frame 0 = the encode itself never came back). */
+#define XB_N 3
+static int x_bc;
+static void rt_bc(const char *fmt, ...)
+{
+    char b[400];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXBC.TXT");
+    if (f) { FIO_WriteFile(f, b, MIN(n, (int)sizeof(b) - 1)); FIO_CloseFile(f); }
+}
 static void rt_xcp_task(void *unused)
 {
     while (!xe_quit)
@@ -1586,6 +1601,12 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
 {
     uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
     if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { crx_rec_free(hd); return -11; }
+    if (x_bc < XB_N)                            /* v4.32 */
+    {
+        char eb[300]; int el = 0;
+        for (uint32_t i = 0; i < n && i < 17 && el < 280; i++) if (es[i]) el += snprintf(eb + el, sizeof(eb) - el, " %x+%d", ea[i], es[i]);
+        rt_bc("t=%d frame %d: encoded in %d us; header %x+%d; %d entries:%s\n", get_ms_clock(), x_bc, us, ha, hs, n, eb);
+    }
     uint32_t need = 64 + 192 + AL64(hs);
     for (uint32_t i = 0; i < n; i++) need += AL64(es[i]);
     if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; crx_rec_free(hd); return -12; }
@@ -1660,6 +1681,7 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     else r = crx_rec_copy_n(nc, cd, cs, cl, c_xpar);
     if (r == -2) x_cp_lost++;
     tc = (uint32_t)get_us_clock() - tc;
+    if (x_bc < XB_N) { rt_bc("t=%d frame %d: copied (r %d, %d us, EDMAC jobs %d, split %d, fail %d)\n", get_ms_clock(), x_bc, r, tc, c_xsplit ? xe_n : 0, c_xsplit, xe_fail); x_bc++; }
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
     uint32_t fu = crx_rec_free(hd);
     x_last_cp = tc; x_last_fr = fu;             /* v4.29 per-frame log */
@@ -2787,8 +2809,12 @@ static void rt_task(void *unused)
         x_plan = 0; x_started_fn = 0; x_late = x_rel_bad = 0; x_logn = 0; x_primed = x_counted = 0;   /* v4.29 */
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
-        c_xsplit = c_crxd == 1 && x_split_ok; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
+        c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
         if (c_xsplit) rt_printf("v4.31 copy-out split HPCopy + EDMAC, EDMAC share starts at %d/64\n", xe_f64);
+        else if (c_crxd == 1) rt_printf("v4.32 copy-out: HPCopy only (menu)\n");
+        x_bc = 0;                                                         /* v4.32 */
+        FIO_RemoveFile("ML/LOGS/CRXBC.TXT");
+        rt_bc("t=%d clip start: %d-bit, source %d, split %d\n", get_ms_clock(), c_bpp, c_crxd, c_xsplit);
         if (c_crxd && !x_log) x_log = fio_malloc(X_LOGMAX * sizeof(struct x_flog));
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
@@ -3828,6 +3854,14 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("Copy", "Direct (test)", "Direct+verify"),
                 .help    = "Copy: each frame is copied, then compressed (tested). Direct: the encoder reads Canon's",
                 .help2   = "frame buffer itself (less memory traffic, for 29.97p). +verify: 1 raw frame/s for the PC check.",
+            },
+            {
+                .name    = "Lossless copy-out",
+                .priv    = &rr_xsplit,
+                .max     = 1,
+                .choices = CHOICES("HPCopy", "HPCopy+EDMAC"),
+                .help    = "Direct source: HPCopy+EDMAC copies each compressed frame on two engines (faster, v4.31).",
+                .help2   = "HPCopy: one engine, as v4.30. Copy and Direct+verify always use HPCopy.",
             },
             {
                 .name    = "Pre-record",
