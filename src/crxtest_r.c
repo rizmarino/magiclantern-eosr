@@ -958,10 +958,12 @@ static MENU_UPDATE_FUNC(pl_update)
  * Same rules the tests proved (STEP1.md steps 2-3b): encode a copy, never the live MEM1; re-init the encoder for the
  * clip's size/depth (flag cleared at begin); wait for each free before the next start; HPCopy the output out (the CPU
  * can't read the chunks); hand the encoder back to Canon at the end. Errors go to ML/LOGS/CRXTEST.LOG. */
+static struct semaphore *cx_cpsem;
 int crx_rec_begin(void)
 {
     if (!cx_sem) cx_sem = create_named_semaphore("crx_test", 0);
     while (!take_semaphore(cx_sem, 1)) ;
+    if (cx_cpsem) while (!take_semaphore(cx_cpsem, 1)) ;   /* v4.30: no stale completions */
     uint32_t m = MEM(CX_MGR);
     if (!m) return -1;
     MEM(m + 0x124) = 0;                   /* next StartEncode re-runs Canon's init with the clip's descriptor */
@@ -1010,6 +1012,35 @@ int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len)   /* HPCopy (XDMAC); 
     while ((r = HPCopy((void *)dst, (void *)src, len)) == 1 && tries++ < 100) msleep(1);
     return r;
 }
+/* v4.30: several copies in flight on separate XDMAC channels. HPCopyAsync (System::HPCopy.c, 0xE0328AB0) takes a
+ * free channel from the pool at 0x4F64 ([0] = count) or returns 1, and on completion releases it and calls cb(ctx)
+ * (handler e0328a86). At most maxpar of ours in flight, so Canon's own HPCopy users still find a free channel.
+ * 0 = ok, 1 = no channel for 100 ms, -2 = a completion didn't come within 1 s (state unknown: stop the clip). */
+static int (*const HPCopyAsync)(void *dst, void *src, uint32_t len, void (*cb)(void *), void *ctx) = (void *)0xE0328AB1;
+static void cx_cp_cb(void *ctx) { give_semaphore(cx_cpsem); }
+int crx_rec_hpc_channels(void) { return MEM(0x4F64); }
+int crx_rec_copy_n(int n, const uint32_t *dst, const uint32_t *src, const uint32_t *len, int maxpar)
+{
+    if (maxpar < 2) { for (int i = 0; i < n; i++) if (len[i] && crx_rec_copy(dst[i], src[i], len[i])) return 1; return 0; }
+    if (!cx_cpsem) cx_cpsem = create_named_semaphore("crx_cp", 0);
+    int out = 0, err = 0;
+    for (int i = 0; i < n && !err; i++)
+    {
+        if (!len[i]) continue;
+        while (out >= maxpar && !err) { if (take_semaphore(cx_cpsem, 1000)) err = -2; else out--; }
+        int tries = 0;
+        while (!err && HPCopyAsync((void *)dst[i], (void *)src[i], len[i], cx_cp_cb, 0) == 1)
+        {
+            if (out) { if (take_semaphore(cx_cpsem, 1000)) err = -2; else out--; }
+            else if (tries++ < 100) msleep(1);
+            else err = 1;
+        }
+        if (!err) out++;
+    }
+    while (out > 0) { if (take_semaphore(cx_cpsem, 1000)) { err = -2; break; } out--; }
+    return err;
+}
+
 void crx_rec_end(void)
 {
     CX_FREEALL();

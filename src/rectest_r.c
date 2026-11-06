@@ -1413,6 +1413,8 @@ extern uint32_t *crx_rec_wait(uint32_t *us);
 extern int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es);
 extern uint32_t crx_rec_free(uint32_t *hd);
 extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
+extern int crx_rec_copy_n(int n, const uint32_t *dst, const uint32_t *src, const uint32_t *len, int maxpar);   /* v4.30 */
+extern int crx_rec_hpc_channels(void);
 extern void crx_rec_end(void);
 #define RT_XSB_BYTES (16 * 1024 * 1024)
 #define RT_XSB_MAX   12                 /* v4.26: was 3; the raw ring is now only RT_XRAW chunks, the rest is staging */
@@ -1425,6 +1427,8 @@ static int nsb;
 static struct semaphore *rt_xsem;
 static volatile int x_stop, x_done;
 static uint32_t x_last_cp, x_last_fr;   /* v4.29 */
+static int c_xpar, c_xch;               /* v4.30: HPCopy copies in flight, XDMAC channel count */
+static uint32_t x_cp_lost;
 static uint32_t x_frames, x_enc_max, x_cp_max, x_free_max, x_wait_ms, x_big, x_hdr0[4], x_max_used;
 static uint64_t x_bytes, x_enc_sum, x_cp_sum;
 /* v4.26 pre-record with lossless: while armed the compressor keeps the newest ~rr_pre_want frames in FULL staging
@@ -1442,7 +1446,7 @@ static volatile int x_dstate;
 static volatile uint32_t x_dfn, x_dts, x_dbusy, x_vn, x_vnext;
 #define RT_XVERIFY_EVERY 30
 /* v4.29 early start (see rt_direct_tick) */
-#define X_LEAD_US 4000
+#define X_LEAD_US 5500                  /* v4.30: was 4000; v4.29 camera starts ran ~1.5 ms after the plan (-2.5 ms) */
 #define X_LAT_US  4500                  /* start latency the deadline allows for (v4.28 camera: up to ~5.3 ms seen) */
 static volatile int x_plan;
 static int x_primed, x_counted;         /* first IRQ of a clip: planning only */
@@ -1583,9 +1587,11 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     xh[0] = 0x56585243; xh[1] = 1; xh[2] = n; xh[3] = hs; xh[4] = us;   /* 'CRXV' */
     for (uint32_t i = 0; i < n; i++) xh[8 + i] = es[i];
     uint32_t o = b + 64 + 192, tc = (uint32_t)get_us_clock();
-    int r = crx_rec_copy(o, ha, AL64(hs));
-    o += AL64(hs);
-    for (uint32_t i = 0; i < n && !r; i++) if (es[i]) { r = crx_rec_copy(o, ea[i], AL64(es[i])); o += AL64(es[i]); }
+    uint32_t cd[33], cs[33], cl[33]; int nc = 0;     /* v4.30: one list, copied with up to c_xpar in flight */
+    cd[nc] = o; cs[nc] = ha; cl[nc++] = AL64(hs); o += AL64(hs);
+    for (uint32_t i = 0; i < n; i++) if (es[i]) { cd[nc] = o; cs[nc] = ea[i]; cl[nc++] = AL64(es[i]); o += AL64(es[i]); }
+    int r = crx_rec_copy_n(nc, cd, cs, cl, c_xpar);
+    if (r == -2) x_cp_lost++;
     tc = (uint32_t)get_us_clock() - tc;
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
     uint32_t fu = crx_rec_free(hd);
@@ -2712,6 +2718,8 @@ static void rt_task(void *unused)
         x_bytes = x_enc_sum = x_cp_sum = 0;
         x_dstate = 0; x_dbusy = x_vn = x_vnext = 0;   /* v4.28 */
         x_plan = 0; x_started_fn = 0; x_late = x_rel_bad = 0; x_logn = 0; x_primed = x_counted = 0;   /* v4.29 */
+        c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
+        rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
         if (c_crxd && !x_log) x_log = fio_malloc(X_LOGMAX * sizeof(struct x_flog));
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
@@ -2979,6 +2987,7 @@ static void rt_task(void *unused)
                               "(top row %d us); %d frames dropped (encoder busy past the deadline: %d), %d verify frames (RAWC); timer/rel errors %d\n",
                               c_src, pitch * 8 / c_bpp, X_LEAD_US, (sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800) - X_LAT_US,
                               sv_irq_to_top, x_dbusy, x_late, x_vn, x_rel_bad);
+        if (c_crx) rt_printf("v4.30 HPCopy: %d channels, %d in flight, %d lost completions\n", c_xch, c_xpar, x_cp_lost);
         if (c_crxd && x_log && x_logn)    /* v4.29: per-frame timing, appended per clip */
         {
             FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXREC.TSV");
@@ -2991,8 +3000,11 @@ static void rt_task(void *unused)
                 {
                     struct x_flog *L = &x_log[i];
                     int rel = L->rel, ar = rel < 0 ? -rel : rel;
-                    len += snprintf(tb + len, 80, rel == 0x7FFF ? "%d\tNA\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n" : "%d\t%s%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n",
-                                    L->fn, rel < 0 ? "-" : "", ar / 10, ar % 10, L->enc / 10, L->enc % 10, L->cp / 10, L->cp % 10,
+                    char rs[16];                    /* v4.30: own column string (a shorter NA format with the same args garbled the row) */
+                    if (rel == 0x7FFF) snprintf(rs, sizeof(rs), "NA");
+                    else snprintf(rs, sizeof(rs), "%s%d.%d", rel < 0 ? "-" : "", ar / 10, ar % 10);
+                    len += snprintf(tb + len, 80, "%d\t%s\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n",
+                                    L->fn, rs, L->enc / 10, L->enc % 10, L->cp / 10, L->cp % 10,
                                     L->fr / 10, L->fr % 10, L->cyc / 10, L->cyc % 10, L->wt / 10, L->wt % 10);
                     if (len > 64 * 1024 - 100) { FIO_WriteFile(f, tb, len); len = 0; }
                 }
