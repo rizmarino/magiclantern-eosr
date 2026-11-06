@@ -317,7 +317,11 @@ void refresh_yuv_from_rgb(void)
      * transparent pixels drawn opaque black (v4.4). */
     const int r_menu_up = gui_menu_shown();
     if (r_menu_up) r_menu_opaque_pass = 1;
-    if (zebra_should_run() || r_menu_up){
+    /* v4.29: always this path on the R. The other one (no overlays running) skips transparent pixels - upstream's
+     * "limited alpha" for a layer shared with Canon - so an erase to COLOR_EMPTY (NotifyBox timeout, status line)
+     * never reached the screen and stayed over live view until a view change (riz, v4.26 camera test). The R draws
+     * into its own compositor layer (CONFIG_COMPOSITOR_DEDICATED_LAYER), so transparent pixels can be written. */
+    if (1){
 #else
     if(zebra_should_run()){
 #endif

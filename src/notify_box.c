@@ -30,6 +30,7 @@ static void notify_box_erase(void)
 {
     if (!notify_box_drawn[0]) return;
     int w = bmp_string_width(FONT_LARGE, notify_box_drawn), h = fontspec_height(FONT_LARGE);
+    if (w <= 0 || w > 720 - 50) w = 720 - 50;    /* v4.29: width not measurable -> the whole band */
     bmp_fill(COLOR_EMPTY, 50, 50, MIN(w + 8, 720 - 50), h + 4);
     notify_box_drawn[0] = 0;
     extern uint32_t ml_refresh_display_needed;

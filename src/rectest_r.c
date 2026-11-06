@@ -1424,6 +1424,7 @@ static struct rt_sb xsb[RT_XSB_MAX];
 static int nsb;
 static struct semaphore *rt_xsem;
 static volatile int x_stop, x_done;
+static uint32_t x_last_cp, x_last_fr;   /* v4.29 */
 static uint32_t x_frames, x_enc_max, x_cp_max, x_free_max, x_wait_ms, x_big, x_hdr0[4], x_max_used;
 static uint64_t x_bytes, x_enc_sum, x_cp_sum;
 /* v4.26 pre-record with lossless: while armed the compressor keeps the newest ~rr_pre_want frames in FULL staging
@@ -1440,6 +1441,17 @@ static int c_crxd;
 static volatile int x_dstate;
 static volatile uint32_t x_dfn, x_dts, x_dbusy, x_vn, x_vnext;
 #define RT_XVERIFY_EVERY 30
+/* v4.29 early start (see rt_direct_tick) */
+#define X_LEAD_US 4000
+#define X_LAT_US  4500                  /* start latency the deadline allows for (v4.28 camera: up to ~5.3 ms seen) */
+static volatile int x_plan;
+static int x_primed, x_counted;         /* first IRQ of a clip: planning only */
+static volatile uint32_t x_plan_t, x_plan_dl, x_cmd_t, x_started_fn, x_late, x_rel_bad;
+static volatile int32_t x_drel;         /* start command time - frame-end IRQ, us (negative = before) */
+struct x_flog { uint32_t fn; int16_t rel; uint16_t enc, cp, fr, cyc, wt; };   /* 0.1 ms units */
+static struct x_flog *x_log;
+static volatile uint32_t x_logn;
+#define X_LOGMAX 2400
 
 static void rt_alloc_staging(void)
 {
@@ -1493,7 +1505,7 @@ static void rt_x_pre_trim(int si)
             full++; frames += xsb[i].nfr;
         }
         if (old < 0 || old == si) return;
-        if (full <= nsb - 1 && frames - (int)xsb[old].nfr < rr_pre_want) return;
+        if (full <= nsb - (c_crxd ? 2 : 1) && frames - (int)xsb[old].nfr < rr_pre_want) return;   /* v4.29: direct has no raw ring to bridge the first write after the trigger: one more free */
         rr_pre_disc += xsb[old].nfr;
         xsb[old].len = xsb[old].nfr = 0;
         RT_DMB();
@@ -1549,9 +1561,16 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     {
         rt_x_close(*psi, *ppos, *pnfr);
         if (rr_pre) rt_x_pre_trim(*psi);        /* v4.26: armed: keep only the newest frames */
+        int closed = *psi;
         *psi = (*psi + 1) % nsb; *ppos = 0; *pnfr = 0;
         uint32_t tw = get_ms_clock();
-        while (xsb[*psi].state != SB_FREE && !w_err) take_semaphore(rt_xsem, 50);
+        while (xsb[*psi].state != SB_FREE && !w_err)
+        {
+            /* v4.29: pre-record triggered while the last free buffer was being filled: every buffer is full now and
+             * only the writer can free one, so hand it the clip start here (v4.28 harness: deadlock, nothing written) */
+            if (!x_go && !rr_pre) rt_x_go(closed);
+            take_semaphore(rt_xsem, 50);
+        }
         x_wait_ms += get_ms_clock() - tw;
         if (w_err) { crx_rec_free(hd); return w_err; }
     }
@@ -1570,6 +1589,7 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     tc = (uint32_t)get_us_clock() - tc;
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
     uint32_t fu = crx_rec_free(hd);
+    x_last_cp = tc; x_last_fr = fu;             /* v4.29 per-frame log */
     if (r) return -13;
     *ppos += need; (*pnfr)++;
     x_kb += need >> 10;                         /* v4.26: status line rate */
@@ -1601,9 +1621,19 @@ static void rt_crx_task(void *unused)
         memset(&v, 0, sizeof(v));
         memcpy(v.type, "VIDF", 4); v.ts = x_dts; v.frame = x_dfn;
         v.crop_x = c_x0 & ~7; v.crop_y = c_y0; v.pan_x = c_x0; v.pan_y = c_y0;
+        uint32_t w0 = x_wait_ms;
         int e = rt_x_put(hd, us, &v, &si, &pos, &nfr);
+        if (!e && x_log && x_logn < X_LOGMAX)   /* v4.29 per-frame timing (ML/LOGS/CRXREC.TSV) */
+        {
+            struct x_flog *L = &x_log[x_logn++];
+            int32_t rel = x_drel;
+            L->fn = v.frame; L->rel = rel == 0x7FFF ? 0x7FFF : (int16_t)(rel / 100);
+            L->enc = MIN(us / 100, 65535); L->cp = MIN(x_last_cp / 100, 65535); L->fr = MIN(x_last_fr / 100, 65535);
+            L->cyc = MIN((rt_us() - x_cmd_t) / 100, 65535); L->wt = MIN((x_wait_ms - w0) * 10, 65535);
+        }
         RT_DMB();
         x_dstate = 0;
+        if (x_plan) give_semaphore(rt_fsem);    /* v4.29: a planned start may be waiting for the encoder */
         if (e) { w_err = e; break; }
     }
     for (;;)
@@ -1675,7 +1705,7 @@ static void rt_writer_crx(void *unused)
             w_fsize += r; w_bytes += r;
             continue;
         }
-        if (c_crxd == 2 && nch && ch[0].state == CH_FULL)   /* v4.28 verify frame (RAWC block, whole slot) */
+        if (c_crxd == 2 && nch && ch[0].state == CH_FULL && (!w_renum || w_fn0_set))   /* v4.28 verify frame (RAWC block, whole slot); v4.29: renumbered clips only after the first VIDF set the base */
         {
             int e = rt_x_part_check(slot_bytes);
             if (e) { w_err = e; break; }
@@ -2229,55 +2259,94 @@ static void rr_pre_go_crx(uint32_t td)
     give_semaphore(rt_xsem);
 }
 
-/* v4.28 direct source, capture task: start the encoder on this frame in MEM1 (it reads ~3x faster than the sensor
- * writes, so started right after the frame-end IRQ it stays ahead of the next readout); verify frames are EDMAC-copied
- * at the same time. Encoder still busy with the previous frame -> dropped. */
+/* v4.28 direct source, capture task. v4.29: the encode of frame k+1 is started ~X_LEAD_US BEFORE its frame-end IRQ.
+ * v4.28 started it at the IRQ: at 29.97p the crop's top row is overwritten ~2 ms after the IRQ, and Canon's encoder
+ * sometimes began reading 2.5-5 ms after StartEncode, so ~1 frame in 6 had its top 40-400 rows from the next frame
+ * (riz 2026-11-05, who_tore.py). The encoder reads a frame in 7-14 ms, the sensor writes it in 31.6 ms: started while
+ * the sensor finishes the frame, it trails the sensor and still ends after it, so its effective start may fall
+ * anywhere in [end - ~6 ms, end + blank]. The capture task plans the start at IRQ k (x_plan_t = IRQ k + period -
+ * X_LEAD_US), wakes from an HPTimer or from the compressor freeing the encoder (both give rt_fsem), and starts if the
+ * encoder is free before x_plan_dl (IRQ k+1 + top-row time - X_LAT_US); later = the frame is dropped. */
+
+static void rt_direct_tick(void)
+{
+    if (!x_plan || x_dstate) return;
+    uint32_t now = rt_us();
+    if ((int32_t)(now - x_plan_t) < 0) return;                 /* early wake-up */
+    x_plan = 0;
+    if ((int32_t)(now - x_plan_dl) > 0) { x_late++; return; }  /* too late for this frame: dropped at its IRQ */
+    x_dfn = nfr;                        /* the frame the sensor is finishing gets this number at its IRQ */
+    x_dts = x_plan_t + X_LEAD_US - first_t;   /* estimate; set exactly at the IRQ */
+    x_drel = 0x7FFF;
+    x_dstate = 1;
+    RT_DMB();
+    x_cmd_t = rt_us();
+    if (crx_rec_start(c_cw, c_ch, c_bpp, c_src, pitch * 8 / c_bpp))
+    {
+        x_dstate = 0; w_err = -14;      /* the capture loop stops on w_err */
+        return;
+    }
+    x_started_fn = nfr + 1;             /* +1: 0 = none */
+    give_semaphore(rt_xsem);
+}
+
 static int rt_frame_direct(uint32_t td, uint32_t lat_us, int flags, uint32_t top_ref, uint32_t bot_ref)
 {
     uint32_t us = 0;
-    if (frames && bot_ref == last_rec_bot) { flags |= F_DUP; dups++; }
-    else if (x_dstate)
-    {
-        flags |= F_DROP; drops++; x_dbusy++;
-        if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+    if (!x_primed)                      /* first IRQ only plans the next frame: no frame number, no time base (so the */
+    {                                   /* first recorded frame is #0 at ts 0, and audio is trimmed to it) */
+        x_primed = 1;
+        first_t = 0;
     }
+    else if (frames && bot_ref == last_rec_bot) { flags |= F_DUP; dups++; }
     else
     {
-        uint32_t top0 = rt_probe(r_top);
-        if (top0 != top_ref) { flags |= F_TEAR; tears++; }
-        x_dfn = nfr; x_dts = td - first_t;
-        x_dstate = 1;
-        RT_DMB();
-        if (crx_rec_start(c_cw, c_ch, c_bpp, c_src, pitch * 8 / c_bpp))
-        {
-            x_dstate = 0; w_err = -14;
-            rt_printf("!! encoder start failed at frame %d, stopping\n", nfr);
-            rt_fail();
-            return -1;
-        }
-        give_semaphore(rt_xsem);
-        if (c_crxd == 2 && !rr_pre && nch && (uint32_t)nfr >= x_vnext && ch[0].state == CH_FREE)   /* verify copy of the same frame */
-        {
-            uint32_t dst = ch[0].base;
-            rt_mlv_slot(dst, nfr, td - first_t);
-            memcpy((void *)dst, "RAWC", 4);
-            if (rt_copy(c_src, pitch, dst + slot_pre, c_rb, c_ch, &us))
-            {
-                rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
-                rt_fail();
-                return -1;
-            }
-            if (rt_probe(r_top) != top0) { flags |= F_TOPCHG; topchg++; }
-            ch[0].n = 1;
-            RT_DMB();
-            ch[0].state = CH_FULL;
-            give_semaphore(rt_wsem);
-            x_vn++; x_vnext = nfr + RT_XVERIFY_EVERY;
-        }
-        if (rt_probe(r_bot) != bot_ref) { flags |= F_BOTCHG; botchg++; }
-        frames++; dsum += us; if (us > dmax) dmax = us;
         last_rec_bot = bot_ref;
+        if (x_started_fn == (uint32_t)nfr + 1)    /* this frame's encode was started before its end: recorded */
+        {
+            x_dts = td - first_t;
+            x_drel = (int32_t)(x_cmd_t - td);
+            if (x_drel > 3000 || x_drel < -20000) x_rel_bad++;
+            frames++;
+            if (c_crxd == 2 && !rr_pre && nch && (uint32_t)nfr >= x_vnext && ch[0].state == CH_FREE)   /* verify copy */
+            {
+                uint32_t dst = ch[0].base;
+                rt_mlv_slot(dst, nfr, td - first_t);
+                memcpy((void *)dst, "RAWC", 4);
+                if (rt_copy(c_src, pitch, dst + slot_pre, c_rb, c_ch, &us))
+                {
+                    rt_printf("!! EDMAC timeout at frame %d, stopping\n", nfr);
+                    rt_fail();
+                    return -1;
+                }
+                ch[0].n = 1;
+                RT_DMB();
+                ch[0].state = CH_FULL;
+                give_semaphore(rt_wsem);
+                x_vn++; x_vnext = nfr + RT_XVERIFY_EVERY;
+            }
+            dsum += us; if (us > dmax) dmax = us;
+        }
+        else if (frames || x_plan || x_late)   /* not started (encoder busy until the deadline): lost */
+        {
+            flags |= F_DROP; drops++; x_dbusy++;
+            if (first_drop_ms < 0) first_drop_ms = (td - first_t) / 1000;
+        }
     }
+    if (!(flags & F_DUP))               /* plan the next frame: start X_LEAD_US before its frame end */
+    {
+        uint32_t per = sv_irq_med ? sv_irq_med : (c_est ? c_est : 41708);
+        uint32_t top = sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800;
+        x_plan_t = td + per - X_LEAD_US;
+        x_plan_dl = td + per + top - X_LAT_US;
+        if ((int32_t)(x_plan_dl - x_plan_t) < 0) x_plan_dl = x_plan_t;
+        RT_DMB();
+        x_plan = 1;
+        int32_t wait = (int32_t)(x_plan_t - rt_us());
+        if (wait > 50 && wait < 0x70000) { if (SetHPTimerAfterNow(wait, rt_hpt_wake, rt_hpt_wake, 0) & 1) x_rel_bad++; }
+        else give_semaphore(rt_fsem);
+    }
+    if (!x_counted) { x_counted = 1; return 0; }   /* the planning IRQ is not a frame */
     if (flags & F_LATE) late++;
     if (nfr < RT_MAXFR)
     {
@@ -2373,6 +2442,7 @@ static void rt_capture_irq(void)
             continue;
         }
         to = 0;
+        if (c_crxd) rt_direct_tick();               /* v4.29: planned encoder start due (timer / encoder freed) */
         if (rt_irq_snapshot(&n, &t, &top, &bot)) continue;
         if (n == n_last) continue;                  /* extra semaphore count for an IRQ already handled */
         if (!first) missed += n - n_last - 1;
@@ -2641,6 +2711,8 @@ static void rt_task(void *unused)
         x_stop = 0; x_done = 0; x_frames = x_enc_max = x_cp_max = x_free_max = x_wait_ms = x_big = x_max_used = 0;
         x_bytes = x_enc_sum = x_cp_sum = 0;
         x_dstate = 0; x_dbusy = x_vn = x_vnext = 0;   /* v4.28 */
+        x_plan = 0; x_started_fn = 0; x_late = x_rel_bad = 0; x_logn = 0; x_primed = x_counted = 0;   /* v4.29 */
+        if (c_crxd && !x_log) x_log = fio_malloc(X_LOGMAX * sizeof(struct x_flog));
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
     if (pre_on && c_crx)                /* v4.26: kept compressed, in staging buffers (rt_x_pre_trim) */
@@ -2649,7 +2721,7 @@ static void rt_task(void *unused)
         rr_pre_want = per ? (int)((uint64_t)rr_pre_ms[rr_pre_sel] * 1000 / per) : 30;
         if (nsb >= 3) rr_pre = 1;
         rt_printf("v4.26 lossless pre-record %d ms: %d frames wanted, kept in up to %d of %d staging buffers%s\n",
-                  rr_pre_ms[rr_pre_sel], rr_pre_want, nsb - 1, nsb, rr_pre ? "" : ": too little memory, recording at once");
+                  rr_pre_ms[rr_pre_sel], rr_pre_want, nsb - (c_crxd ? 2 : 1), nsb, rr_pre ? "" : ": too little memory, recording at once");
     }
     else if (pre_on)                    /* v4.8: ring size; 2 chunks stay free so the writer has headroom after the trigger */
     {
@@ -2903,8 +2975,32 @@ static void rt_task(void *unused)
                   frame_bytes && x_frames ? (uint32_t)(x_bytes * 100 / x_frames / frame_bytes) : 0, xneed10 / 10, xneed10 % 10,
                   x_frames ? (uint32_t)(x_enc_sum / x_frames) : 0, x_enc_max, x_frames ? (uint32_t)(x_cp_sum / x_frames) : 0, x_cp_max,
                   x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_written, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
-        if (c_crxd) rt_printf("v4.28 direct source: MEM1 crop at %08x, line %d px; %d frames dropped (encoder busy), %d verify frames (RAWC)\n",
-                              c_src, pitch * 8 / c_bpp, x_dbusy, x_vn);
+        if (c_crxd) rt_printf("v4.29 direct source: MEM1 crop at %08x, line %d px; start %d us before the frame end, deadline %d us after it "
+                              "(top row %d us); %d frames dropped (encoder busy past the deadline: %d), %d verify frames (RAWC); timer/rel errors %d\n",
+                              c_src, pitch * 8 / c_bpp, X_LEAD_US, (sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800) - X_LAT_US,
+                              sv_irq_to_top, x_dbusy, x_late, x_vn, x_rel_bad);
+        if (c_crxd && x_log && x_logn)    /* v4.29: per-frame timing, appended per clip */
+        {
+            FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXREC.TSV");
+            char *tb = f ? fio_malloc(64 * 1024) : 0;
+            if (tb)
+            {
+                int len = snprintf(tb, 256, "# %s.MLV %dx%d %d-bit, period %d us, lead %d us\nframe\tstart_rel_ms\tencode_ms\thpcopy_ms\tfree_ms\tcycle_ms\tstaging_wait_ms\n",
+                                   rr_base, c_cw, c_ch, c_bpp, sv_irq_med, X_LEAD_US);
+                for (uint32_t i = 0; i < x_logn; i++)
+                {
+                    struct x_flog *L = &x_log[i];
+                    int rel = L->rel, ar = rel < 0 ? -rel : rel;
+                    len += snprintf(tb + len, 80, rel == 0x7FFF ? "%d\tNA\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n" : "%d\t%s%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n",
+                                    L->fn, rel < 0 ? "-" : "", ar / 10, ar % 10, L->enc / 10, L->enc % 10, L->cp / 10, L->cp % 10,
+                                    L->fr / 10, L->fr % 10, L->cyc / 10, L->cyc % 10, L->wt / 10, L->wt % 10);
+                    if (len > 64 * 1024 - 100) { FIO_WriteFile(f, tb, len); len = 0; }
+                }
+                if (len) FIO_WriteFile(f, tb, len);
+                fio_free(tb);
+            }
+            if (f) FIO_CloseFile(f);
+        }
     }
     snprintf(rt_last, sizeof(rt_last), "RT%02d %s%s: %d rec, %d miss", rt_run_id, c_mlv ? (c_bpp == 10 ? "MLV10 " : c_bpp == 12 ? "MLV12 " : "MLV14 ") : "",
              rt_sync_name[mode], frames, missed + drops);
