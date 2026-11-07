@@ -1457,6 +1457,7 @@ static void rt_bc(const char *fmt, ...)
     FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXBC.TXT");
     if (f) { FIO_WriteFile(f, b, MIN(n, (int)sizeof(b) - 1)); FIO_CloseFile(f); }
 }
+static volatile int x_stage, xe_busy;      /* v4.32b: where the compressor / EDMAC task are (status-task breadcrumbs) */
 static void rt_xcp_task(void *unused)
 {
     while (!xe_quit)
@@ -1464,10 +1465,10 @@ static void rt_xcp_task(void *unused)
         if (take_semaphore(xe_go, 100)) continue;
         if (xe_quit) break;
         uint32_t t0 = (uint32_t)get_us_clock(), us = 0;
-        int err = 0;
+        int err = 0; xe_busy = 1;
         for (int i = 0; i < xe_n && !err; i++) if (rt_copy(xe_s[i], 4096, xe_d[i], 4096, xe_r[i], &us)) err = 1;
         if (err) rt_fail();                     /* ports reset, session ended; the compressor stops using the split */
-        xe_us = (uint32_t)get_us_clock() - t0; xe_err = err;
+        xe_us = (uint32_t)get_us_clock() - t0; xe_err = err; xe_busy = 0;
         give_semaphore(xe_done);
     }
     xe_alive = 0;
@@ -1617,6 +1618,7 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
         int closed = *psi;
         *psi = (*psi + 1) % nsb; *ppos = 0; *pnfr = 0;
         uint32_t tw = get_ms_clock();
+        x_stage = 2;
         while (xsb[*psi].state != SB_FREE && !w_err)
         {
             /* v4.29: pre-record triggered while the last free buffer was being filled: every buffer is full now and
@@ -1658,9 +1660,11 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
             if (cl[i] > off) { hd[nh] = cd[i] + off; hsrc[nh] = cs[i] + off; hl[nh++] = cl[i] - off; }
         }
         if (xe_n) give_semaphore(xe_go);
+        x_stage = 3;
         uint32_t t1 = (uint32_t)get_us_clock();
         r = crx_rec_copy_n(nh, hd, hsrc, hl, 1);
         th = (uint32_t)get_us_clock() - t1;
+        x_stage = 4;
         if (xe_n)
         {
             if (take_semaphore(xe_done, 1000)) { c_xsplit = 0; xe_fail++; if (!r) r = -2; }
@@ -1683,7 +1687,9 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     tc = (uint32_t)get_us_clock() - tc;
     if (x_bc < XB_N) { rt_bc("t=%d frame %d: copied (r %d, %d us, EDMAC jobs %d, split %d, fail %d)\n", get_ms_clock(), x_bc, r, tc, c_xsplit ? xe_n : 0, c_xsplit, xe_fail); x_bc++; }
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
+    x_stage = 5;
     uint32_t fu = crx_rec_free(hd);
+    x_stage = 1;
     x_last_cp = tc; x_last_fr = fu;             /* v4.29 per-frame log */
     if (r) return -13;
     *ppos += need; (*pnfr)++;
@@ -3259,6 +3265,10 @@ static void rr_status_task(void *unused)
         int on = rr_active || rt_osd_run || sp_active;
         if (!on) { x_ms_last = 0; x_rate = 0; }       /* v4.26 */
         if (!on) { if (shown) { rr_meter_layout(); bmp_fill(COLOR_EMPTY, 8, RR_STATUS_Y, RR_STATUS_CLEAR_W, 30); shown = 0; last[0] = 0; } continue; }
+        if (tick % 4 == 0 && c_crxd == 1 && rr_active && rr_t0_ms && !rr_stop)   /* v4.32b: 1 line/s while recording Direct (freeze hunt) */
+            rt_bc("t=%d fr %d busy %d late %d stg %d xe %d share %d fail %d lost %d cp %d/%d enc %d free %d wait %d kb %d werr %d\n",
+                  get_ms_clock(), x_frames, x_dbusy, x_late, x_stage, xe_busy, xe_f64, xe_fail, x_cp_lost, x_last_cp, x_cp_max,
+                  x_enc_max, x_last_fr, x_wait_ms, x_kb, w_err);
         if (gui_menu_shown() || (tick % 4 && !sp_active)) continue;   /* v20: silent status every 250 ms */
         char t[40];
         if (c_crx && !sp_active)        /* v4.26: compressed data rate over the last ~1 s (also while pre-record is armed) */
