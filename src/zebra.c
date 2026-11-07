@@ -55,6 +55,14 @@
 extern uint32_t ml_refresh_display_needed;
 #ifdef CONFIG_R
 uint8_t *lv_window(uint8_t *base, uint32_t off);   /* riz/eosr: cached LV row window (defined below) */
+/* v4.38: the R's LV display YUV stores chroma unsigned (128 = neutral), not signed as ML assumes: a grey card read
+ * as int8 gave U/V around +-120, flipping sign at neutral (v4.37 AWB.TXT). R_CHROMA turns a stored byte into
+ * ML's signed chroma (spotmeter, vectorscope, Auto adjust Kelvin). */
+#ifdef CONFIG_R
+#define R_CHROMA(b) ((int8_t)(((b) & 0xFF) ^ 0x80))
+#else
+#define R_CHROMA(b) ((int8_t)((b) & 0xFF))
+#endif
 #endif
 
 #if defined(FEATURE_RAW_HISTOGRAM) || defined(FEATURE_RAW_ZEBRAS) || defined(FEATURE_RAW_SPOTMETER)
@@ -503,6 +511,9 @@ static void hist_add_pixel(uint32_t pixel, int Y)
     if (histogram.is_rgb)
     {
         int R, G, B;
+        #ifdef CONFIG_R
+        pixel ^= 0x00800080;                /* v4.38: R chroma is unsigned (see R_CHROMA) */
+        #endif
         //~ uyvy2yrgb(pixel, &Y, &R, &G, &B);
         COMPUTE_UYVY2YRGB(pixel, Y, R, G, B);
         // YRGB range: 0-255
@@ -620,8 +631,8 @@ hist_build()
             #ifdef FEATURE_VECTORSCOPE
             if (vectorscope_draw)
             {
-                int8_t U = (pixel >>  0) & 0xFF;
-                int8_t V = (pixel >> 16) & 0xFF;
+                int8_t U = R_CHROMA(pixel >>  0);
+                int8_t V = R_CHROMA(pixel >> 16);
                 vectorscope_addpixel(Y, U, V);
             }
             #endif
@@ -2316,7 +2327,7 @@ void get_spot_yuv_ex(int size_dxb, int dx, int dy, int* Y, int* U, int* V, int d
         {
             uint16_t p = vr[ x + y * width ];
             sy += (p >> 8) & 0xFF;
-            if (x % 2) sv += (int8_t)(p & 0x00FF); else su += (int8_t)(p & 0x00FF);
+            if (x % 2) sv += R_CHROMA(p); else su += R_CHROMA(p);
         }
     }
 
@@ -2614,7 +2625,7 @@ static void spotmeter_step()
         {
             uint16_t p = vr[ x + y * width ];
             sy += (p >> 8) & 0xFF;
-            if (x % 2) sv += (int8_t)(p & 0x00FF); else su += (int8_t)(p & 0x00FF);
+            if (x % 2) sv += R_CHROMA(p); else su += R_CHROMA(p);
         }
     }
 
