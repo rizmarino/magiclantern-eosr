@@ -294,8 +294,13 @@ const char * lens_format_aperture(int raw_aperture);
 /** FIXME: not thread-safe */
 const char * lens_format_iso(int raw_iso);
 
+#ifdef CONFIG_R     /* R: Canon's own K range (v4.35 prop watch: plain 4-byte Kelvin, 3000/8000 as set) */
+#define KELVIN_MIN 2500
+#define KELVIN_MAX 10000
+#else
 #define KELVIN_MIN 1500
 #define KELVIN_MAX 15000
+#endif
 #define KELVIN_STEP 100
 void lens_set_kelvin(int k);
 void lens_set_kelvin_value_only(int k);

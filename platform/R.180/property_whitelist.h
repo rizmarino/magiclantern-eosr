@@ -61,7 +61,14 @@ const uint32_t prop_write_allow[] =
     PROP_PICSTYLE_SETTINGS_USERDEF2,
     PROP_PICSTYLE_SETTINGS_USERDEF3,
     PROP_PICSTYLE_SETTINGS_AUTO,
-    PROP_PICSTYLE_SETTINGS_FINEDETAIL
+    PROP_PICSTYLE_SETTINGS_FINEDETAIL,
+    // white balance mode + Kelvin (v4.36). v4.35 Prop watch on the R: all 4 bytes, mode codes as ML's (0 AWB,
+    // 1 daylight, 3 tungsten, 8 shade, 9 Kelvin), Kelvin as the plain number; Canon sets LV and PH copies together,
+    // as lens_set_kelvin() does. WB shift / custom gains are not verified and stay read-only.
+    PROP_WB_MODE_LV,
+    PROP_WB_KELVIN_LV,
+    PROP_WB_MODE_PH,
+    PROP_WB_KELVIN_PH
 };
 
 // anything not listed above will allow reads but not writes

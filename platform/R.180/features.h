@@ -73,6 +73,9 @@
 #define FEATURE_EXPO_SHUTTER
 #define FEATURE_EXPO_APERTURE
 #define FEATURE_EXPO_PRESET
+// riz v4.36 (batch D): Expo > White Balance - Kelvin + Auto adjust Kelvin (WB mode/Kelvin props verified on the R
+// with Prop watch v4.35 and whitelisted; WB shift / custom gains hidden, see shoot.c)
+#define FEATURE_WHITE_BALANCE
 // Shoot > Motion detect and Focus > Trap focus (LV, MF, hold half-press): on the R both read a sampled
 // grid of the LV luma (r_spot_luma in zebra.c), fire through take_a_pic (remote-release path).
 #define FEATURE_MOTION_DETECT

@@ -1969,7 +1969,9 @@ void kelvin_n_gm_auto()
     if (lv)
     {
         kelvin_auto_flag = 1;
+        #ifndef CONFIG_R    /* R: G/M shift format not verified (writes refused): Kelvin only */
         wbs_gm_auto_flag = 1;
+        #endif
     }
 }
 
@@ -3317,10 +3319,8 @@ static void expo_preset_toggle()
     lens_set_rawiso(pre_iso);
     lens_set_rawaperture(pre_av);
     #endif
-    #ifndef CONFIG_R    /* R: WB property format not verified, not in prop_write_allow */
-    if (lens_info.wb_mode == WB_KELVIN)
+    if (lens_info.wb_mode == WB_KELVIN)     /* R: verified + allowed since v4.36 */
         lens_set_kelvin(pre_kelvin);
-    #endif
     
     pre_iso = c_iso;
     pre_tv = c_tv;
@@ -3970,8 +3970,13 @@ static struct menu_entry expo_menus[] = {
         .name = "White Balance",
         .update    = kelvin_wbs_display,
         .select     = kelvin_toggle,
+        #ifdef CONFIG_R
+        .help  = "Kelvin white balance, 2500-10000 K (Canon's WB is switched to K).",
+        .help2 = "PLAY: Auto adjust Kelvin (aim the centre at something white or grey).",
+        #else
         .help  = "Adjust Kelvin white balance and GM/BA WBShift.",
         .help2 = "Advanced: WBShift, RGB multipliers, Push-button WB...",
+        #endif
         .edit_mode = EM_SHOW_LIVEVIEW,
         .submenu_width = 700,
         .children =  (struct menu_entry[]) {
@@ -3982,6 +3987,7 @@ static struct menu_entry expo_menus[] = {
                 .help = "Adjust Kelvin white balance.",
                 .edit_mode = EM_SHOW_LIVEVIEW,
             },
+            #ifndef CONFIG_R    /* R: WB shift / custom gain formats not verified (read-only) */
             {
                 .name = "WBShift G/M",
                 .update = wbs_gm_display, 
@@ -4029,6 +4035,7 @@ static struct menu_entry expo_menus[] = {
                 .help = "BLUE channel multiplier, for custom white balance.",
                 .edit_mode = EM_SHOW_LIVEVIEW,
             },
+            #endif
             /*{
                 .name = "Auto adjust Kelvin",
                 .select = kelvin_auto,
@@ -4039,12 +4046,21 @@ static struct menu_entry expo_menus[] = {
                 .select = wbs_gm_auto,
                 .help = "LiveView: adjust Green-Magenta once for the current scene."
             },*/
+            #ifdef CONFIG_R      /* R: Kelvin only (G/M shift not verified) */
+            {
+                .name = "Auto adjust Kelvin",
+                .select = kelvin_auto,
+                .help = "LiveView: adjust Kelvin once so the centre spot is neutral (aim at white/grey).",
+                .depends_on = DEP_LIVEVIEW,
+            },
+            #else
             {
                 .name = "Auto adjust Kelvin + G/M",
                 .select = kelvin_n_gm_auto,
                 .help = "LiveView: adjust Kelvin and G-M once (Push-button WB).",
                 .depends_on = DEP_LIVEVIEW,
             },
+            #endif
             MENU_EOL
         },
     },
