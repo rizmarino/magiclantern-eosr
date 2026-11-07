@@ -73,11 +73,14 @@ static const uint32_t st_props[] = {
     PROP_MECHA_COUNTER, PROP_FILE_NUMBER_A, PROP_SHOOTING_MODE, PROP_SHUTTER, PROP_BURST_COUNT,
     PROP_LV_MOVIE_SELECT, PROP_SHOOTING_TYPE, PROP_VIDEO_MODE,
     PROP_WB_MODE_LV, PROP_WB_KELVIN_LV, PROP_WB_MODE_PH, PROP_WB_KELVIN_PH, PROP_WBS_GM, PROP_WBS_BA,   /* v4.35: WB format */
+    PROP_AF_MODE, PROP_LVAF_MODE, PROP_CONTINUOUS_AF, PROP_MOVIE_SERVO_AF, PROP_LV_FOCUS_DONE, PROP_LV_LENS_DRIVE_REMOTE,  /* v4.39 */
 };
 static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV", "BURST",
-                                  "MVSEL", "STYPE", "VMODE", "WBM_LV", "WBK_LV", "WBM_PH", "WBK_PH", "WBS_GM", "WBS_BA" };
+                                  "MVSEL", "STYPE", "VMODE", "WBM_LV", "WBK_LV", "WBM_PH", "WBK_PH", "WBS_GM", "WBS_BA",
+                                  "AFMODE", "LVAFMODE", "CONTAF", "MSERVO", "FDONE", "FDRIVE" };
 enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_BURST,
-       P_MVSEL, P_STYPE, P_VMODE, P_WBM_LV, P_WBK_LV, P_WBM_PH, P_WBK_PH, P_WBS_GM, P_WBS_BA, P_N };
+       P_MVSEL, P_STYPE, P_VMODE, P_WBM_LV, P_WBK_LV, P_WBM_PH, P_WBK_PH, P_WBS_GM, P_WBS_BA,
+       P_AFMODE, P_LVAFMODE, P_CONTAF, P_MSERVO, P_FDONE, P_FDRIVE, P_N };
 
 static volatile uint32_t st_cur[P_N];   /* latest value (first word), kept even when not armed */
 static volatile uint16_t st_cur_len[P_N];
@@ -159,6 +162,13 @@ REGISTER_PROP_HANDLER(PROP_WB_MODE_PH,      st_prop);
 REGISTER_PROP_HANDLER(PROP_WB_KELVIN_PH,    st_prop);
 REGISTER_PROP_HANDLER(PROP_WBS_GM,          st_prop);
 REGISTER_PROP_HANDLER(PROP_WBS_BA,          st_prop);
+/* v4.39: AF mode / servo / LV focus step + done (follow/rack focus) */
+REGISTER_PROP_HANDLER(PROP_AF_MODE,         st_prop);
+REGISTER_PROP_HANDLER(PROP_LVAF_MODE,       st_prop);
+REGISTER_PROP_HANDLER(PROP_CONTINUOUS_AF,   st_prop);
+REGISTER_PROP_HANDLER(PROP_MOVIE_SERVO_AF,  st_prop);
+REGISTER_PROP_HANDLER(PROP_LV_FOCUS_DONE,   st_prop);
+REGISTER_PROP_HANDLER(PROP_LV_LENS_DRIVE_REMOTE, st_prop);
 #endif
 
 /* ---- Canon capture-control struct, sampled by the run task ---- */
@@ -275,7 +285,7 @@ static const char *st_note_name(uint32_t id)
     }
 }
 
-static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO || k == P_BURST || k >= P_WBM_LV; }   /* counters in decimal */
+static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO || k == P_BURST || (k >= P_WBM_LV && k <= P_WBS_BA); }   /* counters in decimal */
 
 static void st_dump_state(const char *tag)
 {
@@ -1141,7 +1151,7 @@ static struct menu_entry st_menu[] = {
                 .name   = "Prop watch",
                 .select = st_watch_select,
                 .update = st_update,
-                .help   = "Logs silent/drive/job/white-balance properties while you change Canon menus.",
+                .help   = "Logs silent/drive/job/WB/AF-mode/focus-step properties while you change settings.",
                 .help2  = "SET, close menu, toggle Silent shutter + Drive, wait for DONE.",
             },
             {

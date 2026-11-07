@@ -820,12 +820,8 @@ lens_focus(
     lv_focus_done = 0;
     lv_focus_error = 0;
 
-#ifdef CONFIG_R
-    /* riz v4.11: PROP_LV_LENS_DRIVE_REMOTE isn't in the R's write whitelist (RF focus drive not found yet): every
-     * step would time out after 1 s. Fail at once (Lua lens.focus returns false; focus stacking etc.). */
-    lv_focus_error = 1;
-    return 0;
-#endif
+    /* riz v4.39: the R's own firmware drives LV focus steps through PROP_LV_LENS_DRIVE_REMOTE with this encoding
+     * (FUN_e034ff36), so it is whitelisted now (v4.11-v4.38 failed here at once). */
     if (!lv) return 0;
     if (is_manual_focus()) return 0;
     if (is_continuous_af()) return 0;

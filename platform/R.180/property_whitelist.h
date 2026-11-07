@@ -68,7 +68,11 @@ const uint32_t prop_write_allow[] =
     PROP_WB_MODE_LV,
     PROP_WB_KELVIN_LV,
     PROP_WB_MODE_PH,
-    PROP_WB_KELVIN_PH
+    PROP_WB_KELVIN_PH,
+    // LV lens focus step (v4.39): Canon's own FUN_e034ff36 writes this property with 1/2/3 (near) and
+    // 0x8001/2/3 (far), 4 bytes - ML's lens_focus() encoding. Master FUN_e036033c forwards it to the LV AF task
+    // (Tvaf DAFDeliverer message 0x38).
+    PROP_LV_LENS_DRIVE_REMOTE
 };
 
 // anything not listed above will allow reads but not writes
