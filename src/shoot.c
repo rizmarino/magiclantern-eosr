@@ -2012,6 +2012,16 @@ wb_custom_gain_toggle( void * priv, int delta )
     lens_set_custom_wb_gains(lens_info.WBGain_R + deltaR, lens_info.WBGain_G + deltaG, lens_info.WBGain_B + deltaB);
 }
 
+#ifdef CONFIG_R
+/* v4.37: on the R the first Auto adjust (v4.36) ran to 2500 K on a grey card in ~5000 K light: the spot's B - R had
+ * the opposite sign to what the search expects (LV chroma order/sign on the R not verified). The run now measures
+ * B - R at 3000 K and 8000 K first (higher K = warmer image = smaller B - R) and flips the sign if the camera says
+ * otherwise; every step is logged to ML/LOGS/AWB.TXT. */
+static int kel_sign = 1;
+static char *kel_log; static int kel_len;
+#define KEL_LOG(...) do { if (kel_log && kel_len < 3800) kel_len += snprintf(kel_log + kel_len, 4096 - kel_len, __VA_ARGS__); } while (0)
+#endif
+
 static int crit_kelvin(int k)
 {
     if (!lv) return 0;
@@ -2030,7 +2040,12 @@ static int crit_kelvin(int k)
     
     NotifyBox(5000, "Adjusting white balance...");
 
+    #ifdef CONFIG_R
+    KEL_LOG("K %d: Y %d U %d V %d -> R %d G %d B %d, B-R %d\n", k > 0 ? k * KELVIN_STEP : (int)lens_info.kelvin, Y, U, V, R, G, B, B - R);
+    return kel_sign * (B - R);
+    #else
     return B - R;
+    #endif
 }
 
 static int crit_wbs_gm(int k)
@@ -2058,6 +2073,35 @@ static void kelvin_auto_run()
     if (EXT_MONITOR_RCA) { NotifyBox(2000, "Not working on SD monitors."); return; }
     
     gui_stop_menu();
+    #ifdef CONFIG_R
+    {
+        int k0 = lens_info.wb_mode == WB_KELVIN ? (int)lens_info.kelvin : 0;
+        kel_log = malloc(4096); kel_len = 0;
+        KEL_LOG("Auto adjust Kelvin: start mode %d, %d K\n", lens_info.wb_mode, lens_info.kelvin);
+        kel_sign = 1;
+        int c_lo = crit_kelvin(3000 / KELVIN_STEP), c_hi = crit_kelvin(8000 / KELVIN_STEP);
+        int res = 0;
+        if (ABS(c_lo - c_hi) < 4)
+        {
+            KEL_LOG("no colour response (%d vs %d): stopped\n", c_lo, c_hi);
+            NotifyBox(4000, "Auto Kelvin: no colour change seen (too dark?)");
+            if (k0) lens_set_kelvin(k0);
+        }
+        else
+        {
+            kel_sign = c_lo > c_hi ? 1 : -1;
+            KEL_LOG("B-R at 3000 K %d, at 8000 K %d -> sign %d\n", c_lo, c_hi, kel_sign);
+            res = bin_search(KELVIN_MIN / KELVIN_STEP, KELVIN_MAX / KELVIN_STEP + 1, crit_kelvin) * KELVIN_STEP;
+            lens_set_kelvin(res);
+            KEL_LOG("result %d K\n", res);
+            NotifyBox(3000, "White balance: %d K", res);
+        }
+        FILE *f = FIO_CreateFile("ML/LOGS/AWB.TXT");
+        if (f) { FIO_WriteFile(f, kel_log, kel_len); FIO_CloseFile(f); }
+        free(kel_log); kel_log = 0;
+        return;
+    }
+    #endif
     int c0 = crit_kelvin(-1); // test current kelvin
     int i;
     if (c0 > 0) i = bin_search(lens_info.kelvin/KELVIN_STEP, KELVIN_MAX/KELVIN_STEP + 1, crit_kelvin);
