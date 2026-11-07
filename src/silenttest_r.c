@@ -72,11 +72,12 @@ static const uint32_t st_props[] = {
     PROP_SILENT_SHUTTER, PROP_DRIVE, PROP_LAST_JOB_STATE, PROP_RELEASE_COUNTER,
     PROP_MECHA_COUNTER, PROP_FILE_NUMBER_A, PROP_SHOOTING_MODE, PROP_SHUTTER, PROP_BURST_COUNT,
     PROP_LV_MOVIE_SELECT, PROP_SHOOTING_TYPE, PROP_VIDEO_MODE,
+    PROP_WB_MODE_LV, PROP_WB_KELVIN_LV, PROP_WB_MODE_PH, PROP_WB_KELVIN_PH, PROP_WBS_GM, PROP_WBS_BA,   /* v4.35: WB format */
 };
 static const char *st_pname[] = { "SILENT", "DRIVE", "JOB", "RELCNT", "MECHA", "FILENO", "MODE", "TV", "BURST",
-                                  "MVSEL", "STYPE", "VMODE" };
+                                  "MVSEL", "STYPE", "VMODE", "WBM_LV", "WBK_LV", "WBM_PH", "WBK_PH", "WBS_GM", "WBS_BA" };
 enum { P_SILENT = 0, P_DRIVE, P_JOB, P_RELCNT, P_MECHA, P_FILENO, P_MODE, P_TV, P_BURST,
-       P_MVSEL, P_STYPE, P_VMODE, P_N };
+       P_MVSEL, P_STYPE, P_VMODE, P_WBM_LV, P_WBK_LV, P_WBM_PH, P_WBK_PH, P_WBS_GM, P_WBS_BA, P_N };
 
 static volatile uint32_t st_cur[P_N];   /* latest value (first word), kept even when not armed */
 static volatile uint16_t st_cur_len[P_N];
@@ -151,6 +152,13 @@ REGISTER_PROP_HANDLER(PROP_BURST_COUNT,     st_prop);     /* v1.9: free shots in
 REGISTER_PROP_HANDLER(PROP_LV_MOVIE_SELECT, st_prop);
 REGISTER_PROP_HANDLER(PROP_SHOOTING_TYPE,   st_prop);
 REGISTER_PROP_HANDLER(PROP_VIDEO_MODE,      st_prop);
+/* v4.35: white balance (Kelvin, batch D): record id, length and the raw words while Canon's WB menu is changed */
+REGISTER_PROP_HANDLER(PROP_WB_MODE_LV,      st_prop);
+REGISTER_PROP_HANDLER(PROP_WB_KELVIN_LV,    st_prop);
+REGISTER_PROP_HANDLER(PROP_WB_MODE_PH,      st_prop);
+REGISTER_PROP_HANDLER(PROP_WB_KELVIN_PH,    st_prop);
+REGISTER_PROP_HANDLER(PROP_WBS_GM,          st_prop);
+REGISTER_PROP_HANDLER(PROP_WBS_BA,          st_prop);
 #endif
 
 /* ---- Canon capture-control struct, sampled by the run task ---- */
@@ -267,7 +275,7 @@ static const char *st_note_name(uint32_t id)
     }
 }
 
-static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO || k == P_BURST; }   /* counters in decimal */
+static int st_dec(int k) { return k == P_RELCNT || k == P_MECHA || k == P_FILENO || k == P_BURST || k >= P_WBM_LV; }   /* counters in decimal */
 
 static void st_dump_state(const char *tag)
 {
@@ -1133,7 +1141,7 @@ static struct menu_entry st_menu[] = {
                 .name   = "Prop watch",
                 .select = st_watch_select,
                 .update = st_update,
-                .help   = "Logs silent/drive/job properties while you change Canon menus.",
+                .help   = "Logs silent/drive/job/white-balance properties while you change Canon menus.",
                 .help2  = "SET, close menu, toggle Silent shutter + Drive, wait for DONE.",
             },
             {
