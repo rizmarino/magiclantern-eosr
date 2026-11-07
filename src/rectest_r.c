@@ -2816,6 +2816,12 @@ static void rt_task(void *unused)
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
         c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
+        /* v4.34: the split froze the camera twice at 12-bit 29.97p (sensor writes ~424 MB/s into MEM1) and never at
+         * 10-bit 29.97p (~353) or 12-bit 23.98p (~339): with both copy engines on top, Canon's LV pipeline likely
+         * starves. Above 390 MB/s of sensor data the copy-out stays on HPCopy alone. */
+        uint32_t s_per = sv_irq_med ? sv_irq_med : sv_est, s_mbs = s_per ? (uint32_t)((uint64_t)pitch * m1_h / s_per) : 999;
+        if (c_xsplit && s_mbs > 390) { c_xsplit = 0; rt_printf("v4.34 copy-out: HPCopy only, sensor writes %d MB/s (> 390: the split froze 12-bit 29.97p)\n", s_mbs); }
+        else if (c_crxd == 1) rt_printf("v4.34 sensor writes %d MB/s\n", s_mbs);
         if (c_xsplit) rt_printf("v4.31 copy-out split HPCopy + EDMAC, EDMAC share starts at %d/64\n", xe_f64);
         else if (c_crxd == 1) rt_printf("v4.32 copy-out: HPCopy only (menu)\n");
         x_bc = 0;                                                         /* v4.32 */
@@ -3871,7 +3877,7 @@ static struct menu_entry rr_menu[] = {
                 .max     = 1,
                 .choices = CHOICES("HPCopy", "HPCopy+EDMAC"),
                 .help    = "Direct source: HPCopy+EDMAC copies each compressed frame on two engines (faster, v4.31).",
-                .help2   = "HPCopy: one engine, as v4.30. Copy and Direct+verify always use HPCopy.",
+                .help2   = "HPCopy: one engine. 12-bit 29.97p always uses HPCopy (the split froze it).",
             },
             {
                 .name    = "Pre-record",
