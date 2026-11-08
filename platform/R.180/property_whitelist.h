@@ -72,7 +72,10 @@ const uint32_t prop_write_allow[] =
     // LV lens focus step (v4.39): Canon's own FUN_e034ff36 writes this property with 1/2/3 (near) and
     // 0x8001/2/3 (far), 4 bytes - ML's lens_focus() encoding. Master FUN_e036033c forwards it to the LV AF task
     // (Tvaf DAFDeliverer message 0x38).
-    PROP_LV_LENS_DRIVE_REMOTE
+    PROP_LV_LENS_DRIVE_REMOTE,
+    // sound effect (v4.41 beeps): Canon writes the effect id here itself (control-ring click 0x0E, print error 0x14);
+    // ACTRL plays it. 4 bytes, ids 1..0x25. beep.c never writes it while a recorder runs.
+    PROP_BUZZER
 };
 
 // anything not listed above will allow reads but not writes

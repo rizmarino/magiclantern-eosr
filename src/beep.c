@@ -1154,6 +1154,91 @@ void WAV_StopRecord()
     #endif
 }
 
+#elif defined(CONFIG_R)
+
+/* riz v4.41: beeps on the R through Canon's own sound effects. ML's ASIF tone generator above writes DIGIC 4/5
+ * audio registers, so it is not built here. Canon plays a sound effect when PROP_BUZZER (0x80020006) is written
+ * with its id (ACTRL "PROP_BUZZER ID %d"; Canon's own control-ring click writes 0x0E). Ids 1..0x25, table at
+ * 0xE0B44EC0: see ghidra/notes/lv-survey.md, Beeps. Never while a recorder runs: ACTRL asserts if a movie
+ * starts while a beep plays. */
+extern int rawrec_running(void);
+CONFIG_INT("beep.enabled", beep_enabled, 1);
+static CONFIG_INT("beep.r.id", beep_id, 0x1A);     /* single 32 ms tone (hypothesis until heard) */
+static CONFIG_INT("beep.r.long", beep_long_id, 0x14);
+static int beep_try_id = 0x1A;                     /* Audio > Beeps > Try sound id: not saved */
+static int beep_count;                             /* diagnostics: sounds requested / skipped */
+static int beep_skipped;
+static struct semaphore * beep_sem;
+static volatile int beep_req_id, beep_req_times;
+
+static int is_safe_to_beep() { return beep_enabled && !RECORDING && !rawrec_running(); }
+
+static void beep_request(int id, int times)
+{
+    if (!is_safe_to_beep() || beep_playing || !beep_sem) { beep_skipped++; info_led_blink(MAX(times, 1), 50, 50); return; }
+    beep_req_id = id; beep_req_times = COERCE(times, 1, 10); beep_playing = 1;
+    give_semaphore(beep_sem);
+}
+
+static void beep_task()
+{
+    beep_sem = create_named_semaphore("beep_sem", 0);
+    TASK_LOOP
+    {
+        if (take_semaphore(beep_sem, 500)) continue;
+        for (int i = 0; i < beep_req_times && !RECORDING && !rawrec_running(); i++)
+        {
+            int id = beep_req_id;
+            prop_request_change(PROP_BUZZER, &id, 4);
+            beep_count++;
+            msleep(i + 1 < beep_req_times ? 250 : 100);
+        }
+        beep_playing = 0;
+    }
+}
+TASK_CREATE("beep_task", beep_task, 0, 0x1c, 0x1000);
+
+void unsafe_beep() { beep_request(beep_id, 1); }
+void beep() { beep_request(beep_id, 1); }
+void Beep() { beep(); }
+void beep_times(int times) { beep_request(beep_id, times); }
+void beep_custom(int duration, int frequency, int wait)   /* Canon's tones are fixed: pick short or long */
+{
+    beep_request(duration >= 200 ? beep_long_id : beep_id, 1);
+    if (wait) { msleep(50); while (beep_playing) msleep(20); }
+}
+void WAV_StartRecord(char* filename) {}
+void WAV_StopRecord() {}
+
+static MENU_UPDATE_FUNC(beep_r_update)
+{
+    if (beep_enabled) MENU_SET_VALUE("ON, %d played, %d skipped", beep_count, beep_skipped);
+}
+static MENU_SELECT_FUNC(beep_r_play) { beep_request(*(int *)priv, priv == &beep_try_id ? 1 : 3); }
+
+static struct menu_entry beep_r_menus[] = {
+    {
+        .name = "Beeps", .priv = &beep_enabled, .max = 1, .update = beep_r_update,
+        .help = "ML beeps (intervalometer, trap focus, Lua beep) via Canon's sound effects.",
+        .help2 = "Never while recording. PLAY: sound choice and tests.",
+        .children = (struct menu_entry[]) {
+            { .name = "Beep sound", .priv = &beep_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
+              .help = "Canon sound effect id for a normal ML beep." },
+            { .name = "Long beep sound", .priv = &beep_long_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
+              .help = "Sound for long beeps (Lua beep with a long duration)." },
+            { .name = "Test: beep x3", .priv = &beep_id, .select = beep_r_play, .icon_type = IT_ACTION,
+              .help = "Plays the Beep sound 3 times." },
+            { .name = "Try sound id", .priv = &beep_try_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
+              .help = "Pick an id with LEFT/RIGHT, then use Play below." },
+            { .name = "Play tried id", .priv = &beep_try_id, .select = beep_r_play, .icon_type = IT_ACTION,
+              .help = "Plays the Try sound id once." },
+            MENU_EOL
+        },
+    },
+};
+static void beep_r_init() { menu_add("Audio", beep_r_menus, COUNT(beep_r_menus)); }
+INIT_FUNC("beep_r", beep_r_init);
+
 #else // beep not working, keep dummy stubs
 
 void unsafe_beep(){}

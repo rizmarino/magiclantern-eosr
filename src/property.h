@@ -173,6 +173,7 @@
 #define PROP_DEFAULT_CFN        0x80020004
 #define PROP_DEFALT_AF_SHIFT    0x80020005
 #define PROP_DEFAULT_LV_MANIP   0x80020006
+#define PROP_BUZZER             0x80020006 // R: Canon sound effect id, 4 bytes (ACTRL "PROP_BUZZER ID %d")
 #define PROP_DISPSENSOR_CTRL    0x80020010      // 1 == show results?
 #define PROP_LV_OUTPUT_DEVICE   0x80050011      // 1 == LCD?
 #define PROP_HOUTPUT_TYPE       0x80030030      // 0 = no info displayed in LV, 1 = info displayed (this is toggled with DISP)

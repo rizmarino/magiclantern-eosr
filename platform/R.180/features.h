@@ -79,7 +79,11 @@
 // riz v4.39/4.40 (batch D): Focus End Point + Rack Focus drive the lens with PROP_LV_LENS_DRIVE_REMOTE (R firmware
 // uses the same encoding: FUN_e034ff36; the lens moves, camera 2026-11-08). Follow Focus is off: in LV with the menu
 // closed the R delivers the arrow keys to ML only as event 0x85 (Canon moves the AF point), never as LEFT/RIGHT.
-#define FEATURE_RACK_FOCUS
+// v4.40 camera 2026-11-08: Focus End Point can't be set as built. menu_enable_lv_transparent_mode() is a no-op on
+// the R (menu.c, the menu sits on Canon's 0x68 dialog), so PLAY never hides the menu and the hidden-menu
+// dial/arrow focus overrides in handle_rack_focus_menu_overrides() never run. The top dial changed shutter speed.
+// riz v4.41: dropped on the R for now (riz 2026-11-08). lens_focus() stays open-loop for Lua lens.focus.
+//#define FEATURE_RACK_FOCUS
 // Shoot > Motion detect and Focus > Trap focus (LV, MF, hold half-press): on the R both read a sampled
 // grid of the LV luma (r_spot_luma in zebra.c), fire through take_a_pic (remote-release path).
 #define FEATURE_MOTION_DETECT
