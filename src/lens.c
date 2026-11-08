@@ -836,6 +836,41 @@ lens_focus(
     int focus_cmd = stepsize;
     if (stepsize < 0) focus_cmd = 0x8000 - stepsize;
     
+#ifdef CONFIG_R
+    /* riz v4.40: the R never confirms a step (v4.39 Prop watch: no PROP_LV_FOCUS_DONE, no ack of the drive
+     * property, so every waited step timed out after ~1.5 s and returned failure, and open-loop steps stopped after 2
+     * because only FOCUS_DONE resets lv_focus_requests). The lens did move (foctest: focus_pos 6 -> 14 -> 6). Here
+     * each step is sent, then (wait) we watch lens_info.focus_pos until it has been still for 60 ms after moving, or
+     * 150 ms if it never moved (step 1 is often below the position resolution), at most 400 ms; open loop just
+     * spaces the commands >= 80 ms apart. */
+    for (int i = 0; i < num_steps; i++)
+    {
+        if (!lv || mirror_down || lens_info.job_state || is_manual_focus()) { lv_focus_error = 1; break; }
+        int last = lens_info.focus_pos, moved = 0, still = 0;
+        info_led_on();
+        prop_request_change(PROP_LV_LENS_DRIVE_REMOTE, &focus_cmd, 4);
+        if (wait)
+        {
+            msleep(40);
+            for (int t = 40; t < 400; t += 20)
+            {
+                int p = lens_info.focus_pos;
+                if (p != last) { moved = 1; still = 0; last = p; }
+                else if (++still >= 3 && (moved || t >= 150)) break;
+                msleep(20);
+            }
+            if (extra_delay) msleep(extra_delay);
+        }
+        else msleep(MAX(80, extra_delay));
+        info_led_off();
+    }
+    lv_focus_done = 1;
+    #ifdef FEATURE_MAGIC_ZOOM
+    if (get_zoom_overlay_trigger_by_focus_ring()) zoom_overlay_set_countdown(300);
+    #endif
+    return lv_focus_error ? 0 : 1;
+#endif
+
     for (int i = 0; i < num_steps; i++)
     {
         if (lv && !mirror_down && lens_info.job_state == 0)

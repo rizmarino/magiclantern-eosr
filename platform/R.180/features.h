@@ -76,9 +76,9 @@
 // riz v4.36 (batch D): Expo > White Balance - Kelvin + Auto adjust Kelvin (WB mode/Kelvin props verified on the R
 // with Prop watch v4.35 and whitelisted; WB shift / custom gains hidden, see shoot.c)
 #define FEATURE_WHITE_BALANCE
-// riz v4.39 (batch D, NOT camera-tested): Focus > Follow Focus (arrow keys), Focus End Point + Rack Focus. All drive
-// the lens with PROP_LV_LENS_DRIVE_REMOTE (R firmware uses the same encoding: FUN_e034ff36).
-#define FEATURE_FOLLOW_FOCUS
+// riz v4.39/4.40 (batch D): Focus End Point + Rack Focus drive the lens with PROP_LV_LENS_DRIVE_REMOTE (R firmware
+// uses the same encoding: FUN_e034ff36; the lens moves, camera 2026-11-08). Follow Focus is off: in LV with the menu
+// closed the R delivers the arrow keys to ML only as event 0x85 (Canon moves the AF point), never as LEFT/RIGHT.
 #define FEATURE_RACK_FOCUS
 // Shoot > Motion detect and Focus > Trap focus (LV, MF, hold half-press): on the R both read a sampled
 // grid of the LV luma (r_spot_luma in zebra.c), fire through take_a_pic (remote-release path).
