@@ -1180,18 +1180,67 @@ static void beep_request(int id, int times)
     give_semaphore(beep_sem);
 }
 
+/* v4.43 diagnostics (v4.42 camera: still no sound, no ASSERT): ML/LOGS/BEEP.TXT gets a line before and after each
+ * request (a hang shows as a "start" with no "done"); Method picks the trigger path; Canon log captures Canon's
+ * debug messages around the first sound of a boot (dumpf: LOGnnn.LOG on the card root). Both reset at power-on. */
+extern void dm_set_store_level(uint32_t class, uint32_t level);   /* stubs.S, DbgMgr */
+static int beep_method;        /* 0 property, 1 ACTRL event (FUN_e024eab8), 2 AudioBeep direct (FUN_e0294e76) */
+static int beep_dmlog;         /* 1: capture Canon's log around the next sound (once per boot) */
+static int beep_dmlog_done;
+static int beep_last_ret = -1, beep_last_ms;
+static const uint8_t beep_lv_classes[] = { 0x8C, 0x9E, 0x9C, 0xC9, 0x93, 0xCA, 0x9D, 0xB7, 0x92 };
+
+static void beep_log(const char *fmt, int a, int b, int c, int d)
+{
+    char line[100];
+    snprintf(line, sizeof(line), fmt, a, b, c, d);
+    FILE *f = FIO_CreateFileOrAppend("ML/LOGS/BEEP.TXT");
+    if (f) { FIO_WriteFile(f, line, strlen(line)); FIO_CloseFile(f); }
+}
+
+static int beep_send(int id)
+{
+    switch (beep_method)
+    {
+        case 1: ((void (*)(int))0xE024EAB9)(id); return 0;        /* post EV_ACTRL_BUZZER, as Test_SE mode 1 */
+        case 2: return ((int (*)(int))0xE0294E77)(id);            /* AudioBeep play, as Test_SE mode 2 */
+        default: prop_request_change(PROP_BUZZER, &id, 4); return 0;
+    }
+}
+
 static void beep_task()
 {
     beep_sem = create_named_semaphore("beep_sem", 0);
     TASK_LOOP
     {
         if (take_semaphore(beep_sem, 500)) continue;
+        int dm = beep_dmlog && !beep_dmlog_done;
+        if (dm)
+        {
+            dm_set_store_level(0xFF, 0);                          /* store every class ... */
+            for (int i = 0; i < COUNT(beep_lv_classes); i++)
+                dm_set_store_level(beep_lv_classes[i], 15);       /* ... except the busy LV ones */
+            DryosDebugMsg(0, 15, "=== riz beep: id %x method %d", beep_req_id, beep_method);
+        }
         for (int i = 0; i < beep_req_times && !RECORDING && !rawrec_running(); i++)
         {
-            int id = beep_req_id;
-            prop_request_change(PROP_BUZZER, &id, 4);
+            int id = beep_req_id, t0 = get_ms_clock();
+            beep_log("t=%d id=%x method=%d n=%d start\n", t0, id, beep_method, beep_count);
+            beep_last_ret = beep_send(id);
+            beep_last_ms = get_ms_clock() - t0;
+            beep_log("t=%d id=%x done in %d ms, ret %d\n", get_ms_clock(), id, beep_last_ms, beep_last_ret);
             beep_count++;
             msleep(i + 1 < beep_req_times ? 250 : 100);
+        }
+        if (dm)
+        {
+            msleep(1500);
+            DryosDebugMsg(0, 15, "=== riz beep: freeze");
+            dm_set_store_level(0xFF, 15);                         /* freeze the buffer */
+            msleep(200);
+            call("dumpf");
+            beep_dmlog_done = 1;
+            beep_log("t=%d Canon log dumped (LOGnnn.LOG)\n", get_ms_clock(), 0, 0, 0);
         }
         beep_playing = 0;
     }
@@ -1212,7 +1261,8 @@ void WAV_StopRecord() {}
 
 static MENU_UPDATE_FUNC(beep_r_update)
 {
-    if (beep_enabled) MENU_SET_VALUE("ON, %d played, %d skipped", beep_count, beep_skipped);
+    if (beep_enabled) MENU_SET_VALUE("ON, %d sent, %d skipped%s", beep_count, beep_skipped, beep_playing ? ", BUSY" : "");
+    if (beep_last_ret >= 0 || beep_count) MENU_SET_RINFO("ret %d, %d ms", beep_last_ret, beep_last_ms);
 }
 static MENU_SELECT_FUNC(beep_r_play) { beep_request(*(int *)priv, priv == &beep_try_id ? 1 : 3); }
 
@@ -1232,6 +1282,12 @@ static struct menu_entry beep_r_menus[] = {
               .help = "Pick an id with LEFT/RIGHT, then use Play below." },
             { .name = "Play tried id", .priv = &beep_try_id, .select = beep_r_play, .icon_type = IT_ACTION,
               .help = "Plays the Try sound id once." },
+            { .name = "Method", .priv = &beep_method, .max = 2,
+              .choices = (const char *[]) {"Property", "ACTRL event", "AudioBeep"},
+              .help = "Diagnostic: how ML asks Canon for the sound. Resets to Property at power-on." },
+            { .name = "Canon log (1st sound)", .priv = &beep_dmlog, .max = 1,
+              .help = "Diagnostic: save Canon's log around the next sound (once per boot, LOGnnn.LOG).",
+              .help2 = "Resets to OFF at power-on." },
             MENU_EOL
         },
     },
