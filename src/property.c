@@ -377,6 +377,13 @@ void prop_request_change(unsigned property, const void* addr, size_t len)
     if (property == PROP_BATTERY_REPORT && len == 1)
         goto ok; // exception: this call is correct for polling battery level
 
+    #ifdef CONFIG_R
+    /* riz v4.42: PROP_BUZZER is a request-only sound-effect trigger; ML registers no handler for it, so it has
+     * no known length (v4.41 camera: ASSERT "PROP_LEN(80020006) correct:0 called:4"). Canon writes it with 4. */
+    if (property == PROP_BUZZER && len == 4)
+        goto ok;
+    #endif
+
     #ifndef CONFIG_5DC
     if (property == PROP_REMOTE_SW1 || property == PROP_REMOTE_SW2)
         ASSERT(len <= 4); // some cameras have len=2, others 4; we pass a single integer as param, so max len is 4
