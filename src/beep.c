@@ -1264,7 +1264,14 @@ static MENU_UPDATE_FUNC(beep_r_update)
     if (beep_enabled) MENU_SET_VALUE("ON, %d sent, %d skipped%s", beep_count, beep_skipped, beep_playing ? ", BUSY" : "");
     if (beep_last_ret >= 0 || beep_count) MENU_SET_RINFO("ret %d, %d ms", beep_last_ret, beep_last_ms);
 }
-static MENU_SELECT_FUNC(beep_r_play) { beep_request(*(int *)priv, priv == &beep_try_id ? 1 : 3); }
+static MENU_SELECT_FUNC(beep_r_play)     /* v4.44: on-screen confirmation, the sound itself may be silent */
+{
+    static const char *names[] = { "Property", "ACTRL event", "AudioBeep" };
+    int before = beep_skipped;
+    beep_request(*(int *)priv, priv == &beep_try_id ? 1 : 3);
+    if (beep_skipped != before) NotifyBox(3000, "Beep skipped (busy, recording or Beeps OFF)");
+    else NotifyBox(3000, "Beep sent: id %x, %s%s", *(int *)priv, names[beep_method], beep_dmlog && !beep_dmlog_done ? ", Canon log on" : "");
+}
 
 static struct menu_entry beep_r_menus[] = {
     {
@@ -1272,6 +1279,12 @@ static struct menu_entry beep_r_menus[] = {
         .help = "ML beeps (intervalometer, trap focus, Lua beep) via Canon's sound effects.",
         .help2 = "Never while recording. PLAY: sound choice and tests.",
         .children = (struct menu_entry[]) {
+            { .name = "Method", .priv = &beep_method, .max = 2,
+              .choices = (const char *[]) {"Property", "ACTRL event", "AudioBeep"},
+              .help = "Diagnostic: how ML asks Canon for the sound. Resets to Property at power-on." },
+            { .name = "Canon log (1st sound)", .priv = &beep_dmlog, .max = 1,
+              .help = "Diagnostic: save Canon's log around the next sound (once per boot, LOGnnn.LOG).",
+              .help2 = "Resets to OFF at power-on." },
             { .name = "Beep sound", .priv = &beep_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
               .help = "Canon sound effect id for a normal ML beep." },
             { .name = "Long beep sound", .priv = &beep_long_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
@@ -1282,12 +1295,6 @@ static struct menu_entry beep_r_menus[] = {
               .help = "Pick an id with LEFT/RIGHT, then use Play below." },
             { .name = "Play tried id", .priv = &beep_try_id, .select = beep_r_play, .icon_type = IT_ACTION,
               .help = "Plays the Try sound id once." },
-            { .name = "Method", .priv = &beep_method, .max = 2,
-              .choices = (const char *[]) {"Property", "ACTRL event", "AudioBeep"},
-              .help = "Diagnostic: how ML asks Canon for the sound. Resets to Property at power-on." },
-            { .name = "Canon log (1st sound)", .priv = &beep_dmlog, .max = 1,
-              .help = "Diagnostic: save Canon's log around the next sound (once per boot, LOGnnn.LOG).",
-              .help2 = "Resets to OFF at power-on." },
             MENU_EOL
         },
     },
