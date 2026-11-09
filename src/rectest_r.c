@@ -118,7 +118,7 @@ static const uint16_t rt_crop_wh[][2] = { { 1920, 1080 }, { 1920, 960 }, { 1920,
  * turns the clip into a standard uncompressed MLV. No audio and no pre-record with it yet. */
 static CONFIG_INT("r.rawrec.crx", rr_crx, 0);
 static CONFIG_INT("r.rawrec.crxsrc", rr_crx_src, 0);
-static CONFIG_INT("r.rawrec.xsplit", rr_xsplit, 1);   /* v4.32: Direct copy-out on HPCopy + EDMAC (v4.31) or HPCopy only */    /* v4.28: 0 copy, 1 direct, 2 direct + RAWC verify frames */
+static CONFIG_INT("r.rawrec.xsplit", rr_xsplit, 1);   /* v4.32: Direct copy-out on HPCopy + EDMAC (v4.31) or HPCopy only; v4.48: 2 = pipelined */    /* v4.28: 0 copy, 1 direct, 2 direct + RAWC verify frames */
 #define RT_CROP_FULL 3
 static const int rt_dur_s[] = { 10, 20, 40 };
 static const char *rt_sync_name[] = { "auto", "IRQ", "timer" };
@@ -1413,6 +1413,7 @@ extern int crx_rec_start(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, ui
 extern uint32_t *crx_rec_wait(uint32_t *us);
 extern int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es);
 extern uint32_t crx_rec_free(uint32_t *hd);
+extern uint32_t crx_rec_free_q(uint32_t *hd);   /* v4.48 */
 extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
 extern int crx_rec_copy_n(int n, const uint32_t *dst, const uint32_t *src, const uint32_t *len, int maxpar);   /* v4.30 */
 extern int crx_rec_hpc_channels(void);
@@ -1440,6 +1441,15 @@ static volatile int xe_n, xe_err, xe_quit, xe_alive;
 static uint32_t xe_d[XE_MAX], xe_s[XE_MAX], xe_r[XE_MAX];
 static volatile uint32_t xe_us;
 static int c_xsplit, xe_f64, x_split_ok = 1;   /* x_split_ok: host harness A/B switch (RR_XSPLIT=0) */
+/* v4.48 pipelined copy-out (Lossless copy-out = Pipelined, Direct source): frame N's output stays held while frame
+ * N+1 encodes, and N is HPCopied out meanwhile, so a frame costs max(encode, copy) instead of their sum (12-bit 4K
+ * 29.97p: ~12 + ~13 ms > 33.4 ms with overhead). algsmgr's output buffers are a ring (algsmgrEncSetBuffer
+ * e02f4a02): a second encode gets the next addresses. Rules kept from the CRX tests: no StartEncode while a free is
+ * being processed (each free waits for its callback first), and no free while an encode runs (N-1 is freed right
+ * after N finished, before N+1 may start). The free during a clip never empties the list, so Canon's encoder buffer
+ * resource stays allocated (no per-frame release/re-request). No EDMAC split with it. */
+static int c_xpipe, x_pipe_ok = 1;             /* x_pipe_ok: harness switch */
+static uint32_t x_pipe_frees, x_pipe_fmax, x_pipe_addr_moves, x_pipe_a0;
 static uint32_t xe_fail, xe_frames, xe_sum_e, xe_sum_h;
 static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us);
 static void rt_fail(void);
@@ -1606,19 +1616,26 @@ static void rt_x_renum(uint32_t base, uint32_t len)
 
 /* one encoded frame (handle hd, VIDF fields in v) into the staging buffers, then free it. 0 = ok, else w_err code.
  * Hands a full staging buffer to the writer and waits for the next one to be free. (v4.28: from rt_crx_task) */
-static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uint32_t *ppos, uint32_t *pnfr)
-{
+static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uint32_t *ppos, uint32_t *pnfr, int keep)
+{   /* keep (v4.48): the caller frees hd later, also on errors */
     uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0;
-    if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { crx_rec_free(hd); return -11; }
+    if (crx_rec_parts(hd, &ha, &hs, &n, &ea, &es) || hs > 128) { if (!keep) crx_rec_free(hd); return -11; }
     if (x_bc < XB_N)                            /* v4.32 */
     {
         char eb[300]; int el = 0;
         for (uint32_t i = 0; i < n && i < 17 && el < 280; i++) if (es[i]) el += snprintf(eb + el, sizeof(eb) - el, " %x+%d", ea[i], es[i]);
         rt_bc("t=%d frame %d: encoded in %d us; header %x+%d; %d entries:%s\n", get_ms_clock(), x_bc, us, ha, hs, n, eb);
     }
+    if (keep)                                   /* v4.48: first chunk's address moving = algsmgr's ring in use */
+    {
+        uint32_t a1 = 0;
+        for (uint32_t i = 1; i < n && !a1; i++) if (es[i]) a1 = ea[i];
+        if (x_pipe_a0 && a1 != x_pipe_a0) x_pipe_addr_moves++;
+        x_pipe_a0 = a1;
+    }
     uint32_t need = 64 + 192 + AL64(hs);
     for (uint32_t i = 0; i < n; i++) need += AL64(es[i]);
-    if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; crx_rec_free(hd); return -12; }
+    if (need + 4096 + 16 > RT_XSB_BYTES) { x_big++; if (!keep) crx_rec_free(hd); return -12; }
     if (*ppos + need + 4096 + 16 > RT_XSB_BYTES)   /* this staging buffer is full: hand it to the writer */
     {
         rt_x_close(*psi, *ppos, *pnfr);
@@ -1635,7 +1652,7 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
             take_semaphore(rt_xsem, 50);
         }
         x_wait_ms += get_ms_clock() - tw;
-        if (w_err) { crx_rec_free(hd); return w_err; }
+        if (w_err) { if (!keep) crx_rec_free(hd); return w_err; }
     }
     uint32_t b = xsb[*psi].base + *ppos;
     struct rt_vidf v = *pv;
@@ -1696,9 +1713,9 @@ static int rt_x_put(uint32_t *hd, uint32_t us, struct rt_vidf *pv, int *psi, uin
     if (x_bc < XB_N) { rt_bc("t=%d frame %d: copied (r %d, %d us, EDMAC jobs %d, split %d, fail %d)\n", get_ms_clock(), x_bc, r, tc, c_xsplit ? xe_n : 0, c_xsplit, xe_fail); x_bc++; }
     if (!x_frames && !r) memcpy(x_hdr0, (void *)(b + 64 + 192), 16);   /* CMP1 start (staging copy), logged at the end */
     x_stage = 5;
-    uint32_t fu = crx_rec_free(hd);
+    uint32_t fu = keep ? 0 : crx_rec_free(hd);
     x_stage = 1;
-    x_last_cp = tc; x_last_fr = fu;             /* v4.29 per-frame log */
+    x_last_cp = tc; if (!keep) x_last_fr = fu;  /* v4.29 per-frame log (v4.48 pipelined: set by the delayed free) */
     if (r) return -13;
     *ppos += need; (*pnfr)++;
     x_kb += need >> 10;                         /* v4.26: status line rate */
@@ -1713,6 +1730,7 @@ static void rt_crx_task(void *unused)
 {
     int ri = 0, si = 0;
     uint32_t pos = 0, nfr = 0;
+    uint32_t *held = 0;                         /* v4.48 pipelined: previous frame, copied, not freed yet */
     while (c_crxd)                              /* v4.28 direct source: the capture task started the encode */
     {
         if (w_err) break;
@@ -1726,25 +1744,61 @@ static void rt_crx_task(void *unused)
         uint32_t us = 0;
         uint32_t *hd = crx_rec_wait(&us);
         if (!hd) { w_err = -10; break; }        /* x_dstate stays 1: no more encodes start */
+        if (held)                               /* v4.48: no encode runs now (this one is done, the next not started) */
+        {
+            x_stage = 6;
+            uint32_t fu = crx_rec_free_q(held);
+            held = 0; x_pipe_frees++; x_last_fr = fu;
+            if (fu > x_pipe_fmax) x_pipe_fmax = fu;
+            if (fu > x_free_max) x_free_max = fu;
+            if (fu >= 500000) { held = hd; w_err = -15; break; }   /* free callback never came: stop the clip */
+        }
         struct rt_vidf v;
         memset(&v, 0, sizeof(v));
         memcpy(v.type, "VIDF", 4); v.ts = x_dts; v.frame = x_dfn;
         v.crop_x = c_x0 & ~7; v.crop_y = c_y0; v.pan_x = c_x0; v.pan_y = c_y0;
+        int32_t rel = x_drel;                   /* v4.48: read before the next start can change them */
+        uint32_t cmd_t = x_cmd_t;
         uint32_t w0 = x_wait_ms;
-        int e = rt_x_put(hd, us, &v, &si, &pos, &nfr);
+        if (c_xpipe)                            /* v4.48: the next frame may start encoding while this one is copied */
+        {
+            RT_DMB();
+            x_dstate = 0;
+            if (x_plan) give_semaphore(rt_fsem);
+        }
+        int e = rt_x_put(hd, us, &v, &si, &pos, &nfr, c_xpipe);
+        if (c_xpipe) held = hd;                 /* freed after the next frame's encode (also on errors) */
         if (!e && x_log && x_logn < X_LOGMAX)   /* v4.29 per-frame timing (ML/LOGS/CRXREC.TSV) */
         {
             struct x_flog *L = &x_log[x_logn++];
-            int32_t rel = x_drel;
             L->fn = v.frame; L->rel = rel == 0x7FFF ? 0x7FFF : (int16_t)(rel / 100);
             L->enc = MIN(us / 100, 65535); L->cp = MIN(x_last_cp / 100, 65535); L->fr = MIN(x_last_fr / 100, 65535);
-            L->cyc = MIN((rt_us() - x_cmd_t) / 100, 65535); L->wt = MIN((x_wait_ms - w0) * 10, 65535);
+            L->cyc = MIN((rt_us() - cmd_t) / 100, 65535); L->wt = MIN((x_wait_ms - w0) * 10, 65535);
         }
-        RT_DMB();
-        x_dstate = 0;
-        if (x_plan) give_semaphore(rt_fsem);    /* v4.29: a planned start may be waiting for the encoder */
+        if (!c_xpipe)
+        {
+            RT_DMB();
+            x_dstate = 0;
+            if (x_plan) give_semaphore(rt_fsem);    /* v4.29: a planned start may be waiting for the encoder */
+        }
         if (e) { w_err = e; break; }
     }
+    if (held)                                   /* v4.48: free in encode order; the last free releases the buffers */
+    {
+        x_stage = 7;
+        if (w_err) msleep(60);                  /* let the capture task see w_err: no start during the final free */
+        uint32_t *h2 = 0, u2 = 0;
+        int lost = w_err == -15 || w_err == -10;    /* algsmgr didn't answer a free / an encode: FreeAll cleans up */
+        if (x_dstate == 1 && !lost) h2 = crx_rec_wait(&u2);   /* an encode was started: let it finish first */
+        if (!lost)
+        {
+            if (h2) { crx_rec_free_q(held); crx_rec_free(h2); }
+            else crx_rec_free(held);
+        }
+        held = 0;
+        if (x_dstate == 1 && !h2 && !w_err) w_err = -10;
+    }
+
     for (;;)
     {
         if (c_crxd) break;
@@ -1763,7 +1817,7 @@ static void rt_crx_task(void *unused)
             if (!hd) { w_err = -10; break; }
             struct rt_vidf v;
             memcpy(&v, (void *)slot, sizeof(v));       /* frame number / timestamp / crop from the capture's VIDF */
-            int e = rt_x_put(hd, us, &v, &si, &pos, &nfr);
+            int e = rt_x_put(hd, us, &v, &si, &pos, &nfr, 0);
             if (e) { w_err = e; break; }
         }
         int used = 0;
@@ -2379,7 +2433,7 @@ static void rr_pre_go_crx(uint32_t td)
 
 static void rt_direct_tick(void)
 {
-    if (!x_plan || x_dstate) return;
+    if (!x_plan || x_dstate || w_err) return;   /* v4.48: no new start once the clip is stopping on an error */
     uint32_t now = rt_us();
     if ((int32_t)(now - x_plan_t) < 0) return;                 /* early wake-up */
     x_plan = 0;
@@ -2824,18 +2878,21 @@ static void rt_task(void *unused)
         x_lead = m1_h < 2000 ? X_LEAD_FHD_US : X_LEAD_US;   /* v4.46 */
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
-        c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
+        c_xpipe = c_crxd && x_pipe_ok && rr_xsplit == 2;   /* v4.48 */
+        x_pipe_frees = x_pipe_fmax = x_pipe_addr_moves = x_pipe_a0 = 0;
+        c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit == 1; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
         /* v4.34: the split froze the camera twice at 12-bit 29.97p (sensor writes ~424 MB/s into MEM1) and never at
          * 10-bit 29.97p (~353) or 12-bit 23.98p (~339): with both copy engines on top, Canon's LV pipeline likely
          * starves. Above 390 MB/s of sensor data the copy-out stays on HPCopy alone. */
         uint32_t s_per = sv_irq_med ? sv_irq_med : sv_est, s_mbs = s_per ? (uint32_t)((uint64_t)pitch * m1_h / s_per) : 999;
         if (c_xsplit && s_mbs > 390) { c_xsplit = 0; rt_printf("v4.34 copy-out: HPCopy only, sensor writes %d MB/s (> 390: the split froze 12-bit 29.97p)\n", s_mbs); }
         else if (c_crxd == 1) rt_printf("v4.34 sensor writes %d MB/s\n", s_mbs);
-        if (c_xsplit) rt_printf("v4.31 copy-out split HPCopy + EDMAC, EDMAC share starts at %d/64\n", xe_f64);
+        if (c_xpipe) rt_printf("v4.48 copy-out: pipelined (frame N copied on HPCopy while N+1 encodes; no EDMAC split)\n");
+        else if (c_xsplit) rt_printf("v4.31 copy-out split HPCopy + EDMAC, EDMAC share starts at %d/64\n", xe_f64);
         else if (c_crxd == 1) rt_printf("v4.32 copy-out: HPCopy only (menu)\n");
         x_bc = 0;                                                         /* v4.32 */
         FIO_RemoveFile("ML/LOGS/CRXBC.TXT");
-        rt_bc("t=%d clip start: %d-bit, source %d, split %d\n", get_ms_clock(), c_bpp, c_crxd, c_xsplit);
+        rt_bc("t=%d clip start: %d-bit, source %d, split %d, pipelined %d\n", get_ms_clock(), c_bpp, c_crxd, c_xsplit, c_xpipe);
         if (c_crxd && !x_log) x_log = fio_malloc(X_LOGMAX * sizeof(struct x_flog));
         x_go = 0; w_xs0 = 0; w_fn0_set = 0; x_trig_fn = x_trig_ts = x_written = x_kb = w_pre_cnt = 0; memset(x_hdr0, 0, sizeof(x_hdr0));
     }
@@ -3117,6 +3174,8 @@ static void rt_task(void *unused)
         if (c_crxd == 1) rt_printf("v4.31 split copy-out: %d frames, EDMAC avg %d us, HPCopy avg %d us, EDMAC share at the end %d/64, %d failures%s\n",
                                    xe_frames, xe_frames ? xe_sum_e / xe_frames : 0, xe_frames ? xe_sum_h / xe_frames : 0, xe_f64, xe_fail,
                                    xe_fail ? " (split turned off, rest of the clip HPCopy only)" : "");
+        if (c_xpipe) rt_printf("v4.48 pipelined copy-out: %d delayed frees, slowest %d us, output address moved %d times (0 = no ring use), last chunk at %x\n",
+                               x_pipe_frees, x_pipe_fmax, x_pipe_addr_moves, x_pipe_a0);
         if (c_crxd && x_log && x_logn)    /* v4.29: per-frame timing, appended per clip */
         {
             FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXREC.TSV");
@@ -3883,10 +3942,10 @@ static struct menu_entry rr_menu[] = {
             {
                 .name    = "Lossless copy-out",
                 .priv    = &rr_xsplit,
-                .max     = 1,
-                .choices = CHOICES("HPCopy", "HPCopy+EDMAC"),
-                .help    = "Direct source: HPCopy+EDMAC copies each compressed frame on two engines (faster, v4.31).",
-                .help2   = "HPCopy: one engine. 12-bit 29.97p always uses HPCopy (the split froze it).",
+                .max     = 2,
+                .choices = CHOICES("HPCopy", "HPCopy+EDMAC", "Pipelined (test)"),
+                .help    = "Direct source: HPCopy+EDMAC copies each frame on two engines (v4.31). Pipelined: one engine,",
+                .help2   = "copies frame N while N+1 encodes (v4.48, for 12-bit 29.97p). HPCopy+EDMAC is off at 12-bit 29.97p.",
             },
             {
                 .name    = "Pre-record",

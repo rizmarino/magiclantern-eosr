@@ -958,12 +958,13 @@ static MENU_UPDATE_FUNC(pl_update)
  * Same rules the tests proved (STEP1.md steps 2-3b): encode a copy, never the live MEM1; re-init the encoder for the
  * clip's size/depth (flag cleared at begin); wait for each free before the next start; HPCopy the output out (the CPU
  * can't read the chunks); hand the encoder back to Canon at the end. Errors go to ML/LOGS/CRXTEST.LOG. */
-static struct semaphore *cx_cpsem;
+static struct semaphore *cx_cpsem, *cx_frsem;
 int crx_rec_begin(void)
 {
     if (!cx_sem) cx_sem = create_named_semaphore("crx_test", 0);
     while (!take_semaphore(cx_sem, 1)) ;
     if (cx_cpsem) while (!take_semaphore(cx_cpsem, 1)) ;   /* v4.30: no stale completions */
+    if (cx_frsem) while (!take_semaphore(cx_frsem, 1)) ;   /* v4.48 */
     uint32_t m = MEM(CX_MGR);
     if (!m) return -1;
     MEM(m + 0x124) = 0;                   /* next StartEncode re-runs Canon's init with the clip's descriptor */
@@ -1004,6 +1005,19 @@ uint32_t crx_rec_free(uint32_t *hd)        /* free, wait until algsmgr has proce
     uint64_t t = get_us_clock();
     CX_FREE(hd, 0, 0);
     while (m && MEM(m + 0x108) && get_us_clock() - t < 500000) msleep(1);
+    return (uint32_t)(get_us_clock() - t);
+}
+/* v4.48 pipelined recorder: free while a newer encode is still held. FreeEncBuffer(handle, cb, ctx) e066b522 posts
+ * event 4; the handler (e02f15e6) frees handles in encode order and calls cb(ctx, 0) once this one is released. The
+ * list doesn't empty, so mgr+0x108 (buffers held from Canon's resource manager) stays up: wait for the callback
+ * instead. Returns us; >= 500000 = no callback (state unknown). */
+static void cx_free_cb(void *ctx, int unused) { give_semaphore(cx_frsem); }
+uint32_t crx_rec_free_q(uint32_t *hd)
+{
+    if (!cx_frsem) cx_frsem = create_named_semaphore("crx_fr", 0);   /* stale completions: drained in crx_rec_begin */
+    uint64_t t = get_us_clock();
+    if (CX_FREE(hd, (int)cx_free_cb, 0) & 1) return 500000;
+    if (take_semaphore(cx_frsem, 500)) return 500000;
     return (uint32_t)(get_us_clock() - t);
 }
 int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len)   /* HPCopy (XDMAC); 1 = no free channel, retried */
