@@ -1492,6 +1492,14 @@ static volatile uint32_t x_dfn, x_dts, x_dbusy, x_vn, x_vnext;
 /* v4.29 early start (see rt_direct_tick) */
 #define X_LEAD_US 5500                  /* v4.30: was 4000; v4.29 camera starts ran ~1.5 ms after the plan (-2.5 ms) */
 #define X_LAT_US  4500                  /* start latency the deadline allows for (v4.28 camera: up to ~5.3 ms seen) */
+/* v4.46: the lead must stay below the encoder's read time, or the encoder overtakes the sensor and reads the previous
+ * frame's rows. FHD MEM1 (2304x1290) encodes in ~4.2-4.5 ms against a 14 ms readout: with the 5.5 ms lead ~44% of
+ * 12/14-bit frames had 1-48 rows (around row 1110-1185) identical to the previous frame (riz 2026-11-09,
+ * rowstale.py). No overtaking needs lead (minus the ~0.8 ms from the bottom row to the IRQ) <= encode time. FHD uses
+ * X_LEAD_FHD_US: still before the IRQ (a frame counts as recorded only if its encode started before its IRQ; lead 0
+ * dropped 12-27% in the harness) and ~2.5 ms under the encode time. 4K keeps X_LEAD_US (encode 10-14 ms). */
+#define X_LEAD_FHD_US 2500
+static uint32_t x_lead = X_LEAD_US;
 static volatile int x_plan;
 static int x_primed, x_counted;         /* first IRQ of a clip: planning only */
 static volatile uint32_t x_plan_t, x_plan_dl, x_cmd_t, x_started_fn, x_late, x_rel_bad;
@@ -2377,7 +2385,7 @@ static void rt_direct_tick(void)
     x_plan = 0;
     if ((int32_t)(now - x_plan_dl) > 0) { x_late++; return; }  /* too late for this frame: dropped at its IRQ */
     x_dfn = nfr;                        /* the frame the sensor is finishing gets this number at its IRQ */
-    x_dts = x_plan_t + X_LEAD_US - first_t;   /* estimate; set exactly at the IRQ */
+    x_dts = first_t ? x_plan_t + x_lead - first_t : 0;   /* estimate (frame 0: its IRQ becomes the time base) */
     x_drel = 0x7FFF;
     x_dstate = 1;
     RT_DMB();
@@ -2437,8 +2445,8 @@ static int rt_frame_direct(uint32_t td, uint32_t lat_us, int flags, uint32_t top
     if (!(flags & F_DUP))               /* plan the next frame: start X_LEAD_US before its frame end */
     {
         uint32_t per = sv_irq_med ? sv_irq_med : (c_est ? c_est : 41708);
-        uint32_t top = sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800;
-        x_plan_t = td + per - X_LEAD_US;
+        uint32_t top = sv_irq_to_top > 300 && sv_irq_to_top < 40000 ? sv_irq_to_top : 1800;
+        x_plan_t = td + per - x_lead;
         x_plan_dl = td + per + top - X_LAT_US;
         if ((int32_t)(x_plan_dl - x_plan_t) < 0) x_plan_dl = x_plan_t;
         RT_DMB();
@@ -2813,6 +2821,7 @@ static void rt_task(void *unused)
         x_bytes = x_enc_sum = x_cp_sum = 0;
         x_dstate = 0; x_dbusy = x_vn = x_vnext = 0;   /* v4.28 */
         x_plan = 0; x_started_fn = 0; x_late = x_rel_bad = 0; x_logn = 0; x_primed = x_counted = 0;   /* v4.29 */
+        x_lead = m1_h < 2000 ? X_LEAD_FHD_US : X_LEAD_US;   /* v4.46 */
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
         c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
@@ -3102,7 +3111,7 @@ static void rt_task(void *unused)
                   x_free_max, x_wait_ms, x_max_used, nch * kslots, nsb, x_written, x_hdr0[0], x_hdr0[1], x_hdr0[2], x_hdr0[3], w_err);
         if (c_crxd) rt_printf("v4.29 direct source: MEM1 crop at %08x, line %d px; start %d us before the frame end, deadline %d us after it "
                               "(top row %d us); %d frames dropped (encoder busy past the deadline: %d), %d verify frames (RAWC); timer/rel errors %d\n",
-                              c_src, pitch * 8 / c_bpp, X_LEAD_US, (sv_irq_to_top > 300 && sv_irq_to_top < 20000 ? sv_irq_to_top : 1800) - X_LAT_US,
+                              c_src, pitch * 8 / c_bpp, x_lead, (sv_irq_to_top > 300 && sv_irq_to_top < 40000 ? sv_irq_to_top : 1800) - X_LAT_US,
                               sv_irq_to_top, x_dbusy, x_late, x_vn, x_rel_bad);
         if (c_crx) rt_printf("v4.30 HPCopy: %d channels, %d in flight, %d lost completions\n", c_xch, c_xpar, x_cp_lost);
         if (c_crxd == 1) rt_printf("v4.31 split copy-out: %d frames, EDMAC avg %d us, HPCopy avg %d us, EDMAC share at the end %d/64, %d failures%s\n",
@@ -3115,7 +3124,7 @@ static void rt_task(void *unused)
             if (tb)
             {
                 int len = snprintf(tb, 256, "# %s.MLV %dx%d %d-bit, period %d us, lead %d us\nframe\tstart_rel_ms\tencode_ms\thpcopy_ms\tfree_ms\tcycle_ms\tstaging_wait_ms\n",
-                                   rr_base, c_cw, c_ch, c_bpp, sv_irq_med, X_LEAD_US);
+                                   rr_base, c_cw, c_ch, c_bpp, sv_irq_med, x_lead);
                 for (uint32_t i = 0; i < x_logn; i++)
                 {
                     struct x_flog *L = &x_log[i];
