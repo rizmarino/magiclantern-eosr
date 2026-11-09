@@ -1161,15 +1161,13 @@ void WAV_StopRecord()
  * ghidra/notes/lv-survey.md, Beeps). Camera 2026-11-08: posting the id to ACTRL (FUN_e024eab8, as Canon's
  * Test_SE_SendBeepProp mode 1) and calling AudioBeep (FUN_e0294e76, mode 2) both play it; writing PROP_BUZZER
  * from ML is silent. Ids heard: 0x1A, 0x1B, 0x14; 0x1C silent; 0x1D/0x1E rejected (ret 17).
- * Never in movie LV or while ML's recorder runs: ACTRL asserts if a movie starts while a beep plays, and
+ * v4.47: tidied (ACTRL only, survey entries replaced by Play buttons). Never in movie LV or while ML's recorder runs: ACTRL asserts if a movie starts while a beep plays, and
  * RECORDING can't see Canon's recording on the R (PROP_MVR_REC_START is blocked). */
 extern int rawrec_running(void);
 CONFIG_INT("beep.enabled", beep_enabled, 1);
 static CONFIG_INT("beep.r.id", beep_id, 0x1A);     /* single 32 ms tone */
 static CONFIG_INT("beep.r.long", beep_long_id, 0x14);
-static int beep_path;                              /* 0 ACTRL event (default), 1 AudioBeep; not saved */
-static int beep_try_id = 0x1A;                     /* Audio > Beeps > Try sound id: not saved */
-static int beep_count, beep_skipped, beep_last_ret;
+static int beep_count, beep_skipped;
 static struct semaphore * beep_sem;
 static volatile int beep_req_id, beep_req_times;
 
@@ -1193,8 +1191,7 @@ static void beep_task()
         if (take_semaphore(beep_sem, 500)) continue;
         for (int i = 0; i < beep_req_times && !beep_blocked(); i++)
         {
-            if (beep_path) beep_last_ret = ((int (*)(int))0xE0294E77)(beep_req_id);   /* AudioBeep play */
-            else { ((void (*)(int))0xE024EAB9)(beep_req_id); beep_last_ret = 0; }  /* post EV_ACTRL_BUZZER */
+            ((void (*)(int))0xE024EAB9)(beep_req_id);     /* post EV_ACTRL_BUZZER (AudioBeep FUN_e0294e76 also works) */
             beep_count++;
             msleep(i + 1 < beep_req_times ? 250 : 100);
         }
@@ -1224,9 +1221,9 @@ static MENU_UPDATE_FUNC(beep_r_update)
 static MENU_SELECT_FUNC(beep_r_play)     /* on-screen confirmation for the tests */
 {
     int before = beep_skipped;
-    beep_request(*(int *)priv, priv == &beep_try_id ? 1 : 3);
+    beep_request(*(int *)priv, 1);
     if (beep_skipped != before) NotifyBox(3000, "Beep skipped (movie mode, recording, busy or Beeps OFF)");
-    else NotifyBox(2000, "Beep: id %x, %s", *(int *)priv, beep_path ? "AudioBeep" : "ACTRL");
+    else NotifyBox(2000, "Beep: sound %x", *(int *)priv);
 }
 
 static struct menu_entry beep_r_menus[] = {
@@ -1236,19 +1233,13 @@ static struct menu_entry beep_r_menus[] = {
         .help2 = "Photo mode only, never while recording. PLAY: sound choice and tests.",
         .children = (struct menu_entry[]) {
             { .name = "Beep sound", .priv = &beep_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
-              .help = "Canon sound effect id for a normal ML beep (1A, 1B and 14 tested)." },
+              .help = "Canon sound effect for a normal ML beep (1A, 1B and 14 tested; 1C is silent)." },
+            { .name = "Play beep sound", .priv = &beep_id, .select = beep_r_play, .icon_type = IT_ACTION,
+              .help = "Plays the Beep sound once." },
             { .name = "Long beep sound", .priv = &beep_long_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
               .help = "Sound for long beeps (Lua beep with a long duration)." },
-            { .name = "Test: beep x3", .priv = &beep_id, .select = beep_r_play, .icon_type = IT_ACTION,
-              .help = "Plays the Beep sound 3 times." },
-            { .name = "Try sound id", .priv = &beep_try_id, .min = 1, .max = 0x25, .unit = UNIT_HEX,
-              .help = "Pick an id with LEFT/RIGHT, then use Play below." },
-            { .name = "Play tried id", .priv = &beep_try_id, .select = beep_r_play, .icon_type = IT_ACTION,
-              .help = "Plays the Try sound id once." },
-            { .name = "Sound path", .priv = &beep_path, .max = 1,
-              .choices = (const char *[]) {"ACTRL event", "AudioBeep"},
-              .help = "How ML asks Canon for the sound. Both work; ACTRL runs in Canon's own task.",
-              .help2 = "Resets to ACTRL event at power-on." },
+            { .name = "Play long beep", .priv = &beep_long_id, .select = beep_r_play, .icon_type = IT_ACTION,
+              .help = "Plays the Long beep sound once." },
             MENU_EOL
         },
     },
