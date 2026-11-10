@@ -1449,7 +1449,9 @@ static int c_xsplit, xe_f64, x_split_ok = 1;   /* x_split_ok: host harness A/B s
  * being processed (each free waits for its callback first), and no free while an encode runs (N-1 is freed right
  * after N finished, before N+1 may start). The free during a clip never empties the list, so Canon's encoder buffer
  * resource stays allocated (no per-frame release/re-request). No EDMAC split with it. */
-static int c_xpipe, x_pipe_ok = 1;             /* x_pipe_ok: harness switch */
+static int c_xpipe, x_pipe_ok = 0;             /* v4.50: off on the camera (harness: RR_XPIPE=1). Camera 2026-11-10: froze
+                                                 * at 12-bit 4K 29.97p (any overlap with the encode does there), no gain
+                                                 * elsewhere, so the menu choice is gone; the code stays for reference. */
 static uint32_t x_pipe_frees, x_pipe_fmax, x_pipe_addr_moves, x_pipe_a0;
 /* v4.49: algsmgr's per-plane output buffer only rewinds when no handle is held (camera 2026-11-10: each frame lands
  * right after the previous one, and with one frame always held the encode after ~24 MB per plane was queued for
@@ -2930,6 +2932,7 @@ static void rt_task(void *unused)
         x_lead = m1_h < 2000 ? X_LEAD_FHD_US : X_LEAD_US;   /* v4.46 */
         c_xch = crx_rec_hpc_channels(); c_xpar = c_xch >= 3 && c_xch <= 32 ? 2 : 1; x_cp_lost = 0;    /* v4.30 */
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
+        if (rr_xsplit > 1 && !x_pipe_ok) rr_xsplit = 1;   /* v4.50: an old magic.cfg may still say Pipelined */
         c_xpipe = c_crxd && x_pipe_ok && rr_xsplit == 2;   /* v4.48 */
         x_pipe_frees = x_pipe_fmax = x_pipe_addr_moves = x_pipe_a0 = 0;
         x_ring_bytes = x_drains = x_ring_full = x_ring_disc = x_ring_max = 0; x_ring_cap = X_RING_CAP_KB; x_last_fr = x_last_cp = 0;   /* v4.49 */
@@ -3998,10 +4001,10 @@ static struct menu_entry rr_menu[] = {
             {
                 .name    = "Lossless copy-out",
                 .priv    = &rr_xsplit,
-                .max     = 2,
-                .choices = CHOICES("HPCopy", "HPCopy+EDMAC", "Pipelined (test)"),
-                .help    = "Direct source: HPCopy+EDMAC copies each frame on two engines (v4.31). Pipelined: one engine,",
-                .help2   = "copies frame N while N+1 encodes (v4.48, for 12-bit 29.97p). HPCopy+EDMAC is off at 12-bit 29.97p.",
+                .max     = 1,
+                .choices = CHOICES("HPCopy", "HPCopy+EDMAC"),
+                .help    = "Direct source: HPCopy+EDMAC copies each compressed frame on two engines (faster, v4.31).",
+                .help2   = "HPCopy: one engine. 12-bit 4K 29.97p always uses HPCopy (any overlap froze it).",
             },
             {
                 .name    = "Pre-record",
