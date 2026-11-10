@@ -641,6 +641,9 @@ void M_SaveSelect(int choice)
     M_StringCopy(saveOldString,savegamestrings[choice], SAVESTRINGSIZE);
     if (!strcmp(savegamestrings[choice], EMPTYSTRING))
 	savegamestrings[choice][0] = 0;
+    /* ML port: no keyboard on a camera; give an empty slot a name so SET (Enter) saves straight away */
+    if (!savegamestrings[choice][0])
+        M_snprintf(savegamestrings[choice], SAVESTRINGSIZE, "CAMERA SAVE %d", choice + 1);
     saveCharIndex = strlen(savegamestrings[choice]);
 }
 

@@ -2112,7 +2112,7 @@ char *M_GetSaveGameDir(char *iwadname)
 
         free(topdir);
 #else
-        savegamedir = M_StringJoin(configdir, DIR_SEPARATOR_S, ".savegame/", NULL);
+        savegamedir = M_StringJoin(configdir, DIR_SEPARATOR_S, "SAVES/", NULL);   /* ML port: no dot-dir on the card */
 
         M_MakeDirectory(savegamedir);
 
