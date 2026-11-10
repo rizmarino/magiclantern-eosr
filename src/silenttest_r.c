@@ -713,8 +713,6 @@ static void st_shot_task(void *unused)
  * no MMU work, no interrupts-off section after the first setup. Gone at power off, never written to flash. */
 #if defined(CONFIG_MMU) && !defined(ST_HOST)
 #define ST_REMAP
-#include "mmu_utils.h"
-extern void change_mmu_tables(uint8_t *ttbr0, uint8_t *ttbr1, uint32_t cpu_id);
 #endif
 #define ST_FPS_N 4
 static const uint32_t __attribute__((unused)) st_fps_addr[ST_FPS_N] = { 0xE0F16DE0, 0xE0F16DE8, 0xE0F16BE8, 0xE0F16BF0 };
@@ -751,24 +749,9 @@ static void st_mmu_log(const char *stage, uint32_t a, uint32_t b)
 }
 
 #define ST_ROMPAGE  0xE0F16000          /* 4 KB page holding both tables' seq 61/62 entries */
-#define ST_SECTION  0xE0F00000
-#define ST_L1_SIZE  0x4900              /* Canon L1 (0x4000) + core L2s for 0-1 MB + core L1s for 0-32 MB */
-/* L1 copy (16 KB aligned) + L2 table (1 KB aligned) + RAM page (4 KB aligned), aligned at runtime inside a plain
- * array: a linker-aligned struct cost ~51 KB of bss in v1.8-pre, this costs 40 KB.
- * v3.15: slack is a full 0x4000. The old 0x3C00 only fit when the array happened to land within 0x3C00 below a
- * 16 KB boundary; v3.14 has it at 0x118138 (needs 0x3EC8), so every setup failed at step 9 (ERROR 20009). */
-#define ST_MMU_SPAN 0x6000              /* l1 at +0, l2 at +0x4C00, page at +0x5000 */
-/* v3.18: no longer bss. Canon needs > ~450 KB of free malloc heap (user_mem, where ML's bss also comes from) to
- * get through a full-buffer burst (camera A/B 2026-10-31: v2.4 at 470 KB free OK, same build with 20 KB taken: Err
- * 70). So the buffer comes from Canon's AllocateMemory pool (~1.8 MB free) on first use, i.e. only once a faster
- * rate is picked; the heap is only a fallback. Never freed: the switched tables live in it. */
-#define ST_MMU_ALLOC (ST_MMU_SPAN + 0x4000)
-extern void *_AllocateMemory(size_t size);
-extern void *_malloc(size_t size);
-static uint8_t *st_mmu_buf;
-static int st_mmu_from_heap;
-static uint8_t *st_mmu_l1;
-static uint32_t *st_mmu_l2;
+/* v4.51: the remap itself moved to romremap_r.c (shared with dual ISO: one L1 copy for every patched page; two
+ * independent remaps would each install their own L1 copy and drop the other's pages). Same steps and error codes. */
+#include "romremap_r.h"
 static uint8_t *st_mmu_page;
 static int st_mmu_on;
 
@@ -776,42 +759,11 @@ static int st_mmu_on;
 static int st_remap_init(void)
 {
     if (st_mmu_on) return 0;
-    if (get_cpu_id() != 0) return -1;
-    if (!st_mmu_buf)
-    {
-        uint8_t *p = _AllocateMemory(ST_MMU_ALLOC);
-        if (p && (uint32_t)p >= 0x40000000) p = 0;      /* must be a plain cacheable RAM address (TTBR, L2 pointers); leaked */
-        if (!p) { p = _malloc(ST_MMU_ALLOC); st_mmu_from_heap = 1; }
-        if (!p || (uint32_t)p >= 0x40000000) return -10;
-        st_mmu_buf = p;
-    }
-    uint32_t l1 = ((uint32_t)st_mmu_buf + 0x3FFF) & ~0x3FFF;
-    if (l1 + ST_MMU_SPAN > (uint32_t)st_mmu_buf + ST_MMU_ALLOC) return -9;
-    st_mmu_l1 = (uint8_t *)l1;
-    st_mmu_l2 = (uint32_t *)(l1 + 0x4C00);
-    st_mmu_page = (uint8_t *)(l1 + 0x5000);
-    st_mmu_log(st_mmu_from_heap ? "init heap" : "init AM", l1, (uint32_t)st_mmu_page);
-    if (copy_mmu_tables_ex(l1, 0xE0000000, ST_L1_SIZE)) return -2;
-    uint32_t *a = (uint32_t *)l1, *b = (uint32_t *)0xE0000000, diff = 0;
-    for (int i = 0; i < ST_L1_SIZE / 4; i++) if (a[i] != b[i] && i != 0x1200 && i != 0x1220) diff++;
-    st_mmu_log("copy-diff", diff, a[ST_SECTION >> 20]);
-    if (diff) return -3;
-    if (split_l1_supersection(ST_SECTION, l1)) return -4;
-    uint32_t lf = get_l2_largepage_flags_from_l1_section(ST_SECTION, l1);
-    if (lf == 0xffffffff) return -5;
-    /* large-page flags -> small-page descriptor: B C AP AP2 S nG stay, TEX 14:12 -> 8:6, XN 15 -> 0, type 0b1x */
-    uint32_t sp = (lf & 0xE3C) | (((lf >> 12) & 7) << 6) | ((lf >> 15) & 1) | 2;
-    for (int i = 0; i < 256; i++) st_mmu_l2[i] = (ST_SECTION + i * 0x1000) | sp;
-    memcpy(st_mmu_page, (void *)ST_ROMPAGE, 0x1000);
-    st_mmu_l2[(ST_ROMPAGE - ST_SECTION) >> 12] = (uint32_t)st_mmu_page | sp;
-    if (assign_l2_table_to_l1_section(ST_SECTION, l1, (uint32_t)st_mmu_l2)) return -6;
-    st_mmu_log("tables", lf, sp);
-    dcache_clean(l1, ST_MMU_SPAN);
-    st_mmu_log("ttbr-next", 0, 0);
-    uint32_t old = cli();
-    change_mmu_tables(st_mmu_l1 + ST_L1_SIZE - 0x100, st_mmu_l1, 0);   /* also TLBIALL */
-    sei(old);
-    _sync_caches();
+    int err = romremap_init();
+    snprintf(st_mmu_stage, sizeof(st_mmu_stage), "%s", romremap_stage());
+    if (err) return err;
+    st_mmu_page = romremap_ram(ST_ROMPAGE);
+    if (!st_mmu_page) return -11;
     st_mmu_on = 1;
     uint32_t r0 = *(volatile uint32_t *)st_fps_addr[0];
     st_mmu_log("ttbr-done", r0, *(volatile uint32_t *)0xE0F17000);
@@ -824,7 +776,7 @@ static int st_remap_write(int v)
 {
     for (int i = 0; i < ST_FPS_N; i++)
         *(volatile uint32_t *)(st_mmu_page + (st_fps_addr[i] - ST_ROMPAGE)) = v;
-    dcache_clean((uint32_t)st_mmu_page, 0x1000);
+    romremap_flush(st_mmu_page, 0x1000);
     int bad = 0;
     for (int i = 0; i < ST_FPS_N; i++) bad += *(volatile uint32_t *)st_fps_addr[i] != (uint32_t)v;
     return bad;
