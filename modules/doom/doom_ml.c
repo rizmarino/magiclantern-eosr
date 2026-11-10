@@ -531,7 +531,8 @@ static int load_sfx(const char *lump, int16_t *out, int max_samples)
                 {
                     uint32_t x = (uint32_t)((int64_t)i * rate * 65536 / 24000);
                     int i0 = x >> 16, fr = x & 0xffff, a = smp[i0] - 128, c = smp[MIN(i0 + 1, n - 1)] - 128;
-                    out[i] = (int16_t)((a * 65536 + (c - a) * fr) >> 8);
+                    int v = ((a * 65536 + (c - a) * fr) >> 8) * 3;   /* x3 louder, clipped */
+                    out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
                 }
                 got = m * 2;
                 slogf("sfx %s: %d samples at %d Hz -> %d at 24000\n", lump, n, rate, m);
@@ -556,14 +557,14 @@ static void sound_task(void *unused)
     int n;
 
     NotifyBox(2000, "Sound test 1/6: low tone (24 kHz, output 0)");
-    n = tone(b, 12000, 24000, 1, 440, 8000) - b;
+    n = tone(b, 12000, 24000, 1, 440, 26000) - b;
     ab_play("1 tone 440 Hz 24k mono out0", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
 
     NotifyBox(2000, "Sound test 2/6: low tone (24 kHz, output 1)");
     ab_play("2 tone 440 Hz 24k mono out1", b, n * 2, AB_RATE_24K, 1, 1, 5, 1); slog_flush(); msleep(700);
 
     NotifyBox(2000, "Sound test 3/6: higher tone (48 kHz stereo)");
-    n = tone(b, 24000, 48000, 2, 660, 8000) - b;
+    n = tone(b, 24000, 48000, 2, 660, 26000) - b;
     ab_play("3 tone 660 Hz 48k stereo out0", b, n * 2, AB_RATE_48K, 2, 0, 5, 1); slog_flush(); msleep(700);
 
     NotifyBox(2000, "Sound test 4/6: Doom pistol");
@@ -573,7 +574,7 @@ static void sound_task(void *unused)
 
     NotifyBox(3000, "Sound test 5/6: 10 short beeps back to back");
     int16_t *b2 = b + 2400 + 64;                       /* two 100 ms buffers: 440 / 880 Hz */
-    tone(b, 2400, 24000, 1, 440, 8000); tone(b2, 2400, 24000, 1, 880, 8000);
+    tone(b, 2400, 24000, 1, 440, 26000); tone(b2, 2400, 24000, 1, 880, 26000);
     uint64_t t5 = get_us_clock();
     for (int i = 0; i < 10; i++)
     {
@@ -584,9 +585,9 @@ static void sound_task(void *unused)
     slog_flush(); msleep(700);
 
     NotifyBox(3000, "Sound test 6/6: long tone, cut off by a high one");
-    n = tone(b, 24000, 24000, 1, 440, 8000) - b;
+    n = tone(b, 24000, 24000, 1, 440, 26000) - b;
     int16_t *b3 = b + n + 64;
-    int n3 = tone(b3, 7200, 24000, 1, 880, 8000) - b3;
+    int n3 = tone(b3, 7200, 24000, 1, 880, 26000) - b3;
     ab_play("6a long 1 s tone (not waited)", b, n * 2, AB_RATE_24K, 1, 0, 5, 0);
     msleep(200);
     ab_play("6b cut-in 300 ms", b3, n3 * 2, AB_RATE_24K, 1, 0, 5, 1);
