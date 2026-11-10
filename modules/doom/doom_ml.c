@@ -556,41 +556,59 @@ static void sound_task(void *unused)
     slog_flush();
     int n;
 
-    NotifyBox(2000, "Sound test 1/6: low tone (24 kHz, output 0)");
+    /* 2026-11-10 camera: steps 1-2 (24k mono, out 0/1) played and completed in 501-512 ms; the camera froze in
+     * the 48k stereo step (no log line). Doom's format (24k mono) first; the other formats last, one parameter
+     * changed at a time, with a breadcrumb flushed to the card before each start. */
+#define STEP(msg) do { slogf("> %s\n", msg); slog_flush(); NotifyBox(2500, "Sound test %s", msg); } while (0)
+    STEP("1/9: low tone (24 kHz mono)");
     n = tone(b, 12000, 24000, 1, 440, 26000) - b;
     ab_play("1 tone 440 Hz 24k mono out0", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
 
-    NotifyBox(2000, "Sound test 2/6: low tone (24 kHz, output 1)");
-    ab_play("2 tone 440 Hz 24k mono out1", b, n * 2, AB_RATE_24K, 1, 1, 5, 1); slog_flush(); msleep(700);
-
-    NotifyBox(2000, "Sound test 3/6: higher tone (48 kHz stereo)");
-    n = tone(b, 24000, 48000, 2, 660, 26000) - b;
-    ab_play("3 tone 660 Hz 48k stereo out0", b, n * 2, AB_RATE_48K, 2, 0, 5, 1); slog_flush(); msleep(700);
-
-    NotifyBox(2000, "Sound test 4/6: Doom pistol");
+    STEP("2/9: Doom pistol");
     int pb = load_sfx("DSPISTOL", b, 100 * 1024 / 2);
-    if (pb) ab_play("4 DSPISTOL 24k mono out0", b, pb, AB_RATE_24K, 1, 0, 5, 1);
+    if (pb) ab_play("2 DSPISTOL 24k mono out0", b, pb, AB_RATE_24K, 1, 0, 5, 1);
     slog_flush(); msleep(700);
 
-    NotifyBox(3000, "Sound test 5/6: 10 short beeps back to back");
+    STEP("3/9: 10 short beeps back to back");
     int16_t *b2 = b + 2400 + 64;                       /* two 100 ms buffers: 440 / 880 Hz */
     tone(b, 2400, 24000, 1, 440, 26000); tone(b2, 2400, 24000, 1, 880, 26000);
     uint64_t t5 = get_us_clock();
     for (int i = 0; i < 10; i++)
     {
-        char w[32]; dm_snprintf(w, sizeof w, "5.%d back-to-back 100 ms", i);
+        char w[32]; dm_snprintf(w, sizeof w, "3.%d back-to-back 100 ms", i);
         ab_play(w, i & 1 ? b2 : b, 4800, AB_RATE_24K, 1, 0, 5, 1);
     }
-    slogf("5 total %d ms for 10 x 100 ms\n", (int)((get_us_clock() - t5) / 1000));
+    slogf("3 total %d ms for 10 x 100 ms\n", (int)((get_us_clock() - t5) / 1000));
     slog_flush(); msleep(700);
 
-    NotifyBox(3000, "Sound test 6/6: long tone, cut off by a high one");
+    STEP("4/9: long tone, cut off by a high one");
     n = tone(b, 24000, 24000, 1, 440, 26000) - b;
     int16_t *b3 = b + n + 64;
     int n3 = tone(b3, 7200, 24000, 1, 880, 26000) - b3;
-    ab_play("6a long 1 s tone (not waited)", b, n * 2, AB_RATE_24K, 1, 0, 5, 0);
+    ab_play("4a long 1 s tone (not waited)", b, n * 2, AB_RATE_24K, 1, 0, 5, 0);
     msleep(200);
-    ab_play("6b cut-in 300 ms", b3, n3 * 2, AB_RATE_24K, 1, 0, 5, 1);
+    ab_play("4b cut-in 300 ms", b3, n3 * 2, AB_RATE_24K, 1, 0, 5, 1);
+    slog_flush(); msleep(700);
+
+    STEP("5/9: small 48 kHz mono (0.1 s)");
+    n = tone(b, 4800, 48000, 1, 660, 26000) - b;
+    ab_play("5 tone 660 Hz 48k mono 9.6 KB", b, n * 2, AB_RATE_48K, 1, 0, 5, 1); slog_flush(); msleep(700);
+
+    STEP("6/9: 24 kHz stereo (0.5 s)");
+    n = tone(b, 12000, 24000, 2, 550, 26000) - b;
+    ab_play("6 tone 550 Hz 24k stereo 48 KB", b, n * 2, AB_RATE_24K, 2, 0, 5, 1); slog_flush(); msleep(700);
+
+    STEP("7/9: 48 kHz mono (0.5 s)");
+    n = tone(b, 24000, 48000, 1, 660, 26000) - b;
+    ab_play("7 tone 660 Hz 48k mono 48 KB", b, n * 2, AB_RATE_48K, 1, 0, 5, 1); slog_flush(); msleep(700);
+
+    STEP("8/9: long 2 s tone, 24 kHz mono (96 KB, as big as step 9)");
+    n = tone(b, 48000, 24000, 1, 440, 26000) - b;
+    ab_play("8 tone 440 Hz 24k mono 96 KB", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
+
+    STEP("9/9: 48 kHz stereo (froze last time)");
+    n = tone(b, 24000, 48000, 2, 660, 26000) - b;
+    ab_play("8 tone 660 Hz 48k stereo 96 KB", b, n * 2, AB_RATE_48K, 2, 0, 5, 1); slog_flush();
     slogf("end: state %d result %d\n", AB_INT(0x48), AB_INT(0x24));
     slog_flush();
     free(b);
@@ -675,8 +693,8 @@ static struct menu_entry doom_menu[] =
             {
                 .name    = "Sound test",
                 .select  = doom_sound_test,
-                .help    = "6 short sounds through Canon's speaker (~15 s). Log: ML/DOOM/SOUND.TXT.",
-                .help2   = "Tones, the Doom pistol, back-to-back and cut-in timing. Photo mode first.",
+                .help    = "9 short sounds through Canon's speaker (~25 s). Log: ML/DOOM/SOUND.TXT.",
+                .help2   = "Doom's format first; 48 kHz stereo last (it froze the camera once).",
             },
             MENU_EOL,
         },
