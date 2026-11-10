@@ -328,6 +328,9 @@ static void reset_stats(void)
     t_last_sleep = get_ms_clock();
 }
 
+static void snd_open(void);
+static void snd_close(void);
+
 static void doom_task(void *unused)
 {
     reset_stats();
@@ -342,9 +345,11 @@ static void doom_task(void *unused)
     if (!display_take()) { log_flush(); NotifyBox(4000, "Doom: unexpected display layer"); doom_running = 0; return; }
     powersave_prohibit();
     doom_played = 1;
+    snd_open();
     uint32_t t0 = get_ms_clock();
     int rc = dm_run_catching_exit(doom_main);
     run_stats("game", t0);
+    snd_close();                      /* before dm_libc_release_all: stops Canon reading our buffers */
     logf_("exit code %d; arena high water %d KB; big blocks %d (%d KB)\n", rc, (int)(dm_arena_high_water() / 1024),
           dm_big_count(), (int)(dm_big_bytes() / 1024));
     dm_libc_release_all();
@@ -556,20 +561,19 @@ static void sound_task(void *unused)
     slog_flush();
     int n;
 
-    /* 2026-11-10 camera: steps 1-2 (24k mono, out 0/1) played and completed in 501-512 ms; the camera froze in
-     * the 48k stereo step (no log line). Doom's format (24k mono) first; the other formats last, one parameter
-     * changed at a time, with a breadcrumb flushed to the card before each start. */
+    /* 2026-11-10 camera: every mono step played to length; 48k stereo (96 KB) and 24k stereo (48 KB) both froze
+     * the camera, so the stereo steps are gone. Step 6 checks a buffer as big as the game's (96 KB). */
 #define STEP(msg) do { slogf("> %s\n", msg); slog_flush(); NotifyBox(2500, "Sound test %s", msg); } while (0)
-    STEP("1/9: low tone (24 kHz mono)");
+    STEP("1/6: low tone (24 kHz mono)");
     n = tone(b, 12000, 24000, 1, 440, 26000) - b;
     ab_play("1 tone 440 Hz 24k mono out0", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
 
-    STEP("2/9: Doom pistol");
+    STEP("2/6: Doom pistol");
     int pb = load_sfx("DSPISTOL", b, 100 * 1024 / 2);
     if (pb) ab_play("2 DSPISTOL 24k mono out0", b, pb, AB_RATE_24K, 1, 0, 5, 1);
     slog_flush(); msleep(700);
 
-    STEP("3/9: 10 short beeps back to back");
+    STEP("3/6: 10 short beeps back to back");
     int16_t *b2 = b + 2400 + 64;                       /* two 100 ms buffers: 440 / 880 Hz */
     tone(b, 2400, 24000, 1, 440, 26000); tone(b2, 2400, 24000, 1, 880, 26000);
     uint64_t t5 = get_us_clock();
@@ -581,7 +585,7 @@ static void sound_task(void *unused)
     slogf("3 total %d ms for 10 x 100 ms\n", (int)((get_us_clock() - t5) / 1000));
     slog_flush(); msleep(700);
 
-    STEP("4/9: long tone, cut off by a high one");
+    STEP("4/6: long tone, cut off by a high one");
     n = tone(b, 24000, 24000, 1, 440, 26000) - b;
     int16_t *b3 = b + n + 64;
     int n3 = tone(b3, 7200, 24000, 1, 880, 26000) - b3;
@@ -590,30 +594,128 @@ static void sound_task(void *unused)
     ab_play("4b cut-in 300 ms", b3, n3 * 2, AB_RATE_24K, 1, 0, 5, 1);
     slog_flush(); msleep(700);
 
-    STEP("5/9: small 48 kHz mono (0.1 s)");
+    STEP("5/6: small 48 kHz mono (0.1 s)");
     n = tone(b, 4800, 48000, 1, 660, 26000) - b;
     ab_play("5 tone 660 Hz 48k mono 9.6 KB", b, n * 2, AB_RATE_48K, 1, 0, 5, 1); slog_flush(); msleep(700);
 
-    STEP("6/9: 24 kHz stereo (0.5 s)");
-    n = tone(b, 12000, 24000, 2, 550, 26000) - b;
-    ab_play("6 tone 550 Hz 24k stereo 48 KB", b, n * 2, AB_RATE_24K, 2, 0, 5, 1); slog_flush(); msleep(700);
-
-    STEP("7/9: 48 kHz mono (0.5 s)");
-    n = tone(b, 24000, 48000, 1, 660, 26000) - b;
-    ab_play("7 tone 660 Hz 48k mono 48 KB", b, n * 2, AB_RATE_48K, 1, 0, 5, 1); slog_flush(); msleep(700);
-
-    STEP("8/9: long 2 s tone, 24 kHz mono (96 KB, as big as step 9)");
+    STEP("6/6: long 2 s tone, 24 kHz mono (96 KB)");
     n = tone(b, 48000, 24000, 1, 440, 26000) - b;
-    ab_play("8 tone 440 Hz 24k mono 96 KB", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
+    ab_play("6 tone 440 Hz 24k mono 96 KB", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush();
 
-    STEP("9/9: 48 kHz stereo (froze last time)");
-    n = tone(b, 24000, 48000, 2, 660, 26000) - b;
-    ab_play("8 tone 660 Hz 48k stereo 96 KB", b, n * 2, AB_RATE_48K, 2, 0, 5, 1); slog_flush();
     slogf("end: state %d result %d\n", AB_INT(0x48), AB_INT(0x24));
     slog_flush();
     free(b);
     doom_running = 0;
     NotifyBox(4000, "Sound test done: see ML/DOOM/SOUND.TXT");
+}
+
+
+/* ------------------------------------------------------------------ in-game sound: dm_snd_hw_* (dm/dm_sound.c)
+ * The game task hands over whole effects; doom_audio (one priority step above doom_task, so it never sees a half
+ * written request) stops whatever Canon plays and starts the new buffer, so the game never waits on AudioBeep.
+ * Requests are a 2-slot array published by a sequence number written last. Mono 24 kHz only (stereo froze). */
+struct snd_req { const int16_t *buf; int n; };
+static struct snd_req snd_req[2];
+static volatile int snd_seq, snd_run, snd_alive;
+static const void * volatile snd_busy;
+static struct semaphore *snd_sem;
+static void *snd_blocks[4];
+static int snd_nblocks;
+static int snd_starts, snd_refused, snd_stops, snd_lat_max, snd_stop_max, snd_first_err, snd_skipped;
+
+void *dm_snd_hw_alloc(size_t n)
+{
+    if (!snd_run || snd_nblocks >= 4) return NULL;
+    void *p = fio_malloc(n);
+    if (p) snd_blocks[snd_nblocks++] = p;
+    return p;
+}
+
+static void snd_post(const int16_t *b, int n)
+{
+    int s = snd_seq + 1;
+    snd_req[s & 1].buf = b;
+    snd_req[s & 1].n = n;
+    snd_seq = s;
+    give_semaphore(snd_sem);
+}
+void dm_snd_hw_play(const int16_t *b, int n) { snd_post(b, n); }
+void dm_snd_hw_stop(void) { snd_post(NULL, 0); }
+const void *dm_snd_hw_busy(void) { return snd_busy; }
+
+/* stop Canon's player if it is starting/playing; returns ms */
+static int snd_halt(void)
+{
+    int st = AB_INT(0x48), t0 = get_ms_clock();
+    if (st != 1 && st != 2) return 0;
+    if (st == 1) ab_stop(1);
+    while ((st = AB_INT(0x48)) == 1 || st == 2)
+    {
+        if ((int)(get_ms_clock() - t0) > 150) break;
+        msleep(1);
+    }
+    snd_stops++;
+    return get_ms_clock() - t0;
+}
+
+static void snd_task(void *unused)
+{
+    int seen = 0;
+    while (snd_run)
+    {
+        take_semaphore(snd_sem, 100);
+        int s = snd_seq;
+        if (s == seen) continue;
+        if (s - seen > 1) snd_skipped += s - seen - 1;
+        seen = s;
+        struct snd_req r = snd_req[s & 1];
+        int ms = snd_halt();
+        if (ms > snd_stop_max) snd_stop_max = ms;
+        snd_busy = NULL;
+        if (!r.buf || r.n <= 0) continue;
+        if (snd_seq != seen) continue;                   /* a newer request came in while stopping: take that */
+        uint32_t spec[16];
+        memset(spec, 0, sizeof spec);
+        spec[0] = 1; spec[1] = (uint32_t)r.buf; spec[2] = r.n * 2; spec[5] = 5; spec[7] = 0;
+        spec[9] = AB_RATE_24K; spec[10] = 16; spec[11] = 1;
+        snd_busy = r.buf;
+        uint32_t t0 = get_ms_clock();
+        ab_start(0, spec);
+        int st;
+        while ((st = AB_INT(0x48)) != 1 && st != 3 && (int)(get_ms_clock() - t0) < 40) msleep(1);
+        int lat = get_ms_clock() - t0;
+        if (st == 1 || st == 3) { snd_starts++; if (lat > snd_lat_max) snd_lat_max = lat; }
+        else { snd_refused++; if (!snd_first_err) snd_first_err = AB_INT(0x24) | 0x10000; }
+    }
+    snd_halt();
+    snd_busy = NULL;
+    snd_alive = 0;
+}
+
+static void snd_open(void)
+{
+    snd_run = 0;
+    if (!AB_BLOCK) { logf_("sound: AudioBeep not initialised, no sound\n"); return; }
+    if (!snd_sem) snd_sem = create_named_semaphore("doom_snd", SEM_CREATE_LOCKED);
+    snd_run = snd_alive = 1;
+    task_create("doom_audio", 0x1c, 0x1000, snd_task, 0);
+}
+
+static void snd_close(void)
+{
+    char line[160];
+    dm_snd_stats(line, sizeof line);
+    logf_("%s", line);
+    if (!snd_run) return;
+    snd_run = 0;
+    give_semaphore(snd_sem);
+    for (int i = 0; i < 100 && snd_alive; i++) msleep(10);
+    logf_("sound out: %d started (max %d ms), %d refused (first result %x), %d stops (max %d ms), %d superseded; "
+          "player state %d\n", snd_starts, snd_lat_max, snd_refused, snd_first_err & 0xffff, snd_stops, snd_stop_max,
+          snd_skipped, AB_INT(0x48));
+    if (snd_alive) { logf_("sound: audio task did not end, buffers kept\n"); return; }
+    for (int i = 0; i < snd_nblocks; i++) free(snd_blocks[i]);
+    snd_nblocks = 0;
 }
 
 /* ------------------------------------------------------------------ menu */
@@ -693,8 +795,8 @@ static struct menu_entry doom_menu[] =
             {
                 .name    = "Sound test",
                 .select  = doom_sound_test,
-                .help    = "9 short sounds through Canon's speaker (~25 s). Log: ML/DOOM/SOUND.TXT.",
-                .help2   = "Doom's format first; 48 kHz stereo last (it froze the camera once).",
+                .help    = "6 short sounds through Canon's speaker (~15 s). Log: ML/DOOM/SOUND.TXT.",
+                .help2   = "Mono only: stereo froze the camera twice (2026-11-10).",
             },
             MENU_EOL,
         },

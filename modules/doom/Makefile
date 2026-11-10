@@ -14,7 +14,8 @@ ENGINE_SRCS = dummy am_map doomdef doomstat dstrings d_event d_items d_iwad d_lo
 
 BUILD_DIR ?= build
 ENGINE_OBJS = $(addprefix $(BUILD_DIR)/engine/,$(addsuffix .o,$(ENGINE_SRCS))) \
-              $(BUILD_DIR)/engine/dm_libc.o $(BUILD_DIR)/engine/dm_blit.o $(BUILD_DIR)/engine/dm_input.o
+              $(BUILD_DIR)/engine/dm_libc.o $(BUILD_DIR)/engine/dm_blit.o $(BUILD_DIR)/engine/dm_input.o \
+              $(BUILD_DIR)/engine/dm_sound.o
 
 MODULE_OBJS = $(BUILD_DIR)/doom_all.o
 
@@ -27,11 +28,13 @@ ARM_OBJCOPY = $(ARM_BINPATH)/arm-none-eabi-objcopy
 
 ENGINE_CFLAGS = -Os -march=armv5te -mlong-calls -fno-common -fno-strict-aliasing -std=gnu99 -w \
         -fstack-usage -Idm/include -include dm/include/dm_force.h -Iengine \
-        -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200
+        -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DDM_SOUND
 
 $(BUILD_DIR)/engine/%.o: engine/%.c dm/include/dm_force.h | $(BUILD_DIR)/engine
 	$(ARM_CC) $(ENGINE_CFLAGS) -c -o $@ $<
 $(BUILD_DIR)/engine/dm_libc.o: dm/dm_libc.c $(wildcard dm/include/*.h) | $(BUILD_DIR)/engine
+	$(ARM_CC) $(ENGINE_CFLAGS) -Wall -Wextra -Wno-unused-parameter -Werror -c -o $@ $<
+$(BUILD_DIR)/engine/dm_sound.o: dm/dm_sound.c dm/include/dm_sys.h | $(BUILD_DIR)/engine
 	$(ARM_CC) $(ENGINE_CFLAGS) -Wall -Wextra -Wno-unused-parameter -Werror -c -o $@ $<
 $(BUILD_DIR)/engine/dm_blit.o: dm/dm_blit.c dm/dm_blit.h | $(BUILD_DIR)/engine
 	$(ARM_CC) $(ENGINE_CFLAGS) -Wall -Werror -c -o $@ $<

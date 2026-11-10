@@ -22,6 +22,15 @@ int   dm_io_remove(const char *path);
 int   dm_io_rename(const char *from, const char *to);
 int   dm_io_mkdir(const char *path);
 
+/* sound (optional; dm_sound.c): mono s16 24 kHz. alloc NULL = no sound output. play/stop are asynchronous and
+ * replace whatever plays; busy = the buffer the hardware may still be reading (NULL if none). The platform frees
+ * its buffers itself once the game has ended and the output has stopped. */
+void *dm_snd_hw_alloc(size_t n);
+void  dm_snd_hw_play(const int16_t *buf, int samples);
+void  dm_snd_hw_stop(void);
+const void *dm_snd_hw_busy(void);
+int   dm_snd_stats(char *buf, size_t n);              /* provided by dm_sound.c: one log line */
+
 /* --- provided by dm_libc.c --- */
 /* Run fn() with exit() caught; returns the exit code (or fn's return). */
 int  dm_run_catching_exit(int (*fn)(void));

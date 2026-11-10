@@ -69,12 +69,19 @@ static int snd_sbirq = 0;
 static int snd_sbdma = 0;
 static int snd_mport = 0;
 
+#ifdef DM_SOUND
+extern sound_module_t DM_sound_module;
+#endif
+
 // Compiled-in sound modules:
 
 static sound_module_t *sound_modules[] = 
 {
     #ifdef FEATURE_SOUND
     &DG_sound_module,
+    #endif
+    #ifdef DM_SOUND
+    &DM_sound_module,       /* dm/dm_sound.c: Canon AudioBeep PCM on the EOS R */
     #endif
     NULL,
 };
