@@ -993,6 +993,12 @@ uint32_t *crx_rec_wait(uint32_t *us)
     *us = (uint32_t)(cx_hq_us[cx_rec_c0 & 15] - cx_rec_t0);
     return cx_hq[cx_rec_c0 & 15];
 }
+uint32_t *crx_rec_wait_ms(uint32_t *us, int ms)   /* v4.49: 0 after ms (the encode may still come: call again) */
+{
+    if (take_semaphore(cx_sem, ms)) return 0;
+    *us = (uint32_t)(cx_hq_us[cx_rec_c0 & 15] - cx_rec_t0);
+    return cx_hq[cx_rec_c0 & 15];
+}
 int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es)
 {
     if (CX_HDR(hd, ha, hs)) return -1;

@@ -1414,6 +1414,7 @@ extern uint32_t *crx_rec_wait(uint32_t *us);
 extern int crx_rec_parts(uint32_t *hd, uint32_t *ha, uint32_t *hs, uint32_t *n, uint32_t **ea, uint32_t **es);
 extern uint32_t crx_rec_free(uint32_t *hd);
 extern uint32_t crx_rec_free_q(uint32_t *hd);   /* v4.48 */
+extern uint32_t *crx_rec_wait_ms(uint32_t *us, int ms);   /* v4.49 */
 extern int crx_rec_copy(uint32_t dst, uint32_t src, uint32_t len);
 extern int crx_rec_copy_n(int n, const uint32_t *dst, const uint32_t *src, const uint32_t *len, int maxpar);   /* v4.30 */
 extern int crx_rec_hpc_channels(void);
@@ -1450,6 +1451,16 @@ static int c_xsplit, xe_f64, x_split_ok = 1;   /* x_split_ok: host harness A/B s
  * resource stays allocated (no per-frame release/re-request). No EDMAC split with it. */
 static int c_xpipe, x_pipe_ok = 1;             /* x_pipe_ok: harness switch */
 static uint32_t x_pipe_frees, x_pipe_fmax, x_pipe_addr_moves, x_pipe_a0;
+/* v4.49: algsmgr's per-plane output buffer only rewinds when no handle is held (camera 2026-11-10: each frame lands
+ * right after the previous one, and with one frame always held the encode after ~24 MB per plane was queued for
+ * space that never came: 21-27 frames, then -10). So the pipeline drains: before the bytes since the last empty
+ * ring (largest plane per frame) plus two frames' worth pass x_ring_cap, that frame is freed before the next start
+ * (the pre-v4.48 path: buffers released, ring rewinds). Backstop: an encode not back within X_RING_WAIT_MS while a
+ * frame is held is taken as queued for space: free the held frame, take the late encode and discard it (it started
+ * late, may be torn), and lower x_ring_cap for the rest of the clip. */
+#define X_RING_CAP_KB   18432           /* 18 MB: camera ran out at ~23-24 MB per plane (10-bit 4K) */
+#define X_RING_WAIT_MS  60              /* encode p99 15 ms on the camera */
+static uint32_t x_ring_bytes, x_ring_cap, x_drains, x_ring_full, x_ring_disc, x_ring_max;
 static uint32_t xe_fail, xe_frames, xe_sum_e, xe_sum_h;
 static int rt_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us);
 static void rt_fail(void);
@@ -1514,7 +1525,7 @@ static volatile int x_plan;
 static int x_primed, x_counted;         /* first IRQ of a clip: planning only */
 static volatile uint32_t x_plan_t, x_plan_dl, x_cmd_t, x_started_fn, x_late, x_rel_bad;
 static volatile int32_t x_drel;         /* start command time - frame-end IRQ, us (negative = before) */
-struct x_flog { uint32_t fn; int16_t rel; uint16_t enc, cp, fr, cyc, wt; };   /* 0.1 ms units */
+struct x_flog { uint32_t fn; int16_t rel; uint16_t enc, cp, fr, cyc, wt, ring; };   /* 0.1 ms units; ring = KB used (v4.49) */
 static struct x_flog *x_log;
 static volatile uint32_t x_logn;
 #define X_LOGMAX 2400
@@ -1742,7 +1753,25 @@ static void rt_crx_task(void *unused)
             continue;
         }
         uint32_t us = 0;
-        uint32_t *hd = crx_rec_wait(&us);
+        uint32_t *hd = held ? crx_rec_wait_ms(&us, X_RING_WAIT_MS) : crx_rec_wait(&us);
+        if (!hd && held)                        /* v4.49: queued for ring space (see x_ring_cap): free, discard the late one */
+        {
+            x_stage = 8;
+            uint32_t fu = crx_rec_free_q(held);
+            held = 0; x_pipe_frees++;
+            if (fu >= 500000) { w_err = -15; break; }
+            hd = crx_rec_wait(&us);
+            if (!hd) { w_err = -10; break; }
+            crx_rec_free(hd);                   /* list empty: buffers released, the ring rewinds */
+            x_ring_full++; x_ring_disc++;
+            uint32_t kb = x_ring_bytes >> 10;
+            if (x_ring_cap > kb * 3 / 4) x_ring_cap = MAX(kb * 3 / 4, 4096);
+            x_ring_bytes = 0;
+            RT_DMB();
+            x_dstate = 0;
+            if (x_plan) give_semaphore(rt_fsem);
+            continue;
+        }
         if (!hd) { w_err = -10; break; }        /* x_dstate stays 1: no more encodes start */
         if (held)                               /* v4.48: no encode runs now (this one is done, the next not started) */
         {
@@ -1760,22 +1789,34 @@ static void rt_crx_task(void *unused)
         int32_t rel = x_drel;                   /* v4.48: read before the next start can change them */
         uint32_t cmd_t = x_cmd_t;
         uint32_t w0 = x_wait_ms;
-        if (c_xpipe)                            /* v4.48: the next frame may start encoding while this one is copied */
+        int pipe = c_xpipe;
+        if (pipe)                               /* v4.49: drain before the ring can fill (largest plane of this frame) */
+        {
+            uint32_t ha = 0, hs = 0, n = 0, *ea = 0, *es = 0, mx = 0;
+            if (!crx_rec_parts(hd, &ha, &hs, &n, &ea, &es)) for (uint32_t i = 1; i < n; i++) if (es[i] > mx) mx = es[i];
+            x_ring_bytes += AL64(mx);
+            if (x_ring_bytes > x_ring_max) x_ring_max = x_ring_bytes;
+            if ((x_ring_bytes >> 10) + 2 * (AL64(mx) >> 10) > x_ring_cap) pipe = 0;
+        }
+        uint32_t ring_kb = x_ring_bytes >> 10;
+        if (c_xpipe && !pipe) { x_drains++; x_ring_bytes = 0; }   /* this frame is freed in rt_x_put: the ring rewinds */
+        if (pipe)                               /* v4.48: the next frame may start encoding while this one is copied */
         {
             RT_DMB();
             x_dstate = 0;
             if (x_plan) give_semaphore(rt_fsem);
         }
-        int e = rt_x_put(hd, us, &v, &si, &pos, &nfr, c_xpipe);
-        if (c_xpipe) held = hd;                 /* freed after the next frame's encode (also on errors) */
+        int e = rt_x_put(hd, us, &v, &si, &pos, &nfr, pipe);
+        if (pipe) held = hd;                    /* freed after the next frame's encode (also on errors) */
         if (!e && x_log && x_logn < X_LOGMAX)   /* v4.29 per-frame timing (ML/LOGS/CRXREC.TSV) */
         {
             struct x_flog *L = &x_log[x_logn++];
             L->fn = v.frame; L->rel = rel == 0x7FFF ? 0x7FFF : (int16_t)(rel / 100);
             L->enc = MIN(us / 100, 65535); L->cp = MIN(x_last_cp / 100, 65535); L->fr = MIN(x_last_fr / 100, 65535);
             L->cyc = MIN((rt_us() - cmd_t) / 100, 65535); L->wt = MIN((x_wait_ms - w0) * 10, 65535);
+            L->ring = MIN(ring_kb, 65535);
         }
-        if (!c_xpipe)
+        if (!pipe)
         {
             RT_DMB();
             x_dstate = 0;
@@ -1789,7 +1830,18 @@ static void rt_crx_task(void *unused)
         if (w_err) msleep(60);                  /* let the capture task see w_err: no start during the final free */
         uint32_t *h2 = 0, u2 = 0;
         int lost = w_err == -15 || w_err == -10;    /* algsmgr didn't answer a free / an encode: FreeAll cleans up */
-        if (x_dstate == 1 && !lost) h2 = crx_rec_wait(&u2);   /* an encode was started: let it finish first */
+        if (x_dstate == 1 && !lost)             /* an encode was started: let it finish first */
+        {
+            h2 = crx_rec_wait_ms(&u2, X_RING_WAIT_MS);
+            if (!h2)                            /* v4.49: queued for ring space: free the held one, then it runs */
+            {
+                if (crx_rec_free_q(held) >= 500000) lost = 1;
+                held = 0;
+                if (!lost) h2 = crx_rec_wait(&u2);
+                if (h2) { crx_rec_free(h2); h2 = 0; x_dstate = 0; }
+                lost = 1;                       /* both handled */
+            }
+        }
         if (!lost)
         {
             if (h2) { crx_rec_free_q(held); crx_rec_free(h2); }
@@ -2880,6 +2932,7 @@ static void rt_task(void *unused)
         rt_printf("v4.30 HPCopy: %d XDMAC channels, %d copies in flight\n", c_xch, c_xpar);
         c_xpipe = c_crxd && x_pipe_ok && rr_xsplit == 2;   /* v4.48 */
         x_pipe_frees = x_pipe_fmax = x_pipe_addr_moves = x_pipe_a0 = 0;
+        x_ring_bytes = x_drains = x_ring_full = x_ring_disc = x_ring_max = 0; x_ring_cap = X_RING_CAP_KB; x_last_fr = x_last_cp = 0;   /* v4.49 */
         c_xsplit = c_crxd == 1 && x_split_ok && rr_xsplit == 1; xe_f64 = 27; xe_fail = xe_frames = xe_sum_e = xe_sum_h = 0;   /* v4.31: 272 vs 364 MiB/s */
         /* v4.34: the split froze the camera twice at 12-bit 29.97p (sensor writes ~424 MB/s into MEM1) and never at
          * 10-bit 29.97p (~353) or 12-bit 23.98p (~339): with both copy engines on top, Canon's LV pipeline likely
@@ -3176,13 +3229,15 @@ static void rt_task(void *unused)
                                    xe_fail ? " (split turned off, rest of the clip HPCopy only)" : "");
         if (c_xpipe) rt_printf("v4.48 pipelined copy-out: %d delayed frees, slowest %d us, output address moved %d times (0 = no ring use), last chunk at %x\n",
                                x_pipe_frees, x_pipe_fmax, x_pipe_addr_moves, x_pipe_a0);
+        if (c_xpipe) rt_printf("v4.49 ring: %d drains, %d ring-full stalls (%d late frames discarded), most used %d KB, limit at the end %d KB\n",
+                               x_drains, x_ring_full, x_ring_disc, x_ring_max >> 10, x_ring_cap);
         if (c_crxd && x_log && x_logn)    /* v4.29: per-frame timing, appended per clip */
         {
             FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CRXREC.TSV");
             char *tb = f ? fio_malloc(64 * 1024) : 0;
             if (tb)
             {
-                int len = snprintf(tb, 256, "# %s.MLV %dx%d %d-bit, period %d us, lead %d us\nframe\tstart_rel_ms\tencode_ms\thpcopy_ms\tfree_ms\tcycle_ms\tstaging_wait_ms\n",
+                int len = snprintf(tb, 256, "# %s.MLV %dx%d %d-bit, period %d us, lead %d us\nframe\tstart_rel_ms\tencode_ms\thpcopy_ms\tfree_ms\tcycle_ms\tstaging_wait_ms\tring_kb\n",
                                    rr_base, c_cw, c_ch, c_bpp, sv_irq_med, x_lead);
                 for (uint32_t i = 0; i < x_logn; i++)
                 {
@@ -3191,9 +3246,9 @@ static void rt_task(void *unused)
                     char rs[16];                    /* v4.30: own column string (a shorter NA format with the same args garbled the row) */
                     if (rel == 0x7FFF) snprintf(rs, sizeof(rs), "NA");
                     else snprintf(rs, sizeof(rs), "%s%d.%d", rel < 0 ? "-" : "", ar / 10, ar % 10);
-                    len += snprintf(tb + len, 80, "%d\t%s\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\n",
+                    len += snprintf(tb + len, 90, "%d\t%s\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d.%d\t%d\n",
                                     L->fn, rs, L->enc / 10, L->enc % 10, L->cp / 10, L->cp % 10,
-                                    L->fr / 10, L->fr % 10, L->cyc / 10, L->cyc % 10, L->wt / 10, L->wt % 10);
+                                    L->fr / 10, L->fr % 10, L->cyc / 10, L->cyc % 10, L->wt / 10, L->wt % 10, L->ring);
                     if (len > 64 * 1024 - 100) { FIO_WriteFile(f, tb, len); len = 0; }
                 }
                 if (len) FIO_WriteFile(f, tb, len);
@@ -3208,9 +3263,10 @@ static void rt_task(void *unused)
     {
         snprintf(rt_last, sizeof(rt_last), "%s.MLV %dx%d %d-bit%s, %d frames%s", rr_base, crop_w, crop_h, c_bpp,
                  c_crx ? " lossless" : "", c_crx ? (int)x_written : pre_on ? (int)(wb / slot_bytes) : frames,   /* v4.8: frames dropped from the pre-record ring aren't in the clip */
-                 w_err <= -10 && w_err >= -14 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
-                 missed + drops ? ", FRAMES LOST" : rr_full ? ", card full" : "");
-        if (missed + drops) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed)\n", missed + drops, drops, missed);
+                 w_err <= -10 && w_err >= -15 ? ", ENCODER ERROR" : w_err ? ", WRITE ERROR" :   /* v4.25 */
+                 missed + drops + x_ring_disc ? ", FRAMES LOST" : rr_full ? ", card full" : "");
+        if (missed + drops + x_ring_disc) rt_printf("!! clip lost %d frames (%d dropped: buffer full, %d missed, %d discarded: late after a ring-full stall)\n",
+                                                  missed + drops + x_ring_disc, drops, missed, x_ring_disc);   /* v4.49 */
         if (pre_on && pre_armed_end) snprintf(rt_last, sizeof(rt_last), "pre-record %s", rr_pre_cancel ? "cancelled" : "stopped");
         if (w_n >= 20 && !w_err && card10 > 300) rr_card10 = card10;   /* menu's card speed */
     }
