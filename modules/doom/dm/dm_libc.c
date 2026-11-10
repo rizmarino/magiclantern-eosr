@@ -499,15 +499,31 @@ int dm_sscanf(const char *s, const char *fmt, ...)
 
 /* ------------------------------------------------------------------ FILE */
 
+/* Writes are buffered (DM_WBUF): Doom's savegame code writes one byte per fwrite, and on the camera each
+ * FIO_WriteFile costs ~10 ms, so an unbuffered ~20 KB save took minutes (camera 2026-11-10: "froze" on save,
+ * 6252 bytes on the card when he switched off). Flushed when full, before read/seek, on fflush and fclose. */
+#define DM_WBUF (16 * 1024)
 struct dm_file
 {
     void *h;
     int console;        /* stdout/stderr */
     int eof, err;
-    long pos;
+    long pos;           /* logical position, including buffered bytes */
+    char *wb;           /* write buffer (allocated on the first write) */
+    int wlen;
 };
 
-static struct dm_file f_out = { NULL, 1, 0, 0, 0 }, f_err = { NULL, 2, 0, 0, 0 };
+static struct dm_file f_out = { NULL, 1, 0, 0, 0, NULL, 0 }, f_err = { NULL, 2, 0, 0, 0, NULL, 0 };
+
+static int dm_wflush(FILE *f)
+{
+    if (!f || f->console || !f->wlen) return 0;
+    int n = f->wlen;
+    f->wlen = 0;
+    int r = dm_io_write(f->h, f->wb, n);
+    if (r != n) { f->err = 1; return EOF; }
+    return 0;
+}
 FILE *dm_stdout = &f_out, *dm_stderr = &f_err;
 
 FILE *dm_fopen(const char *path, const char *mode)
@@ -518,6 +534,7 @@ FILE *dm_fopen(const char *path, const char *mode)
     FILE *f = dm_malloc(sizeof(*f));
     if (!f) { dm_io_close(h); return NULL; }
     f->h = h; f->console = 0; f->eof = 0; f->err = 0;
+    f->wb = NULL; f->wlen = 0;
     f->pos = m == 2 ? dm_io_size(h) : 0;
     return f;
 }
@@ -525,14 +542,17 @@ FILE *dm_fopen(const char *path, const char *mode)
 int dm_fclose(FILE *f)
 {
     if (!f || f->console) return 0;
+    int r = dm_wflush(f);
     dm_io_close(f->h);
+    if (f->wb) dm_free(f->wb);
     dm_free(f);
-    return 0;
+    return r;
 }
 
 size_t dm_fread(void *ptr, size_t size, size_t n, FILE *f)
 {
     if (!f || f->console || !size) return 0;
+    if (dm_wflush(f)) return 0;
     int r = dm_io_read(f->h, ptr, size * n);
     if (r < 0) { f->err = 1; return 0; }
     f->pos += r;
@@ -559,15 +579,27 @@ size_t dm_fwrite(const void *ptr, size_t size, size_t n, FILE *f)
 {
     if (!f || !size) return 0;
     if (f->console) return console_write(ptr, size * n) / size;
-    int r = dm_io_write(f->h, ptr, size * n);
-    if (r < 0) { f->err = 1; return 0; }
-    f->pos += r;
-    return (size_t)r / size;
+    size_t k = size * n;
+    if (!f->wb && k < DM_WBUF) f->wb = dm_malloc(DM_WBUF);
+    if (!f->wb || k >= DM_WBUF)                 /* big write (or no buffer): straight through */
+    {
+        if (dm_wflush(f)) return 0;
+        int r = dm_io_write(f->h, ptr, k);
+        if (r < 0) { f->err = 1; return 0; }
+        f->pos += r;
+        return (size_t)r / size;
+    }
+    if (f->wlen + (int)k > DM_WBUF && dm_wflush(f)) return 0;
+    memcpy(f->wb + f->wlen, ptr, k);
+    f->wlen += (int)k;
+    f->pos += (long)k;
+    return n;
 }
 
 int dm_fseek(FILE *f, long off, int whence)
 {
     if (!f || f->console) return -1;
+    if (dm_wflush(f)) return -1;
     long p = whence == SEEK_SET ? off : whence == SEEK_CUR ? f->pos + off : dm_io_size(f->h) + off;
     if (p < 0 || dm_io_seek(f->h, p)) return -1;
     f->pos = p;
@@ -576,7 +608,7 @@ int dm_fseek(FILE *f, long off, int whence)
 }
 
 long dm_ftell(FILE *f) { return f && !f->console ? f->pos : -1; }
-int  dm_fflush(FILE *f) { (void)f; return 0; }
+int  dm_fflush(FILE *f) { return f ? dm_wflush(f) : 0; }
 int  dm_feof(FILE *f) { return f ? f->eof : 1; }
 int  dm_fputs(const char *s, FILE *f) { return dm_fwrite(s, 1, strlen(s), f) == strlen(s) ? 0 : EOF; }
 int  dm_fputc(int c, FILE *f) { char ch = (char)c; return dm_fwrite(&ch, 1, 1, f) == 1 ? c : EOF; }
