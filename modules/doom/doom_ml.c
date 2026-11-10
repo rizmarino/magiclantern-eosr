@@ -56,7 +56,7 @@ extern char firmware_version[];
 
 static CONFIG_INT("doom.scale", doom_scale, DM_SCALE_ASPECT);
 
-static volatile int doom_running;      /* 1 game, 2 display/input test */
+static volatile int doom_running;      /* 1 game, 2 display/input test, 3 sound test */
 static int doom_played;                /* engine globals are dirty after one run */
 static char wad_path[48];
 
@@ -403,6 +403,200 @@ static void test_task(void *unused)
     NotifyBox(3000, "Doom test: %d frames, %d key events logged", frames, key_events);
 }
 
+static int find_wad(void);
+
+/* ------------------------------------------------------------------ sound test (Canon AudioBeep PCM)
+ * R.180 AudioBeep (AudioDS::AudioBeep.c), ghidra notes "PCM playback for Doom sound" (snd-decomp1-6.c):
+ * FUN_e0294a78(id, spec) copies a 0x40-byte SE spec and posts EV_START_BEEP; with spec[0] = 1 (PCM) it first
+ * sets the player state to 0 (ready). The start handler (e029442a) refuses while Canon plays a movie ("Movie
+ * Playing", result 0x1b) or when the state isn't 0, else starts the output (FUN_e03021fa, result in +0x24).
+ * State block at *(0x9d00): +0x48 state 0 ready / 1 start / 2 stop / 3 complete / 4 continue, +0x24 result.
+ * Canon's own wait (FUN_e0294da0) has no timeout, so we poll the state ourselves. Buffers: fio_malloc
+ * (uncacheable), as Canon's WAV loader uses alloc_dma_memory. Log: ML/DOOM/SOUND.TXT. */
+#define AB_BLOCK      (*(volatile uint32_t *)0x9d00)
+#define AB_INT(off)   (*(volatile int *)(AB_BLOCK + (off)))
+static int (*const ab_start)(int id, uint32_t *spec) = (void *)0xE0294A79;
+static int (*const ab_stop)(int arg) = (void *)0xE0294AEF;
+#define AB_RATE_24K   0x18
+#define AB_RATE_48K   0x30
+
+static char slog[6144];
+static int  sloglen;
+static void slogf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    extern int dm_vsnprintf(char *, size_t, const char *, va_list);
+    if (sloglen < (int)sizeof(slog) - 200) sloglen += dm_vsnprintf(slog + sloglen, sizeof(slog) - sloglen, fmt, ap);
+    va_end(ap);
+}
+static void slog_flush(void)
+{
+    if (!sloglen) return;
+    FIO_CreateDirectory("ML/DOOM");
+    FILE *f = FIO_CreateFileOrAppend("ML/DOOM/SOUND.TXT");
+    if (f) { FIO_WriteFile(f, slog, sloglen); FIO_CloseFile(f); }
+    sloglen = 0;
+}
+
+/* wait until the player is not starting/playing; returns ms waited, or -1 after timeout_ms */
+static int ab_wait_idle(int timeout_ms)
+{
+    uint32_t t0 = get_ms_clock();
+    for (;;)
+    {
+        int st = AB_INT(0x48);
+        if (st == 3 || st == 0) return get_ms_clock() - t0;
+        if ((int)(get_ms_clock() - t0) > timeout_ms) return -1;
+        msleep(2);
+    }
+}
+
+/* play one buffer; logs start latency and length. wait_done: wait for "complete" (up to len + 1 s) */
+static int ab_play(const char *what, void *buf, int bytes, int rate, int ch, int outsel, int vol, int wait_done)
+{
+    uint32_t spec[16];
+    memset(spec, 0, sizeof spec);
+    spec[0] = 1;  spec[1] = (uint32_t)buf;  spec[2] = bytes;  spec[5] = vol;  spec[6] = 0;  spec[7] = outsel;
+    spec[9] = rate;  spec[10] = 16;  spec[11] = ch;  spec[12] = 0;
+    int st0 = AB_INT(0x48);
+    if (st0 != 0 && st0 != 3)
+    {
+        ab_stop(1);
+        int w = ab_wait_idle(500);
+        slogf("  (was playing: state %d, stop took %d ms)\n", st0, w);
+    }
+    uint64_t t0 = get_us_clock();
+    int rc = ab_start(0, spec);
+    int t_start = -1, t_end = -1, st, last = -1, ms_len = bytes * 1000 / (2 * ch * (rate == AB_RATE_48K ? 48000 : 24000));
+    int limit = wait_done ? ms_len + 1000 : 300;
+    for (;;)
+    {
+        st = AB_INT(0x48);
+        int ms = (int)((get_us_clock() - t0) / 1000);
+        if (st != last) { last = st; if (st == 1 && t_start < 0) t_start = ms; if (st == 3 && t_start >= 0) { t_end = ms; break; } }
+        if (!wait_done && t_start >= 0) break;
+        if (ms > limit) break;
+        msleep(1);
+    }
+    slogf("%s: buf %x %d bytes, rate %x ch %d out %d vol %d: post rc %d, state before %d, started after %d ms, "
+          "complete after %d ms (expected %d), state now %d, result %d\n", what, (int)buf, bytes, rate, ch, outsel, vol,
+          rc, st0, t_start, t_end, ms_len, AB_INT(0x48), AB_INT(0x24));
+    return t_end >= 0 ? t_end : -1;
+}
+
+static int16_t *tone(int16_t *p, int n, int rate_hz, int ch, int freq, int amp)
+{
+    /* triangle wave (no float or sine table needed), 5 ms fade in/out against clicks */
+    int period = rate_hz / freq, fade = rate_hz / 200;
+    for (int i = 0; i < n; i++)
+    {
+        int ph = i % period, v = ph < period / 2 ? ph * 4 * amp / period - amp : 3 * amp - ph * 4 * amp / period;
+        if (i < fade) v = v * i / fade;
+        if (n - i < fade) v = v * (n - i) / fade;
+        for (int c = 0; c < ch; c++) *p++ = (int16_t)v;
+    }
+    return p;
+}
+
+/* Doom sfx lump (format 3: u16 3, u16 rate, u32 n, 16 pad, samples u8, 16 pad) -> 24 kHz s16 mono. bytes or 0 */
+static int load_sfx(const char *lump, int16_t *out, int max_samples)
+{
+    if (!find_wad()) return 0;
+    FILE *f = FIO_OpenFile(wad_path, O_RDONLY);
+    if (!f) return 0;
+    int got = 0;
+    uint8_t *b = fio_malloc(64 * 1024);
+    if (b && FIO_ReadFile(f, b, 12) == 12 && !memcmp(b + 1, "WAD", 3))
+    {
+        int nl = *(int *)(b + 4), dir = *(int *)(b + 8), pos = -1, size = 0;
+        for (int i = 0; i < nl && pos < 0; i += 2048)
+        {
+            int k = MIN(2048, nl - i);
+            FIO_SeekSkipFile(f, dir + i * 16, SEEK_SET);
+            if (FIO_ReadFile(f, b, k * 16) != k * 16) break;
+            for (int j = 0; j < k; j++) if (!strncmp((char *)b + j * 16 + 8, lump, 8)) { pos = *(int *)(b + j * 16); size = *(int *)(b + j * 16 + 4); break; }
+        }
+        if (pos > 0 && size > 40 && size <= 64 * 1024)
+        {
+            FIO_SeekSkipFile(f, pos, SEEK_SET);
+            if (FIO_ReadFile(f, b, size) == size && b[0] == 3)
+            {
+                int rate = b[2] | (b[3] << 8), n = *(int *)(b + 4) - 32;
+                uint8_t *smp = b + 8 + 16;
+                if (n > size - 40) n = size - 40;
+                int m = (int)((int64_t)n * 24000 / rate);
+                if (m > max_samples) m = max_samples;
+                for (int i = 0; i < m; i++)             /* linear interpolation, 16.16 */
+                {
+                    uint32_t x = (uint32_t)((int64_t)i * rate * 65536 / 24000);
+                    int i0 = x >> 16, fr = x & 0xffff, a = smp[i0] - 128, c = smp[MIN(i0 + 1, n - 1)] - 128;
+                    out[i] = (int16_t)((a * 65536 + (c - a) * fr) >> 8);
+                }
+                got = m * 2;
+                slogf("sfx %s: %d samples at %d Hz -> %d at 24000\n", lump, n, rate, m);
+            }
+        }
+        else slogf("sfx %s: not found (pos %d size %d)\n", lump, pos, size);
+    }
+    if (b) free(b);
+    FIO_CloseFile(f);
+    return got;
+}
+
+static void sound_task(void *unused)
+{
+    slogf("\n=== sound test: %s fw %s, lv %d, movie mode %d, AudioBeep block %x state %d result %d\n", camera_model,
+          firmware_version, lv, is_movie_mode(), (int)AB_BLOCK, AB_BLOCK ? AB_INT(0x48) : -1, AB_BLOCK ? AB_INT(0x24) : -1);
+    if (!AB_BLOCK) { slog_flush(); NotifyBox(4000, "Sound test: AudioBeep not initialised"); doom_running = 0; return; }
+    int16_t *b = fio_malloc(200 * 1024);
+    if (!b) { slogf("no memory\n"); slog_flush(); doom_running = 0; return; }
+    slogf("buffer %x\n", (int)b);
+    slog_flush();
+    int n;
+
+    NotifyBox(2000, "Sound test 1/6: low tone (24 kHz, output 0)");
+    n = tone(b, 12000, 24000, 1, 440, 8000) - b;
+    ab_play("1 tone 440 Hz 24k mono out0", b, n * 2, AB_RATE_24K, 1, 0, 5, 1); slog_flush(); msleep(700);
+
+    NotifyBox(2000, "Sound test 2/6: low tone (24 kHz, output 1)");
+    ab_play("2 tone 440 Hz 24k mono out1", b, n * 2, AB_RATE_24K, 1, 1, 5, 1); slog_flush(); msleep(700);
+
+    NotifyBox(2000, "Sound test 3/6: higher tone (48 kHz stereo)");
+    n = tone(b, 24000, 48000, 2, 660, 8000) - b;
+    ab_play("3 tone 660 Hz 48k stereo out0", b, n * 2, AB_RATE_48K, 2, 0, 5, 1); slog_flush(); msleep(700);
+
+    NotifyBox(2000, "Sound test 4/6: Doom pistol");
+    int pb = load_sfx("DSPISTOL", b, 100 * 1024 / 2);
+    if (pb) ab_play("4 DSPISTOL 24k mono out0", b, pb, AB_RATE_24K, 1, 0, 5, 1);
+    slog_flush(); msleep(700);
+
+    NotifyBox(3000, "Sound test 5/6: 10 short beeps back to back");
+    int16_t *b2 = b + 2400 + 64;                       /* two 100 ms buffers: 440 / 880 Hz */
+    tone(b, 2400, 24000, 1, 440, 8000); tone(b2, 2400, 24000, 1, 880, 8000);
+    uint64_t t5 = get_us_clock();
+    for (int i = 0; i < 10; i++)
+    {
+        char w[32]; dm_snprintf(w, sizeof w, "5.%d back-to-back 100 ms", i);
+        ab_play(w, i & 1 ? b2 : b, 4800, AB_RATE_24K, 1, 0, 5, 1);
+    }
+    slogf("5 total %d ms for 10 x 100 ms\n", (int)((get_us_clock() - t5) / 1000));
+    slog_flush(); msleep(700);
+
+    NotifyBox(3000, "Sound test 6/6: long tone, cut off by a high one");
+    n = tone(b, 24000, 24000, 1, 440, 8000) - b;
+    int16_t *b3 = b + n + 64;
+    int n3 = tone(b3, 7200, 24000, 1, 880, 8000) - b3;
+    ab_play("6a long 1 s tone (not waited)", b, n * 2, AB_RATE_24K, 1, 0, 5, 0);
+    msleep(200);
+    ab_play("6b cut-in 300 ms", b3, n3 * 2, AB_RATE_24K, 1, 0, 5, 1);
+    slogf("end: state %d result %d\n", AB_INT(0x48), AB_INT(0x24));
+    slog_flush();
+    free(b);
+    doom_running = 0;
+    NotifyBox(4000, "Sound test done: see ML/DOOM/SOUND.TXT");
+}
+
 /* ------------------------------------------------------------------ menu */
 
 static const char *wads[] = { "DOOM1.WAD", "DOOM.WAD", "DOOMU.WAD", "DOOM2.WAD", "FREEDOOM1.WAD", "FREEDOOM2.WAD" };
@@ -440,6 +634,13 @@ static MENU_SELECT_FUNC(doom_test)
     task_create("doom_test", 0x1d, 0x2000, test_task, 0);
 }
 
+static MENU_SELECT_FUNC(doom_sound_test)
+{
+    if (doom_running) return;
+    doom_running = 3;
+    task_create("doom_snd", 0x1d, 0x2000, sound_task, 0);
+}
+
 static MENU_UPDATE_FUNC(doom_play_update)
 {
     if (doom_played) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Already played this power-on: restart the camera.");
@@ -469,6 +670,12 @@ static struct menu_entry doom_menu[] =
                 .select  = doom_test,
                 .help    = "Test pattern + key log (ML/DOOM/KEYS.TXT). Border changes on each key.",
                 .help2   = "MENU ends it (or 30 s without keys). No WAD needed.",
+            },
+            {
+                .name    = "Sound test",
+                .select  = doom_sound_test,
+                .help    = "6 short sounds through Canon's speaker (~15 s). Log: ML/DOOM/SOUND.TXT.",
+                .help2   = "Tones, the Doom pistol, back-to-back and cut-in timing. Photo mode first.",
             },
             MENU_EOL,
         },
