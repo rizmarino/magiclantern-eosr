@@ -20,20 +20,36 @@
 
 #define DI_TBL      0xE0B40A58          /* m_AnalogIsoGainFix, mode 0 */
 #define DI_MSTRIDE  0x33c
-#define DI_ROW      0x24                /* register row 1 = CMOS reg 0x2D */
+#define DI_NROWS    2                   /* patchable rows: 1 = CMOS reg 0x2D, 3 = reg 0x2F */
 #define DI_NMODES   9
 #define DI_NISO     9
 #define DI_STATE    0xef24              /* ImageSequence state: +0 ISO index (byte), +4 short, +0xc m_SensorMode, +0x48 */
 #define DI_LOG      "ML/DUALISO.TXT"
 
+/* v4.53 (camera 2026-11-11, v4.52): Canon's still command buffer carried every patched reg 0x2D word; field 3 (bits
+ * 12-15) alone = whole-frame analog gain (+2.87 stops for step 4), fields 1, 2, 4 no visible effect. Now a list of
+ * candidates, one experiment each: an enable bit above the second field (as on the 5D2: bit 20/21 of the 22-bit
+ * data, always 0 in Canon's table), and one of the four look-alike registers 0x2F-0x32. */
+static const uint8_t di_rows[DI_NROWS] = { 1, 3 };
+static const uint8_t di_regs[DI_NROWS] = { 0x2D, 0x2F };
+struct di_cand { uint8_t row; uint32_t isof; uint32_t bits; int8_t from_col; };
+static const struct di_cand di_cands[] = {
+    { 0, 0x0F000, 0,        -1 },       /* 0x2D field 3 = 2nd ISO: whole-frame control */
+    { 0, 0xF0000, 0x100000, -1 },       /* field 4 + bit 20 */
+    { 0, 0xF0000, 0x200000, -1 },       /* field 4 + bit 21 */
+    { 0, 0x00FF0, 0x100000, -1 },       /* fields 1+2 + bit 20 */
+    { 0, 0x00FF0, 0x200000, -1 },       /* fields 1+2 + bit 21 */
+    { 0, 0xF0FF0, 0x300000, -1 },       /* fields 1, 2, 4 + bits 20+21 */
+    { 1, 0,       0,         8 },       /* 0x2F = its ISO 25600 value (2222) */
+};
 static int di_on, di_err, di_applied_iso = -1, di_applied_pat = -1, di_bad, di_skipped;
 static CONFIG_INT("dualiso.test.iso", di_iso, 4);       /* 0..7 = ISO 100..12800 */
-static CONFIG_INT("dualiso.test.fields", di_pat, 0);
-static const uint32_t di_masks[] = { 0x00FF0, 0x0F0F0, 0xF00F0, 0xFFFF0 };
-static uint32_t di_orig[DI_NMODES][DI_NISO];
+static CONFIG_INT("dualiso.test.cand", di_pat, 0);
+static uint32_t di_orig[DI_NROWS][DI_NMODES][DI_NISO];
 static int di_have_orig;
 
-static uint32_t di_rom(int m, int c) { return DI_TBL + m * DI_MSTRIDE + DI_ROW + c * 4; }
+static uint32_t di_rom_r(int r, int m, int c) { return DI_TBL + m * DI_MSTRIDE + di_rows[r] * 0x24 + c * 4; }
+static uint32_t di_rom(int m, int c) { return di_rom_r(0, m, c); }
 
 /* v4.52 (camera 2026-11-11: patched table read back fine, but 0 effect on CR3s/LV): also watch what Canon puts into
  * the command buffers the CMOS DMA sends (FUN_e06a19a4 walks them up to 0xffffffff): the still buffer
@@ -64,10 +80,10 @@ static uint32_t di_lv_word(int n)
 #define DI_NW 64
 static struct { uint32_t ms; uint8_t which; uint32_t v; } di_w[DI_NW];
 static volatile int di_nw, di_nw_lost;
-static uint32_t di_wlast[1 + DI_NLV];
+static uint32_t di_wlast[2 + DI_NLV];
 static volatile int di_mism, di_mism_checks;
 static volatile uint32_t di_mism_first, di_mism_val, di_mism_ms;
-static uint32_t di_want[DI_NMODES][DI_NISO];
+static uint32_t di_want[DI_NROWS][DI_NMODES][DI_NISO];
 static int di_cpu;
 
 static void di_note_word(int which, uint32_t v)
@@ -104,12 +120,17 @@ static void di_flush(void)
     di_len = 0;
 }
 
-static int di_check_orig(int m)
+static int di_check_orig(int r, int m)
 {
+    if (r)                              /* reg 0x2F: just the register number */
+    {
+        for (int c = 0; c < DI_NISO; c++) if ((di_orig[r][m][c] >> 22) != di_regs[r]) return 0;
+        return 1;
+    }
     /* every column must be reg 0x2D with four equal fields */
     for (int c = 0; c < DI_NISO; c++)
     {
-        uint32_t v = di_orig[m][c];
+        uint32_t v = di_orig[0][m][c];
         uint32_t f = (v >> 4) & 0xF;
         if ((v >> 22) != 0x2D || ((v >> 8) & 0xF) != f || ((v >> 12) & 0xF) != f || ((v >> 16) & 0xF) != f || f > 7)
             return 0;
@@ -120,12 +141,14 @@ static int di_check_orig(int m)
 static void di_dump_rows(const char *what)
 {
     di_printf("%s (read through the ROM addresses):\n", what);
-    for (int m = 0; m < DI_NMODES; m++)
-    {
-        di_printf("  mode %d %x:", m, (int)di_rom(m, 0));
-        for (int c = 0; c < DI_NISO; c++) di_printf(" %x", (int)(*(volatile uint32_t *)di_rom(m, c) & 0x3fffff));
-        di_printf("\n");
-    }
+    for (int r = 0; r < DI_NROWS; r++)
+        for (int m = 0; m < DI_NMODES; m++)
+        {
+            if (m != 0 && m != 4) continue;     /* still (table 0) and photo LV (table 4) */
+            di_printf("  reg %x mode %d %x:", di_regs[r], m, (int)di_rom_r(r, m, 0));
+            for (int c = 0; c < DI_NISO; c++) di_printf(" %x", (int)(*(volatile uint32_t *)di_rom_r(r, m, c) & 0x3fffff));
+            di_printf("\n");
+        }
 }
 
 /* write the table: on = patched with (iso, pat), off = Canon's values. returns 0 or an error code */
@@ -135,29 +158,31 @@ static int di_write(int on)
     if (err) return 0x20000 | (-err);
     if (!di_have_orig)
     {
-        for (int m = 0; m < DI_NMODES; m++)
-            for (int c = 0; c < DI_NISO; c++) di_orig[m][c] = *(volatile uint32_t *)di_rom(m, c);
+        for (int r = 0; r < DI_NROWS; r++)
+            for (int m = 0; m < DI_NMODES; m++)
+                for (int c = 0; c < DI_NISO; c++) di_orig[r][m][c] = *(volatile uint32_t *)di_rom_r(r, m, c);
         di_have_orig = 1;
     }
-    uint32_t mask = di_masks[di_pat], alt = (uint32_t)di_iso * 0x11110;
+    const struct di_cand *k = &di_cands[di_pat];
+    uint32_t alt = (uint32_t)di_iso * 0x11110, mask = k->isof | k->bits;
     di_bad = di_skipped = 0;
     di_cpu = get_cpu_id();
-    for (int m = 0; m < DI_NMODES; m++)
-        for (int c = 0; c < DI_NISO; c++) di_want[m][c] = di_orig[m][c];
-    for (int m = 0; m < DI_NMODES; m++)
-    {
-        if (!di_check_orig(m)) { di_skipped++; continue; }
-        for (int c = 0; c < DI_NISO; c++)
+    for (int r = 0; r < DI_NROWS; r++)
+        for (int m = 0; m < DI_NMODES; m++)
         {
-            uint32_t v = on ? (di_orig[m][c] & ~mask) | (alt & mask) : di_orig[m][c];
-            di_want[m][c] = v;
-            uint32_t *ram = (uint32_t *)romremap_ram(di_rom(m, c));
-            if (!ram) return 0x30000;
-            *ram = v;
-            romremap_flush(ram, 4);
-            if (*(volatile uint32_t *)di_rom(m, c) != v) di_bad++;
+            if (!di_check_orig(r, m)) { di_skipped++; continue; }
+            for (int c = 0; c < DI_NISO; c++)
+            {
+                uint32_t o = di_orig[r][m][c], v = o;
+                if (on && r == k->row)
+                    v = k->from_col >= 0 ? di_orig[r][m][k->from_col] : (o & ~mask) | (alt & k->isof) | k->bits;
+                di_want[r][m][c] = v;
+                uint32_t *ram = (uint32_t *)romremap_ram(di_rom_r(r, m, c));
+                if (!ram) return 0x30000;
+                if (*ram != v) { *ram = v; romremap_flush(ram, 4); }
+                if (*(volatile uint32_t *)di_rom_r(r, m, c) != v) di_bad++;
+            }
         }
-    }
     return di_bad ? 0x40000 | di_bad : 0;
 }
 
@@ -183,18 +208,19 @@ static void di_sample_task(void *unused)
             else di_ns_lost++;
         }
         uint32_t sb = di_still_buf();
-        if (sb) di_note_word(0, *(volatile uint32_t *)(sb + 4));
+        if (sb) { di_note_word(0, *(volatile uint32_t *)(sb + 4)); di_note_word(1 + DI_NLV, *(volatile uint32_t *)(sb + 12)); }
         for (int n = 0; n < DI_NLV; n++) di_note_word(1 + n, di_lv_word(n));
         if (++tick % 40 == 0 && di_have_orig)
         {
             di_mism_checks++;
+            for (int r = 0; r < DI_NROWS; r++)
             for (int m = 0; m < DI_NMODES; m++)
                 for (int c = 0; c < DI_NISO; c++)
                 {
-                    uint32_t v = *(volatile uint32_t *)di_rom(m, c);
-                    if (v != di_want[m][c])
+                    uint32_t v = *(volatile uint32_t *)di_rom_r(r, m, c);
+                    if (v != di_want[r][m][c])
                     {
-                        if (!di_mism) { di_mism_first = di_rom(m, c); di_mism_val = v; di_mism_ms = get_ms_clock(); }
+                        if (!di_mism) { di_mism_first = di_rom_r(r, m, c); di_mism_val = v; di_mism_ms = get_ms_clock(); }
                         di_mism++;
                     }
                 }
@@ -220,7 +246,17 @@ static void di_log_words(void)
         }
         di_printf("\n");
     }
-    di_printf("reg 0x2D word changes (%d, %d not logged): ms buffer(0 = still, n = LV n-1) word\n", di_nw, di_nw_lost);
+    /* GAIN9-12 for stills come from records behind the pointer table at 0x68668 (FUN_e06a0dca), not this table */
+    for (int i = 0; i < 9; i++)
+    {
+        uint32_t p = *(volatile uint32_t *)(0x68668 + i * 4);
+        di_printf("  gain ptr %d: %x", i, (int)p);
+        if (di_ram_ok(p) || (p >= 0xE0000000 && p < 0xE2000000 && !(p & 3)))
+            for (int j = 0; j < 4; j++) di_printf(" %x", (int)*(volatile uint32_t *)(p + j * 4));
+        di_printf("\n");
+    }
+    di_printf("reg word changes (%d, %d not logged): ms buffer(0 = still 0x2D, n = LV n-1 0x2D, %d = still 0x2F) word\n",
+              di_nw, di_nw_lost, 1 + DI_NLV);
     for (int i = 0; i < di_nw; i++) di_printf("  %d %d %x\n", (int)di_w[i].ms, di_w[i].which, (int)di_w[i].v);
     di_nw = di_nw_lost = 0;
     di_mism = di_mism_checks = 0;
@@ -239,9 +275,10 @@ static void di_apply(int on)
 {
     int t0 = get_ms_clock();
     di_err = di_write(on);
-    di_printf("\n=== %d ms: dual ISO test %s: second ISO %d (step %d), fields mask %x; result %x (%s), %d modes skipped, "
-              "%d bad read-backs, %d ms\n", t0, on ? "ON" : "OFF", 100 << di_iso, di_iso, (int)di_masks[di_pat], di_err,
-              romremap_stage(), di_skipped, di_bad, (int)(get_ms_clock() - t0));
+    di_printf("\n=== %d ms: dual ISO test %s: second ISO %d (step %d), candidate %d (reg %x isof %x bits %x col %d); "
+              "result %x (%s), %d rows skipped, %d bad read-backs, %d ms\n", t0, on ? "ON" : "OFF", 100 << di_iso, di_iso,
+              di_pat, di_regs[di_cands[di_pat].row], (int)di_cands[di_pat].isof, (int)di_cands[di_pat].bits,
+              di_cands[di_pat].from_col, di_err, romremap_stage(), di_skipped, di_bad, (int)(get_ms_clock() - t0));
     if (!di_err) di_dump_rows(on ? "patched rows" : "restored rows");
     if (!on) di_log_samples();
     di_flush();
@@ -251,8 +288,7 @@ static void di_apply(int on)
     di_applied_pat = on ? di_pat : -1;
     if (on && !di_task_run) { di_task_run = 1; di_ns = di_ns_lost = 0; task_create("di_sample", 0x1e, 0x800, di_sample_task, 0); }
     /* v4.52: the watcher keeps running after OFF, so reference shots are logged too */
-    NotifyBox(4000, on ? "Dual ISO test ON (ISO %d on fields %x). Change Canon ISO once." : "Dual ISO test OFF: Canon values back",
-              100 << di_iso, (int)di_masks[di_pat]);
+    NotifyBox(4000, on ? "Dual ISO test ON: candidate %d, ISO %d" : "Dual ISO test OFF: Canon values back", di_pat, 100 << di_iso);
 }
 
 static MENU_SELECT_FUNC(di_toggle) { di_apply(!di_on); }
@@ -263,7 +299,7 @@ static MENU_SELECT_FUNC(di_iso_select)
 }
 static MENU_SELECT_FUNC(di_pat_select)
 {
-    menu_numeric_toggle(&di_pat, delta, 0, COUNT(di_masks) - 1);
+    menu_numeric_toggle(&di_pat, delta, 0, COUNT(di_cands) - 1);
     if (di_on) di_apply(1);
 }
 static MENU_SELECT_FUNC(di_save_select)
@@ -314,13 +350,13 @@ static struct menu_entry di_menu[] = {
                 .help    = "ISO for the patched fields. Canon's ISO setting stays the base ISO.",
             },
             {
-                .name    = "Fields",
+                .name    = "Candidate",
                 .priv    = &di_pat,
-                .max     = 3,
-                .choices = CHOICES("1+2", "1+3", "1+4", "All 4 (control)"),
+                .max     = 6,
+                .choices = CHOICES("0 control", "1 f4+b20", "2 f4+b21", "3 f12+b20", "4 f12+b21", "5 f124+b2021", "6 reg 2F"),
                 .select  = di_pat_select,
-                .help    = "Which of the register's 4 ISO fields get the second ISO.",
-                .help2   = "All 4 = whole picture at the second ISO (proves the patch works).",
+                .help    = "Experiment: 0 = whole frame at 2nd ISO (control); 1-5 = enable-bit tries",
+                .help2   = "on reg 0x2D; 6 = reg 0x2F at its ISO 25600 value. One photo each.",
             },
             {
                 .name    = "Save log",
