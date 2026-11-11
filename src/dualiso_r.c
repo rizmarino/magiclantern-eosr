@@ -35,6 +35,50 @@ static int di_have_orig;
 
 static uint32_t di_rom(int m, int c) { return DI_TBL + m * DI_MSTRIDE + DI_ROW + c * 4; }
 
+/* v4.52 (camera 2026-11-11: patched table read back fine, but 0 effect on CR3s/LV): also watch what Canon puts into
+ * the command buffers the CMOS DMA sends (FUN_e06a19a4 walks them up to 0xffffffff): the still buffer
+ * (*0x1769c + 0x28dc, filled by M_/E_/SRS_SetReadOut via FUN_e06a0dca; word 1 = reg 0x2D) and the LV buffers
+ * (*0x176a8 + 0x1bac + n * 0xac, FUN_e06cb1f4; reg 0x2D word found by scanning), and re-check the patched table
+ * every 200 ms (the first apply's dump showed whole 32-byte lines back at Canon's values). */
+#define DI_STILLP   0x1769c
+#define DI_LVP      0x176a8
+#define DI_NLV      10
+static int di_ram_ok(uint32_t a) { return a >= 0x1000 && a < 0x80000000 && !(a & 3); }
+static uint32_t di_still_buf(void)
+{
+    uint32_t p = *(volatile uint32_t *)DI_STILLP;
+    return di_ram_ok(p) ? p + 0x28dc : 0;
+}
+static uint32_t di_lv_word(int n)
+{
+    uint32_t p = *(volatile uint32_t *)DI_LVP;
+    if (!di_ram_ok(p)) return 0;
+    volatile uint32_t *b = (volatile uint32_t *)(p + 0x1bac + n * 0xac);
+    for (int i = 0; i < 0xac / 4; i++)
+    {
+        if (b[i] == 0xffffffff) break;
+        if ((b[i] >> 22) == 0x2D) return b[i];
+    }
+    return 0;
+}
+#define DI_NW 64
+static struct { uint32_t ms; uint8_t which; uint32_t v; } di_w[DI_NW];
+static volatile int di_nw, di_nw_lost;
+static uint32_t di_wlast[1 + DI_NLV];
+static volatile int di_mism, di_mism_checks;
+static volatile uint32_t di_mism_first, di_mism_val, di_mism_ms;
+static uint32_t di_want[DI_NMODES][DI_NISO];
+static int di_cpu;
+
+static void di_note_word(int which, uint32_t v)
+{
+    if (v == di_wlast[which]) return;
+    di_wlast[which] = v;
+    int i = di_nw;
+    if (i < DI_NW) { di_w[i].ms = get_ms_clock(); di_w[i].which = which; di_w[i].v = v; di_nw = i + 1; }
+    else di_nw_lost++;
+}
+
 /* sensor-state transitions while the test is on (which m_SensorMode does a still capture use?) */
 #define DI_NS 96
 static struct { uint32_t ms; uint8_t iso; uint8_t mode; uint8_t fine; uint8_t mapped; int16_t v4; } di_s[DI_NS];
@@ -97,12 +141,16 @@ static int di_write(int on)
     }
     uint32_t mask = di_masks[di_pat], alt = (uint32_t)di_iso * 0x11110;
     di_bad = di_skipped = 0;
+    di_cpu = get_cpu_id();
+    for (int m = 0; m < DI_NMODES; m++)
+        for (int c = 0; c < DI_NISO; c++) di_want[m][c] = di_orig[m][c];
     for (int m = 0; m < DI_NMODES; m++)
     {
         if (!di_check_orig(m)) { di_skipped++; continue; }
         for (int c = 0; c < DI_NISO; c++)
         {
             uint32_t v = on ? (di_orig[m][c] & ~mask) | (alt & mask) : di_orig[m][c];
+            di_want[m][c] = v;
             uint32_t *ram = (uint32_t *)romremap_ram(di_rom(m, c));
             if (!ram) return 0x30000;
             *ram = v;
@@ -115,7 +163,7 @@ static int di_write(int on)
 
 static void di_sample_task(void *unused)
 {
-    int last = -1;
+    int last = -1, tick = 0;
     while (di_task_run)
     {
         volatile uint8_t *s = (volatile uint8_t *)DI_STATE;
@@ -134,12 +182,53 @@ static void di_sample_task(void *unused)
             }
             else di_ns_lost++;
         }
+        uint32_t sb = di_still_buf();
+        if (sb) di_note_word(0, *(volatile uint32_t *)(sb + 4));
+        for (int n = 0; n < DI_NLV; n++) di_note_word(1 + n, di_lv_word(n));
+        if (++tick % 40 == 0 && di_have_orig)
+        {
+            di_mism_checks++;
+            for (int m = 0; m < DI_NMODES; m++)
+                for (int c = 0; c < DI_NISO; c++)
+                {
+                    uint32_t v = *(volatile uint32_t *)di_rom(m, c);
+                    if (v != di_want[m][c])
+                    {
+                        if (!di_mism) { di_mism_first = di_rom(m, c); di_mism_val = v; di_mism_ms = get_ms_clock(); }
+                        di_mism++;
+                    }
+                }
+        }
         msleep(5);
     }
 }
 
+static void di_log_words(void)
+{
+    uint32_t sb = di_still_buf();
+    di_printf("command buffers: still %x, LV base %x; table re-checks %d, mismatches %d (first %x = %x at %d ms); "
+              "patch ran on cpu %d\n", (int)sb, (int)*(volatile uint32_t *)DI_LVP, di_mism_checks, di_mism,
+              (int)di_mism_first, (int)di_mism_val, (int)di_mism_ms, di_cpu);
+    if (sb)
+    {
+        di_printf("  still buffer now:");
+        for (int i = 0; i < 40; i++)
+        {
+            uint32_t v = *(volatile uint32_t *)(sb + i * 4);
+            di_printf(" %x", (int)v);
+            if (v == 0xffffffff) break;
+        }
+        di_printf("\n");
+    }
+    di_printf("reg 0x2D word changes (%d, %d not logged): ms buffer(0 = still, n = LV n-1) word\n", di_nw, di_nw_lost);
+    for (int i = 0; i < di_nw; i++) di_printf("  %d %d %x\n", (int)di_w[i].ms, di_w[i].which, (int)di_w[i].v);
+    di_nw = di_nw_lost = 0;
+    di_mism = di_mism_checks = 0;
+}
+
 static void di_log_samples(void)
 {
+    di_log_words();
     di_printf("sensor state changes (%d, %d not logged): ms iso_idx m_SensorMode -> table mode, fine, v4\n", di_ns, di_ns_lost);
     for (int i = 0; i < di_ns; i++)
         di_printf("  %d %x %d -> %d %d %d\n", (int)di_s[i].ms, di_s[i].iso, di_s[i].mode, di_s[i].mapped, di_s[i].fine, di_s[i].v4);
@@ -161,7 +250,7 @@ static void di_apply(int on)
     di_applied_iso = on ? di_iso : -1;
     di_applied_pat = on ? di_pat : -1;
     if (on && !di_task_run) { di_task_run = 1; di_ns = di_ns_lost = 0; task_create("di_sample", 0x1e, 0x800, di_sample_task, 0); }
-    if (!on) di_task_run = 0;
+    /* v4.52: the watcher keeps running after OFF, so reference shots are logged too */
     NotifyBox(4000, on ? "Dual ISO test ON (ISO %d on fields %x). Change Canon ISO once." : "Dual ISO test OFF: Canon values back",
               100 << di_iso, (int)di_masks[di_pat]);
 }
@@ -179,6 +268,7 @@ static MENU_SELECT_FUNC(di_pat_select)
 }
 static MENU_SELECT_FUNC(di_save_select)
 {
+    if (!di_task_run) { di_task_run = 1; task_create("di_sample", 0x1e, 0x800, di_sample_task, 0); }
     di_printf("\n=== %d ms: log saved (test %s)\n", (int)get_ms_clock(), di_on ? "ON" : "OFF");
     di_log_samples();
     di_flush();
