@@ -32,16 +32,62 @@
  * data, always 0 in Canon's table), and one of the four look-alike registers 0x2F-0x32. */
 static const uint8_t di_rows[DI_NROWS] = { 1, 3 };
 static const uint8_t di_regs[DI_NROWS] = { 0x2D, 0x2F };
-struct di_cand { uint8_t row; uint32_t isof; uint32_t bits; int8_t from_col; };
+/* v4.54 (camera 2026-11-11, v4.53: candidates 1-6 no effect on level, rows, cols, Bayer or noise): GAIN9-12
+ * (regs 0x34-0x37) for stills come from 4-word records in uncached RAM behind the pointer table 0x68668 (one per
+ * gain index: 1b1b at ISO 100 ... 1414 at the top). Candidates 7-13 set some of them, or one byte, to Canon's own
+ * 1414 in all 9 records (no remap needed). row 0xff = gain candidate: gregs = register mask (bit 0 = GAIN9),
+ * gbytes = which bytes. */
+struct di_cand { uint8_t row; uint32_t isof; uint32_t bits; int8_t from_col; uint8_t gregs; uint16_t gbytes; };
 static const struct di_cand di_cands[] = {
-    { 0, 0x0F000, 0,        -1 },       /* 0x2D field 3 = 2nd ISO: whole-frame control */
-    { 0, 0xF0000, 0x100000, -1 },       /* field 4 + bit 20 */
-    { 0, 0xF0000, 0x200000, -1 },       /* field 4 + bit 21 */
-    { 0, 0x00FF0, 0x100000, -1 },       /* fields 1+2 + bit 20 */
-    { 0, 0x00FF0, 0x200000, -1 },       /* fields 1+2 + bit 21 */
-    { 0, 0xF0FF0, 0x300000, -1 },       /* fields 1, 2, 4 + bits 20+21 */
-    { 1, 0,       0,         8 },       /* 0x2F = its ISO 25600 value (2222) */
+    { 0, 0x0F000, 0,         -1, 0, 0 },/* 0x2D field 3 = 2nd ISO: whole-frame control */
+    { 0, 0xF0000, 0x100000,  -1, 0, 0 },/* field 4 + bit 20 */
+    { 0, 0xF0000, 0x200000,  -1, 0, 0 },/* field 4 + bit 21 */
+    { 0, 0x00FF0, 0x100000,  -1, 0, 0 },/* fields 1+2 + bit 20 */
+    { 0, 0x00FF0, 0x200000,  -1, 0, 0 },/* fields 1+2 + bit 21 */
+    { 0, 0xF0FF0, 0x300000,  -1, 0, 0 },/* fields 1, 2, 4 + bits 20+21 */
+    { 1, 0,       0,         8, 0, 0 },/* 0x2F = its ISO 25600 value (2222) */
+    { 0xff, 0, 0, -1, 0xF, 0xFFFF },    /* GAIN9-12 all = 1414 (control for this family) */
+    { 0xff, 0, 0, -1, 0x1, 0xFFFF },    /* GAIN9 only */
+    { 0xff, 0, 0, -1, 0x2, 0xFFFF },    /* GAIN10 only */
+    { 0xff, 0, 0, -1, 0x4, 0xFFFF },    /* GAIN11 only */
+    { 0xff, 0, 0, -1, 0x8, 0xFFFF },    /* GAIN12 only */
+    { 0xff, 0, 0, -1, 0x1, 0x00FF },    /* GAIN9 low byte */
+    { 0xff, 0, 0, -1, 0x1, 0xFF00 },    /* GAIN9 high byte */
 };
+#define DI_GPTR   0x68668
+#define DI_NGREC  9
+static uint32_t *di_grec[DI_NGREC];
+static uint32_t di_gorig[DI_NGREC][4];
+static int di_have_gorig, di_gerr;
+static int di_ram_ok(uint32_t a);
+/* patch (on) or restore the GAIN9-12 records; returns records touched or -1 */
+static int di_gain_write(int on, const struct di_cand *k)
+{
+    if (!di_have_gorig)
+    {
+        for (int i = 0; i < DI_NGREC; i++)
+        {
+            uint32_t p = *(volatile uint32_t *)(DI_GPTR + i * 4);
+            if (!di_ram_ok(p)) { di_gerr = i + 1; return -1; }
+            di_grec[i] = (uint32_t *)p;
+            for (int j = 0; j < 4; j++)
+            {
+                di_gorig[i][j] = di_grec[i][j];
+                if ((di_gorig[i][j] >> 22) != (uint32_t)(0x34 + j)) { di_gerr = 0x100 + i * 4 + j; return -1; }
+            }
+        }
+        di_have_gorig = 1;
+    }
+    int n = 0;
+    for (int i = 0; i < DI_NGREC; i++)
+        for (int j = 0; j < 4; j++)
+        {
+            uint32_t v = di_gorig[i][j];
+            if (on && k->row == 0xff && (k->gregs & (1 << j))) v = (v & ~(uint32_t)k->gbytes) | (0x1414 & k->gbytes);
+            if (*(volatile uint32_t *)&di_grec[i][j] != v) { *(volatile uint32_t *)&di_grec[i][j] = v; n++; }
+        }
+    return n;
+}
 static int di_on, di_err, di_applied_iso = -1, di_applied_pat = -1, di_bad, di_skipped;
 static CONFIG_INT("dualiso.test.iso", di_iso, 4);       /* 0..7 = ISO 100..12800 */
 static CONFIG_INT("dualiso.test.cand", di_pat, 0);
@@ -80,7 +126,7 @@ static uint32_t di_lv_word(int n)
 #define DI_NW 64
 static struct { uint32_t ms; uint8_t which; uint32_t v; } di_w[DI_NW];
 static volatile int di_nw, di_nw_lost;
-static uint32_t di_wlast[2 + DI_NLV];
+static uint32_t di_wlast[6 + DI_NLV];
 static volatile int di_mism, di_mism_checks;
 static volatile uint32_t di_mism_first, di_mism_val, di_mism_ms;
 static uint32_t di_want[DI_NROWS][DI_NMODES][DI_NISO];
@@ -183,6 +229,7 @@ static int di_write(int on)
                 if (*(volatile uint32_t *)di_rom_r(r, m, c) != v) di_bad++;
             }
         }
+    if (di_gain_write(on, k) < 0) return 0x50000 | di_gerr;
     return di_bad ? 0x40000 | di_bad : 0;
 }
 
@@ -208,7 +255,12 @@ static void di_sample_task(void *unused)
             else di_ns_lost++;
         }
         uint32_t sb = di_still_buf();
-        if (sb) { di_note_word(0, *(volatile uint32_t *)(sb + 4)); di_note_word(1 + DI_NLV, *(volatile uint32_t *)(sb + 12)); }
+        if (sb)
+        {
+            di_note_word(0, *(volatile uint32_t *)(sb + 4));
+            di_note_word(1 + DI_NLV, *(volatile uint32_t *)(sb + 12));
+            for (int j = 0; j < 4; j++) di_note_word(2 + DI_NLV + j, *(volatile uint32_t *)(sb + 32 + j * 4));
+        }
         for (int n = 0; n < DI_NLV; n++) di_note_word(1 + n, di_lv_word(n));
         if (++tick % 40 == 0 && di_have_orig)
         {
@@ -255,8 +307,8 @@ static void di_log_words(void)
             for (int j = 0; j < 4; j++) di_printf(" %x", (int)*(volatile uint32_t *)(p + j * 4));
         di_printf("\n");
     }
-    di_printf("reg word changes (%d, %d not logged): ms buffer(0 = still 0x2D, n = LV n-1 0x2D, %d = still 0x2F) word\n",
-              di_nw, di_nw_lost, 1 + DI_NLV);
+    di_printf("reg word changes (%d, %d not logged): ms buffer(0 = still 0x2D, n = LV n-1 0x2D, %d = still 0x2F, "
+              "%d-%d = still GAIN9-12) word\n", di_nw, di_nw_lost, 1 + DI_NLV, 2 + DI_NLV, 5 + DI_NLV);
     for (int i = 0; i < di_nw; i++) di_printf("  %d %d %x\n", (int)di_w[i].ms, di_w[i].which, (int)di_w[i].v);
     di_nw = di_nw_lost = 0;
     di_mism = di_mism_checks = 0;
@@ -275,10 +327,11 @@ static void di_apply(int on)
 {
     int t0 = get_ms_clock();
     di_err = di_write(on);
-    di_printf("\n=== %d ms: dual ISO test %s: second ISO %d (step %d), candidate %d (reg %x isof %x bits %x col %d); "
+    di_printf("\n=== %d ms: dual ISO test %s: second ISO %d (step %d), candidate %d (row %x isof %x bits %x col %d; "
+              "gain regs %x bytes %x); "
               "result %x (%s), %d rows skipped, %d bad read-backs, %d ms\n", t0, on ? "ON" : "OFF", 100 << di_iso, di_iso,
-              di_pat, di_regs[di_cands[di_pat].row], (int)di_cands[di_pat].isof, (int)di_cands[di_pat].bits,
-              di_cands[di_pat].from_col, di_err, romremap_stage(), di_skipped, di_bad, (int)(get_ms_clock() - t0));
+              di_pat, di_cands[di_pat].row, (int)di_cands[di_pat].isof, (int)di_cands[di_pat].bits,
+              di_cands[di_pat].from_col, di_cands[di_pat].gregs, di_cands[di_pat].gbytes, di_err, romremap_stage(), di_skipped, di_bad, (int)(get_ms_clock() - t0));
     if (!di_err) di_dump_rows(on ? "patched rows" : "restored rows");
     if (!on) di_log_samples();
     di_flush();
@@ -352,11 +405,12 @@ static struct menu_entry di_menu[] = {
             {
                 .name    = "Candidate",
                 .priv    = &di_pat,
-                .max     = 6,
-                .choices = CHOICES("0 control", "1 f4+b20", "2 f4+b21", "3 f12+b20", "4 f12+b21", "5 f124+b2021", "6 reg 2F"),
+                .max     = 13,
+                .choices = CHOICES("0 control", "1 f4+b20", "2 f4+b21", "3 f12+b20", "4 f12+b21", "5 f124+b2021", "6 reg 2F",
+                                   "7 GAIN all", "8 GAIN9", "9 GAIN10", "10 GAIN11", "11 GAIN12", "12 G9 low", "13 G9 high"),
                 .select  = di_pat_select,
                 .help    = "Experiment: 0 = whole frame at 2nd ISO (control); 1-5 = enable-bit tries",
-                .help2   = "on reg 0x2D; 6 = reg 0x2F at its ISO 25600 value. One photo each.",
+                .help2   = "on 0x2D; 6 = reg 0x2F; 7-13 = GAIN9-12 at 1414 (7 = all). One photo each.",
             },
             {
                 .name    = "Save log",
