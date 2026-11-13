@@ -14,6 +14,8 @@
 #include "lens.h"
 #include "focus.h"
 #include "fio-ml.h"
+#include "propvalues.h"
+#include "property.h"
 
 extern int lens_focus(int num_steps, int stepsize, int wait, int extra_delay);
 
@@ -50,7 +52,8 @@ static const char *rf_blocked(void)
 {
     if (!lv) return "needs LiveView";
     if (is_manual_focus()) return "lens is in MF: set AF";
-    if (is_continuous_af()) return "Servo / continuous AF is on";
+    if (is_continuous_af())
+        return lv_movie_select == LVMS_ENABLE_MOVIE ? "Movie Servo AF is on: disable it" : "Continuous AF is on: disable it";
     if (lens_info.job_state) return "camera busy";
     return NULL;
 }
@@ -100,8 +103,9 @@ static void rf_task(void *unused)
     int d1 = lens_info.focus_dist, p1 = lens_info.focus_pos, ms = get_ms_clock() - t0;
     snprintf(rf_last, sizeof(rf_last), "to %s: %s, %d steps, %d.%d s", to ? "B" : "A", why, steps, ms / 1000, (ms / 100) % 10);
     rf_log("%d ms: %s to %s: target dist %d pos %d; size %d, interval %d ms, delay %d s; start dist %d pos %d; end dist %d "
-           "pos %d; %d steps in %d ms%s; %s\n", t0, j.fast ? "go" : "rack", to ? "B" : "A", tdist, tpos, size, iv, j.delay,
-           d0, p0, d1, p1, steps, ms, flipped ? " (direction flipped)" : "", why);
+           "pos %d; %d steps in %d ms%s; %s; movie %d servo photo %d movie %d af_mode %d\n", t0, j.fast ? "go" : "rack", to ? "B" : "A", tdist, tpos, size, iv, j.delay,
+           d0, p0, d1, p1, steps, ms, flipped ? " (direction flipped)" : "", why,
+           lv_movie_select == LVMS_ENABLE_MOVIE, continuous_af_photo, continuous_af_movie, af_mode);
     NotifyBox(3000, "Rack focus %s", rf_last);
     rf_busy = 0;
 }
@@ -124,7 +128,9 @@ static void rf_store(int which)
     int d = lens_info.focus_dist, p = lens_info.focus_pos;
     if (d <= 0) { NotifyBox(3000, "Lens reports no focus distance"); return; }
     if (which) { rf_b_dist = d; rf_b_pos = p; } else { rf_a_dist = d; rf_a_pos = p; }
-    rf_log("%d ms: point %s stored: dist %d pos %d (%s)\n", (int)get_ms_clock(), which ? "B" : "A", d, p, lens_info.name);
+    rf_log("%d ms: point %s stored: dist %d pos %d (%s); movie %d servo photo %d movie %d af_mode %d\n", (int)get_ms_clock(),
+           which ? "B" : "A", d, p, lens_info.name, lv_movie_select == LVMS_ENABLE_MOVIE, continuous_af_photo,
+           continuous_af_movie, af_mode);
     NotifyBox(2500, "Point %s stored: %d cm", which ? "B" : "A", d);
 }
 

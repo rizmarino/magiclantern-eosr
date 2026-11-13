@@ -909,7 +909,13 @@ int is_continuous_af()
 {
     if (!lv) return 0;
     if (is_manual_focus()) return 0;
+#ifdef CONFIG_R
+    /* is_movie_mode() is always 0 on the R (movie mode still reports shooting_mode 3); PROP_LV_MOVIE_SELECT is
+     * 2 in movie mode (camera 2026-10-30). Without this, Movie Servo AF went unseen and fought rack focus. */
+    return lv_movie_select == LVMS_ENABLE_MOVIE ? continuous_af_movie : continuous_af_photo;
+#else
     return is_movie_mode() ? continuous_af_movie : continuous_af_photo;
+#endif
 }
 
 #if defined(FEATURE_TRAP_FOCUS) || defined(FEATURE_MAGIC_ZOOM)
