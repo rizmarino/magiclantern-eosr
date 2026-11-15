@@ -81,7 +81,7 @@ static sound_module_t *sound_modules[] =
     &DG_sound_module,
     #endif
     #ifdef DM_SOUND
-    &DM_sound_module,       /* dm/dm_sound.c: Canon AudioBeep PCM on the EOS R */
+    &DM_sound_module,       /* dm/dm_sound.c: software mix, streamed through Canon's movie-play audio on the EOS R */
     #endif
     NULL,
 };
@@ -137,7 +137,10 @@ static void InitSfxModule(boolean use_sfx_prefix)
 
 static void InitMusicModule(void)
 {
-#ifdef FEATURE_SOUND
+#ifdef DM_SOUND
+    extern music_module_t DM_music_module;
+    music_module = &DM_music_module;        /* dm/dm_sound.c: pre-rendered tracks streamed from the card */
+#elif defined(FEATURE_SOUND)
     music_module = &DG_music_module;
 #endif /* FEATURE_SOUND */
 }

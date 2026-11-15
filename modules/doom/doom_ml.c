@@ -55,6 +55,8 @@ extern char firmware_version[];
 #define WIN_H 480
 
 static CONFIG_INT("doom.scale", doom_scale, DM_SCALE_ASPECT);
+/* Canon SoundDev output volume 0..10 for the movie-play path (the factory test uses 7) */
+static CONFIG_INT("doom.spkvol", doom_spk_vol, 8);
 
 static volatile int doom_running;      /* 1 game, 2 display/input test, 3 sound test */
 static int doom_played;                /* engine globals are dirty after one run */
@@ -138,9 +140,19 @@ void *dm_io_open(const char *path, int mode)
     return h;
 }
 
+/* the game task (WAD, saves) and doom_musio (music) both read: one bounce buffer, so one reader at a time */
+static struct semaphore *io_sem;
+static int dm_io_read_locked(struct cam_file *h, void *buf, size_t n);
 int dm_io_read(void *hv, void *buf, size_t n)
 {
-    struct cam_file *h = hv;
+    if (!io_sem) io_sem = create_named_semaphore("doom_io", SEM_CREATE_UNLOCKED);   /* first call: game task, before doom_musio exists */
+    take_semaphore(io_sem, 0);
+    int r = dm_io_read_locked(hv, buf, n);
+    give_semaphore(io_sem);
+    return r;
+}
+static int dm_io_read_locked(struct cam_file *h, void *buf, size_t n)
+{
     if (!bounce) bounce = fio_malloc(BOUNCE_SIZE);
     if (!bounce) return -1;
     size_t done = 0;
@@ -612,114 +624,6 @@ static void sound_task(void *unused)
 }
 
 
-/* ------------------------------------------------------------------ in-game sound: dm_snd_hw_* (dm/dm_sound.c)
- * The game task hands over whole effects; doom_audio (one priority step above doom_task, so it never sees a half
- * written request) stops whatever Canon plays and starts the new buffer, so the game never waits on AudioBeep.
- * Requests are a 2-slot array published by a sequence number written last. Mono 24 kHz only (stereo froze). */
-struct snd_req { const int16_t *buf; int n; };
-static struct snd_req snd_req[2];
-static volatile int snd_seq, snd_run, snd_alive;
-static const void * volatile snd_busy;
-static struct semaphore *snd_sem;
-static void *snd_blocks[4];
-static int snd_nblocks;
-static int snd_starts, snd_refused, snd_stops, snd_lat_max, snd_stop_max, snd_first_err, snd_skipped;
-
-void *dm_snd_hw_alloc(size_t n)
-{
-    if (!snd_run || snd_nblocks >= 4) return NULL;
-    void *p = fio_malloc(n);
-    if (p) snd_blocks[snd_nblocks++] = p;
-    return p;
-}
-
-static void snd_post(const int16_t *b, int n)
-{
-    int s = snd_seq + 1;
-    snd_req[s & 1].buf = b;
-    snd_req[s & 1].n = n;
-    snd_seq = s;
-    give_semaphore(snd_sem);
-}
-void dm_snd_hw_play(const int16_t *b, int n) { snd_post(b, n); }
-void dm_snd_hw_stop(void) { snd_post(NULL, 0); }
-const void *dm_snd_hw_busy(void) { return snd_busy; }
-
-/* stop Canon's player if it is starting/playing; returns ms */
-static int snd_halt(void)
-{
-    int st = AB_INT(0x48), t0 = get_ms_clock();
-    if (st != 1 && st != 2) return 0;
-    if (st == 1) ab_stop(1);
-    while ((st = AB_INT(0x48)) == 1 || st == 2)
-    {
-        if ((int)(get_ms_clock() - t0) > 150) break;
-        msleep(1);
-    }
-    snd_stops++;
-    return get_ms_clock() - t0;
-}
-
-static void snd_task(void *unused)
-{
-    int seen = 0;
-    while (snd_run)
-    {
-        take_semaphore(snd_sem, 100);
-        int s = snd_seq;
-        if (s == seen) continue;
-        if (s - seen > 1) snd_skipped += s - seen - 1;
-        seen = s;
-        struct snd_req r = snd_req[s & 1];
-        int ms = snd_halt();
-        if (ms > snd_stop_max) snd_stop_max = ms;
-        snd_busy = NULL;
-        if (!r.buf || r.n <= 0) continue;
-        if (snd_seq != seen) continue;                   /* a newer request came in while stopping: take that */
-        uint32_t spec[16];
-        memset(spec, 0, sizeof spec);
-        spec[0] = 1; spec[1] = (uint32_t)r.buf; spec[2] = r.n * 2; spec[5] = 5; spec[7] = 0;
-        spec[9] = AB_RATE_24K; spec[10] = 16; spec[11] = 1;
-        snd_busy = r.buf;
-        uint32_t t0 = get_ms_clock();
-        ab_start(0, spec);
-        int st;
-        while ((st = AB_INT(0x48)) != 1 && st != 3 && (int)(get_ms_clock() - t0) < 40) msleep(1);
-        int lat = get_ms_clock() - t0;
-        if (st == 1 || st == 3) { snd_starts++; if (lat > snd_lat_max) snd_lat_max = lat; }
-        else { snd_refused++; if (!snd_first_err) snd_first_err = AB_INT(0x24) | 0x10000; }
-    }
-    snd_halt();
-    snd_busy = NULL;
-    snd_alive = 0;
-}
-
-static void snd_open(void)
-{
-    snd_run = 0;
-    if (!AB_BLOCK) { logf_("sound: AudioBeep not initialised, no sound\n"); return; }
-    if (!snd_sem) snd_sem = create_named_semaphore("doom_snd", SEM_CREATE_LOCKED);
-    snd_run = snd_alive = 1;
-    task_create("doom_audio", 0x1c, 0x1000, snd_task, 0);
-}
-
-static void snd_close(void)
-{
-    char line[160];
-    dm_snd_stats(line, sizeof line);
-    logf_("%s", line);
-    if (!snd_run) return;
-    snd_run = 0;
-    give_semaphore(snd_sem);
-    for (int i = 0; i < 100 && snd_alive; i++) msleep(10);
-    logf_("sound out: %d started (max %d ms), %d refused (first result %x), %d stops (max %d ms), %d superseded; "
-          "player state %d\n", snd_starts, snd_lat_max, snd_refused, snd_first_err & 0xffff, snd_stops, snd_stop_max,
-          snd_skipped, AB_INT(0x48));
-    if (snd_alive) { logf_("sound: audio task did not end, buffers kept\n"); return; }
-    for (int i = 0; i < snd_nblocks; i++) free(snd_blocks[i]);
-    snd_nblocks = 0;
-}
-
 /* ------------------------------------------------------------------ menu */
 
 static const char *wads[] = { "DOOM1.WAD", "DOOM.WAD", "DOOMU.WAD", "DOOM2.WAD", "FREEDOOM1.WAD", "FREEDOOM2.WAD" };
@@ -790,7 +694,7 @@ static int  (*const sd_audio_end)(int m) = (void *)0xE05EDDAF;
 static int  (*const sd_out_start)(void) = (void *)0xE05EDE15;
 static void (*const sd_mute)(int on) = (void *)0xE05EEA77;
 
-#define ST_SLOTS 8
+#define ST_SLOTS 10                      /* ring; Canon holds at most ~6 (4 queued + DMA current/next) */
 #define ST_EV    160
 static struct { uint32_t us; uint8_t type; uint32_t a, b; } st_ev[ST_EV];
 static volatile int st_nev;
@@ -798,8 +702,11 @@ static volatile int st_plays, st_frees, st_starts, st_stops, st_errs, st_err_id,
 static struct semaphore *st_sem, *st_stop_sem;
 static uint8_t *st_mem;
 static int st_chunk;
-static uint32_t st_freed;                 /* bit per slot: Canon gave it back */
 static uint64_t st_t0;
+static void (*st_fillfn)(int16_t *d, int frames);
+static int st_open_ok, st_slot, st_seen, st_submitted, st_mix_us_max;
+static uint64_t st_mix_us_sum;
+static int st_mix_n;
 
 static void st_log_ev(int type, uint32_t a, uint32_t b)
 {
@@ -813,11 +720,9 @@ static void st_start_cbr(int inst, int err)
     st_start_err = err; st_starts++; st_log_ev('S', err, 0);
     if (err == 0) { sd_out_start(); sd_mute(0); }      /* what Canon's BGM player and factory test do here */
 }
-static void st_free_cbr(int inst, uint32_t adr, int c, int d)
-{
-    st_frees++; st_log_ev('F', adr, c);
-    if (st_mem && adr >= (uint32_t)st_mem && st_chunk) st_freed |= 1u << (((adr - (uint32_t)st_mem) / st_chunk) % ST_SLOTS);
-}
+/* camera 2026-11-15: FreeCBR comes when a buffer is accepted (adr = that buffer), PlayCBR when Canon wants the next
+ * one (adr = the buffer it took), one per buffer period after the first two */
+static void st_free_cbr(int inst, uint32_t adr, int c, int d) { st_frees++; st_log_ev('F', adr, c); }
 static void st_play_cbr(int inst, int b, int c, int d) { st_plays++; st_log_ev('P', b, c); give_semaphore(st_sem); }
 static void st_stop_cbr(int inst) { st_stops++; st_log_ev('E', 0, 0); give_semaphore(st_stop_sem); }
 static void st_err_cbr(int inst, int id) { st_errs++; st_err_id = id; st_log_ev('X', id, 0); }
@@ -825,13 +730,13 @@ static void st_err_cbr(int inst, int id) { st_errs++; st_err_id = id; st_log_ev(
 /* phase-continuous test signal, 48 kHz stereo: t < 2 s 440 Hz both, 2-3 s 440 Hz left only, 3-4 s 660 Hz right
  * only, then a 440 -> 880 Hz sweep on both. Any gap or repeated buffer is an audible click. */
 static uint32_t st_phase, st_frame;
-static int st_sine(uint32_t ph)               /* parabolic sine, ph in [0, 2^32): about -/+ 24000 */
+static int st_sine(uint32_t ph)               /* parabolic sine, ph in [0, 2^32) */
 {
     int x = (int)(ph >> 16) - 32768;          /* -32768..32767 = -pi..pi */
     int y = (x * 4 / 2 * (32768 - (x < 0 ? -x : x))) >> 15;     /* 4/pi x - 4/pi^2 x|x|, scaled */
     return -(y * 5 / 4);                      /* peak ~20500, like the beep test tones (26000 was loud enough) */
 }
-static void st_fill(int16_t *d, int frames)
+static void st_test_fill(int16_t *d, int frames)
 {
     for (int i = 0; i < frames; i++, st_frame++)
     {
@@ -845,6 +750,14 @@ static void st_fill(int16_t *d, int frames)
         d[2 * i] = l; d[2 * i + 1] = r;
     }
 }
+static void st_fill_slot(int slot)
+{
+    uint64_t t = get_us_clock();
+    st_fillfn((int16_t *)(st_mem + slot * st_chunk), st_chunk / 4);
+    int us = (int)(get_us_clock() - t);
+    st_mix_us_sum += us; st_mix_n++;
+    if (us > st_mix_us_max) st_mix_us_max = us;
+}
 static int st_submit(int slot, int first)
 {
     struct sd_buf b;
@@ -852,108 +765,136 @@ static int st_submit(int slot, int first)
     uint32_t adr = (uint32_t)st_mem + slot * st_chunk;
     b.w[0] = 1; b.w[1] = st_chunk;
     b.w[0x33] = adr; b.w[0x34] = adr + st_chunk; b.w[0x35] = adr; b.w[0x36] = st_chunk;
-    st_freed &= ~(1u << slot);
     return first ? sd_start_buf(b, 0) : sd_next_buf(b);
 }
 
-/* one streaming run; returns 0 if it played to the end */
-static int stream_run(int chunk, int seconds, int vol)
+typedef void (*st_logfn)(const char *fmt, ...);
+#define SCALL(what, expr) ({ lg("> %s\n", what); if (flush) flush(); int _r = (int)(expr); lg("  rc %d\n", _r); _r; })
+
+/* open Canon's play device and start a gapless 48 kHz stereo stream fed by fill(); 0 = running */
+static int st_open(int chunk, int vol, void (*fill)(int16_t *, int), st_logfn lg, void (*flush)(void))
 {
-#define SCALL(what, expr) ({ slogf("> %s\n", what); slog_flush(); int _r = (int)(expr); slogf("  rc %d\n", _r); _r; })
-    int total = seconds * 192000 / chunk, submitted = 0, underruns = 0, notfree = 0;
-    uint32_t tstart = get_ms_clock();
-    st_chunk = chunk; st_nev = 0; st_plays = st_frees = st_starts = st_stops = st_errs = st_err_id = 0;
-    st_start_err = -1; st_phase = st_frame = 0; st_freed = 0;
-    slogf("\n--- stream: chunk %d B (%d ms), %d s, volume %d; ACTRL active 0x22 %d, 0x11 %d, 0x20 %d\n", chunk,
-          chunk * 1000 / 192000, seconds, vol, actrl_is_active(0x22, 0), actrl_is_active(0x11, 0),
-          actrl_is_active(0x20, 0));
-    if (actrl_is_active(0x22, 0)) { slogf("Canon audio busy (recording): skipped\n"); return 1; }
+    if (st_open_ok) return 1;
+    if (!st_sem) st_sem = create_named_semaphore("doom_st", SEM_CREATE_LOCKED);
+    if (!st_stop_sem) st_stop_sem = create_named_semaphore("doom_st_stop", SEM_CREATE_LOCKED);
+    st_chunk = chunk; st_fillfn = fill; st_nev = 0;
+    st_plays = st_frees = st_starts = st_stops = st_errs = st_err_id = 0; st_start_err = -1;
+    st_submitted = st_mix_us_max = st_mix_n = 0; st_mix_us_sum = 0;
+    lg("stream: chunk %d B (%d us), volume %d; ACTRL active 0x22 %d, 0x11 %d, 0x20 %d\n", chunk,
+       (int)(chunk * 1000LL / 192), vol, actrl_is_active(0x22, 0), actrl_is_active(0x11, 0), actrl_is_active(0x20, 0));
+    if (actrl_is_active(0x22, 0)) { lg("Canon audio busy (recording): no stream\n"); return 1; }
     st_mem = fio_malloc(ST_SLOTS * chunk);
-    if (!st_mem) { slogf("no memory\n"); return 1; }
+    if (!st_mem) { lg("stream: no memory\n"); return 1; }
     memset(st_mem, 0, ST_SLOTS * chunk);
-    slogf("buffers %x, %d x %d B\n", (int)st_mem, ST_SLOTS, chunk);
     static int param[15];
     param[0] = 48000; param[1] = 16; param[2] = 2; param[3] = 0; param[4] = 1; param[5] = 0; param[6] = 0;
     param[7] = 1; param[8] = (int)st_start_cbr; param[9] = (int)st_free_cbr; param[10] = (int)st_play_cbr;
     param[11] = (int)st_stop_cbr; param[12] = 0x57; param[13] = (int)st_err_cbr; param[14] = 0x57;
 
     SCALL("SetOut(0)", sd_set_out(0));
-    slogf("> SetOutVolume(%d)\n", vol); slog_flush(); sd_set_out_volume(vol);
-    if (SCALL("SetAudioInit(5, 0, 1, 1)", sd_audio_init(5, 0, 1, 1))) goto out_mem;
-    if (SCALL("SetPlayParam", sd_play_param(param))) goto out_end;
+    lg("> SetOutVolume(%d)\n", vol); if (flush) flush(); sd_set_out_volume(vol);
+    if (SCALL("SetAudioInit(5, 0, 1, 1)", sd_audio_init(5, 0, 1, 1))) goto fail_mem;
+    if (SCALL("SetPlayParam", sd_play_param(param))) goto fail_end;
     st_t0 = get_us_clock();
     for (int i = 0; i < 4; i++)
     {
-        st_fill((int16_t *)(st_mem + i * chunk), chunk / 4);
+        st_fill_slot(i);
         int r = st_submit(i, 1);
-        slogf("  start buf %d rc %d\n", i, r);
-        submitted++;
+        if (r) lg("  start buf %d rc %d\n", i, r);
+        st_submitted++;
     }
-    slog_flush();
-    tstart = get_ms_clock();
-    if (SCALL("SetMovieStart(6)", sd_movie_start(6))) goto out_stop;
-    /* steady state: one buffer per PlayCBR, prepared ahead in the next slot */
-    int slot = 4, seen = 0, ready = 0;
-    st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); ready = 1;
-    while (submitted < total && get_ms_clock() - tstart < (uint32_t)(seconds * 1000 + 3000))
-    {
-        take_semaphore(st_sem, 200);
-        while (seen < st_plays && submitted < total)
-        {
-            seen++;
-            if (!ready) { underruns++; st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); }
-            int r = st_submit(slot, 0);
-            if (r) st_log_ev('R', r, slot);
-            submitted++;
-            slot = (slot + 1) % ST_SLOTS;
-            if (!(st_freed & (1u << slot)) && submitted >= ST_SLOTS) notfree++;   /* refilling a slot Canon may still read */
-            st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); ready = 1;
-        }
-    }
-    msleep(4 * chunk * 1000 / 192000 + 100);  /* let the queued buffers play out */
-out_stop:
+    if (SCALL("SetMovieStart(6)", sd_movie_start(6))) goto fail_stop;
+    st_slot = 4; st_seen = 0;
+    st_fill_slot(st_slot);
+    st_open_ok = 1;
+    return 0;
+fail_stop:
     SCALL("SetMovieStop(7)", sd_movie_stop(7));
-    { int r = take_semaphore(st_stop_sem, 2000); slogf("  StopCBR wait %s\n", r ? "TIMEOUT" : "ok"); }
-out_end:
+    take_semaphore(st_stop_sem, 2000);
+fail_end:
+    SCALL("SetAudioEnd(8)", sd_audio_end(8));
+fail_mem:
+    free(st_mem); st_mem = NULL;
+    return 1;
+}
+
+/* queue one buffer per PlayCBR (waiting up to wait_ms for one), then prepare the next slot; limit < 0: no limit */
+static int st_pump(int wait_ms, int limit)
+{
+    if (!st_open_ok) { msleep(wait_ms); return 0; }
+    take_semaphore(st_sem, wait_ms);
+    int n = 0;
+    while (st_seen < st_plays && (limit < 0 || st_submitted < limit))
+    {
+        st_seen++;
+        int r = st_submit(st_slot, 0);
+        if (r) st_log_ev('R', r, st_slot);
+        st_submitted++; n++;
+        st_slot = (st_slot + 1) % ST_SLOTS;
+        st_fill_slot(st_slot);
+    }
+    return n;
+}
+
+static void st_close(st_logfn lg, void (*flush)(void))
+{
+    if (!st_open_ok) return;
+    st_open_ok = 0;
+    SCALL("SetMovieStop(7)", sd_movie_stop(7));
+    { int r = take_semaphore(st_stop_sem, 2000); lg("  StopCBR wait %s\n", r ? "TIMEOUT" : "ok"); }
     SCALL("SetAudioEnd(8)", sd_audio_end(8));
     msleep(50);
-    slogf("result: submitted %d/%d, PlayCBR %d, FreeCBR %d, StartCBR %d (err %d), StopCBR %d, ErrorCBR %d (id %x),"
-          " underruns %d, refill-before-free %d, ran %d ms for %d ms of audio\n", submitted, total, st_plays, st_frees,
-          st_starts, st_start_err, st_stops, st_errs, st_err_id, underruns, notfree, (int)(get_ms_clock() - tstart),
-          submitted * chunk * 1000 / 192000);
+    lg("stream result: submitted %d, PlayCBR %d, FreeCBR %d, StartCBR %d (err %d), StopCBR %d, ErrorCBR %d (id %x); "
+       "fill avg %d us max %d us\n", st_submitted, st_plays, st_frees, st_starts, st_start_err, st_stops, st_errs,
+       st_err_id, st_mix_n ? (int)(st_mix_us_sum / st_mix_n) : 0, st_mix_us_max);
+    free(st_mem); st_mem = NULL;
+}
+
+static void st_dump_events(st_logfn lg)
+{
+    uint32_t prev = 0; int dmin = 1 << 30, dmax = 0, np = 0;
+    for (int i = 0; i < st_nev; i++)
     {
-        uint32_t prev = 0; int dmin = 1 << 30, dmax = 0, np = 0;
-        for (int i = 0; i < st_nev; i++)
-        {
-            if (i < 24 || i >= st_nev - 6) slogf("  %c t=%u us a=%x b=%x\n", st_ev[i].type, st_ev[i].us, st_ev[i].a, st_ev[i].b);
-            if (st_ev[i].type == 'P') { if (np++) { int d = st_ev[i].us - prev; if (d < dmin) dmin = d; if (d > dmax) dmax = d; } prev = st_ev[i].us; }
-        }
-        if (np > 1) slogf("  PlayCBR spacing %d..%d us (one buffer = %d us), %d events logged\n", dmin, dmax,
-                          chunk * 1000000 / 192000, st_nev);
+        if (i < 24 || i >= st_nev - 6) lg("  %c t=%u us a=%x b=%x\n", st_ev[i].type, st_ev[i].us, st_ev[i].a, st_ev[i].b);
+        if (st_ev[i].type == 'P') { if (np++) { int d = st_ev[i].us - prev; if (d < dmin) dmin = d; if (d > dmax) dmax = d; } prev = st_ev[i].us; }
     }
+    if (np > 1) lg("  PlayCBR spacing %d..%d us (one buffer = %d us), %d events logged\n", dmin, dmax,
+                   (int)(st_chunk * 1000LL / 192), st_nev);
+}
+
+/* one test run; returns 0 if it played to the end */
+static int stream_run(int chunk, int seconds, int vol)
+{
+    st_phase = st_frame = 0;
+    slogf("\n--- stream: %d s\n", seconds);
+    if (st_open(chunk, vol, st_test_fill, slogf, slog_flush)) { slog_flush(); return 1; }
+    int total = seconds * 192000 / chunk;
+    uint32_t tstart = get_ms_clock();
+    while (st_submitted < total && get_ms_clock() - tstart < (uint32_t)(seconds * 1000 + 3000)) st_pump(200, total);
+    msleep(4 * chunk * 1000 / 192000 + 100);  /* let the queued buffers play out */
+    int ok = st_submitted == total;
+    slogf("ran %d ms for %d ms of audio\n", (int)(get_ms_clock() - tstart), st_submitted * chunk * 1000 / 192000);
+    st_close(slogf, slog_flush);
+    st_dump_events(slogf);
     slog_flush();
     msleep(200);
-out_mem:
-    free(st_mem); st_mem = NULL;
-    return st_plays > 0 && st_frees > 0 ? 0 : 1;
-#undef SCALL
+    return ok && st_plays > 0 ? 0 : 1;
 }
+#undef SCALL
 
 static void stream_task(void *unused)
 {
     slogf("\n=== stream test: %s fw %s, lv %d, movie mode %d (lv_movie_select %d)\n", camera_model, firmware_version,
           lv, is_movie_mode(), lv_movie_select);
     slog_flush();
-    if (!st_sem) st_sem = create_named_semaphore("doom_st", SEM_CREATE_LOCKED);
-    if (!st_stop_sem) st_stop_sem = create_named_semaphore("doom_st_stop", SEM_CREATE_LOCKED);
     NotifyBox(3000, "Stream test 1/2: 6 s tone, 85 ms buffers");
-    int r1 = stream_run(16384, 6, 7);
+    int r1 = stream_run(16384, 6, doom_spk_vol);
     msleep(800);
     int r2 = 1;
     if (!r1)
     {
         NotifyBox(3000, "Stream test 2/2: 4 s tone, 21 ms buffers");
-        r2 = stream_run(4096, 4, 7);
+        r2 = stream_run(4096, 4, doom_spk_vol);
     }
     slogf("end: run1 %s, run2 %s; AudioBeep state %d\n", r1 ? "FAILED" : "ok", r1 ? "skipped" : r2 ? "FAILED" : "ok",
           AB_BLOCK ? AB_INT(0x48) : -1);
@@ -966,6 +907,61 @@ static MENU_SELECT_FUNC(doom_stream_test)
     if (doom_running) return;
     doom_running = 3;
     task_create("doom_stream", 0x1c, 0x2000, stream_task, 0);
+}
+
+/* ------------------------------------------------------------------ in-game sound and music (dm/dm_sound.c)
+ * The game's mixer feeds the Stream test's path: doom_audio (one priority step above doom_task) queues a 21 ms
+ * buffer per PlayCBR and mixes the next one (dm_snd_mix), so the game never waits on Canon. doom_musio (below
+ * doom_task) streams the pre-rendered music file from the card (dm_mus_service); it runs whenever the game sleeps or
+ * yields (at least every 200 ms) and keeps ~5 s of music ahead. */
+#define GS_CHUNK 4096                     /* 1024 frames = 21.3 ms: the camera-verified small size */
+static volatile int gs_run, gs_alive, mio_run, mio_alive;
+
+static void gs_fill(int16_t *d, int frames) { dm_snd_mix(d, frames); }
+static void gs_task(void *unused)
+{
+    while (gs_run) st_pump(100, -1);
+    gs_alive = 0;
+}
+static void mio_task(void *unused)
+{
+    while (mio_run) { dm_mus_service(); msleep(20); }
+    mio_alive = 0;
+}
+void dm_sys_sleep(int ms) { msleep(ms < 10 ? 10 : ms); }
+
+int dm_snd_hw_open(void)
+{
+    if (gs_run) return 0;
+    if (st_open(GS_CHUNK, doom_spk_vol, gs_fill, logf_, log_flush)) return 1;
+    gs_run = gs_alive = 1;
+    task_create("doom_audio", 0x1c, 0x1000, gs_task, 0);
+    mio_run = mio_alive = 1;
+    task_create("doom_musio", 0x1e, 0x1000, mio_task, 0);
+    return 0;
+}
+
+/* idempotent: Doom's own quit calls it (Snd_Shutdown), doom_task again after any exit */
+void dm_snd_hw_close(void)
+{
+    if (mio_run) { mio_run = 0; for (int i = 0; i < 200 && mio_alive; i++) msleep(10); }
+    if (mio_alive) logf_("music task did not end\n");
+    else dm_mus_release();
+    if (!gs_run) return;
+    gs_run = 0;
+    give_semaphore(st_sem);
+    for (int i = 0; i < 100 && gs_alive; i++) msleep(10);
+    if (gs_alive) { logf_("sound: audio task did not end, stream kept\n"); return; }
+    st_close(logf_, log_flush);
+}
+
+static void snd_open(void) { }
+static void snd_close(void)
+{
+    char line[256];
+    dm_snd_stats(line, sizeof line);
+    logf_("%s", line);
+    dm_snd_hw_close();                    /* before dm_libc_release_all: stops Canon reading our buffers */
 }
 
 static MENU_UPDATE_FUNC(doom_play_update)
@@ -991,6 +987,13 @@ static struct menu_entry doom_menu[] =
                 .max     = 3,
                 .choices = CHOICES("640x480 (4:3)", "640x400 (2x)", "320x200 (1x)", "720x480 (fill)"),
                 .help    = "How the 320x200 game picture is scaled on screen.",
+            },
+            {
+                .name    = "Speaker volume",
+                .priv    = &doom_spk_vol,
+                .min     = 1,
+                .max     = 10,
+                .help    = "Canon output level for Doom's sound (1-10). Doom's own sliders mix effects/music.",
             },
             {
                 .name    = "Display & input test",
@@ -1034,4 +1037,5 @@ MODULE_CBRS_END()
 
 MODULE_CONFIGS_START()
     MODULE_CONFIG(doom_scale)
+    MODULE_CONFIG(doom_spk_vol)
 MODULE_CONFIGS_END()

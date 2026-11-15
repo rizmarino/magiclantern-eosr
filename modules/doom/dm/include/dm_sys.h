@@ -22,13 +22,16 @@ int   dm_io_remove(const char *path);
 int   dm_io_rename(const char *from, const char *to);
 int   dm_io_mkdir(const char *path);
 
-/* sound (optional; dm_sound.c): mono s16 24 kHz. alloc NULL = no sound output. play/stop are asynchronous and
- * replace whatever plays; busy = the buffer the hardware may still be reading (NULL if none). The platform frees
- * its buffers itself once the game has ended and the output has stopped. */
-void *dm_snd_hw_alloc(size_t n);
-void  dm_snd_hw_play(const int16_t *buf, int samples);
-void  dm_snd_hw_stop(void);
-const void *dm_snd_hw_busy(void);
+/* sound (optional; dm_sound.c mixes, the platform plays): 48 kHz s16 stereo interleaved, pulled in chunks.
+ * dm_snd_hw_open starts an output that calls dm_snd_mix() for every chunk from its own audio context (0 = running);
+ * after dm_snd_hw_close returns, dm_snd_mix is no longer called. Music: the platform calls dm_mus_service() regularly
+ * from a context that may block on the card (never the audio one), and dm_mus_release() at the end. */
+int   dm_snd_hw_open(void);
+void  dm_snd_hw_close(void);
+void  dm_snd_mix(int16_t *out, int frames);           /* provided by dm_sound.c */
+void  dm_mus_service(void);                           /* provided by dm_sound.c */
+void  dm_mus_release(void);                           /* provided by dm_sound.c */
+void  dm_sys_sleep(int ms);
 int   dm_snd_stats(char *buf, size_t n);              /* provided by dm_sound.c: one log line */
 
 /* --- provided by dm_libc.c --- */
