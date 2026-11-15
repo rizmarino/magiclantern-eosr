@@ -27,6 +27,7 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crxtest_r.o   # v4.17 lossless 4K step 2
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/romremap_r.o   # v4.51 shared ROM remap (silent burst fps patch)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rackfocus_r.o  # v4.56 Focus > Rack focus (stored points, lens-distance loop)
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/sensreg_r.o    # v4.58 Debug > Sensor regs log (read-only, wider-4K research)
 # v4.55: dualiso_r.o (Shoot > Dual ISO (test)) left out: no per-line ISO control found on the R (parked 2026-11-11);
 # the source stays for reference (skill references/dual-iso.md)
 # v3.16: audprobe_r.o (Debug > Audio probe) and memsurvey_r.o (Debug > Memory survey) left out: finished test
