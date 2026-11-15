@@ -1,4 +1,4 @@
-/* R: Debug > Sensor regs log (EOS R 1.8.0, v4.58, v4.59 volatile-register filter). Personal diagnostic, not for upstream.
+/* R: Debug > Sensor regs log (EOS R 1.8.0, v4.58; v4.59 volatile-register filter; v4.60 Tap test). Personal diagnostic, not for upstream.
  *
  * Read-only survey for wider/taller 1:1 4K (crop_rec on the R). While "Watch" is ON a task polls, every 50 ms,
  * Canon's CMOS command buffers (the lists FUN_e06a19a4 sends to the sensor, 0xffffffff-terminated):
@@ -13,6 +13,12 @@
 #include "dryos.h"
 #include "menu.h"
 #include "fio-ml.h"
+#include "gui.h"
+#include "propvalues.h"
+
+#ifndef MEM
+#define MEM(x) (*(volatile uint32_t *)(x))
+#endif
 
 #define SR_LOG      "ML/LOGS/SENSREG.TXT"
 #define SR_STILLP   0x1769c
@@ -149,6 +155,10 @@ static void sr_task(void *unused)
     sr_task_alive = 0;
 }
 
+static void tp_save_log(void);
+static volatile int tp_running;
+static int tp_nev_get(void);
+
 /* ---- log writing (menu task) ---- */
 #define SR_BUF 4096
 static char *sr_buf;
@@ -221,6 +231,7 @@ static int sr_save(void)
         sr_flush();
     }
     sr_flush();
+    tp_save_log();
     FIO_CloseFile(sr_f);
     sr_f = 0;
     sr_saved_total += n;
@@ -228,9 +239,159 @@ static int sr_save(void)
     return n;
 }
 
+
+/* ---- v4.60 Tap test (4K): does a LiveView path rebuild keep the recorder's 10-bit MEM1 setup? ----
+ * Taller-4K blocker (lv-survey stage 4): MEM1 0xFB9D90 is exactly 4256x2214 at 14-bit with live YUV buffers behind
+ * it, so a taller frame must never arrive at 14-bit. This turns on lv_save_raw + 10-bit packing exactly like the
+ * recorder (rectest_r.c rt_pack_apply), then for 30 s logs every change of the Mem1Path fields, the pack unit
+ * register and m_SensorMode while the user enters/leaves magnify (a SAP path rebuild, FUN_e0637bd8, which rewrites
+ * Mem1Path +0x18 with the record width). Safety reflex: if +0x18 no longer matches the 10-bit width while f2 is still
+ * 10-bit, put Canon's 14-bit defaults back at once (logged). Magnify is smaller than 4K, so no outcome can overrun
+ * the buffer. Restores everything and lv_save_raw(0) at the end; opening the ML menu cancels. */
+#define TP_PATH     0x133CC
+#define TP_UNIT     0xD0422224u
+#define TP_BUF_UNC  0x68EEA940u
+#define TP_NF       16
+#define TP_NEV      240
+#define TP_MS       30000
+static const uint16_t tp_off[TP_NF] = { 0x00, 0x10, 0x14, 0x18, 0x1c, 0x28, 0x50, 0x58, 0x64, 0x68, 0x6c, 0x70, 0x74,
+                                        0xffff /* unit reg */, 0xfffe /* m_SensorMode */, 0xfffd /* stall */ };
+static struct { uint32_t ms; uint8_t f; uint32_t v; } *tp_ev;
+static volatile int tp_nev, tp_lost, tp_reflex, tp_cancel;
+static int tp_nev_get(void) { return tp_nev; }
+static uint32_t tp_last[TP_NF];
+static char tp_result[64];
+
+static uint32_t tp_read(int f, uint32_t stall)
+{
+    uint16_t o = tp_off[f];
+    if (o == 0xffff) return *(volatile uint32_t *)TP_UNIT;
+    if (o == 0xfffe) return *(volatile uint32_t *)(SR_STATE + 0xc);
+    if (o == 0xfffd) return stall;
+    return *(volatile uint32_t *)(TP_PATH + o);
+}
+static void tp_note(int f, uint32_t v)
+{
+    if (v == tp_last[f]) return;
+    tp_last[f] = v;
+    int i = tp_nev;
+    if (i < TP_NEV) { tp_ev[i].ms = get_ms_clock(); tp_ev[i].f = f; tp_ev[i].v = v; tp_nev = i + 1; }
+    else tp_lost++;
+}
+static uint32_t tp_rowsum(void)          /* one MEM1 line from the middle: does the DMA still write frames? */
+{
+    volatile uint32_t *r = (volatile uint32_t *)(TP_BUF_UNC + 1100 * 5320);
+    uint32_t h = 0;
+    for (int i = 0; i < 256; i += 4) h = h * 31 + r[i];
+    return h;
+}
+
+static void tp_task(void *unused)
+{
+    uint32_t orig[5], w0 = 0, wset = 0;
+    int raw = 0, applied = 0;
+    tp_nev = tp_lost = tp_reflex = tp_cancel = 0;
+    for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);     /* wait for the ML menu to close */
+    if (gui_menu_shown()) { snprintf(tp_result, sizeof(tp_result), "menu not closed: not started"); goto out; }
+    if (!lv) { snprintf(tp_result, sizeof(tp_result), "no live view: not started"); goto out; }
+    call("lv_save_raw", 1); raw = 1;
+    msleep(500);
+    uint32_t w = MEM(TP_PATH + 0x10), h = MEM(TP_PATH + 0x14);
+    for (int i = 0; i < 5; i++) orig[i] = MEM(TP_PATH + 0x64 + 4 * i);
+    w0 = MEM(TP_PATH + 0x18);
+    for (int f = 0; f < TP_NF; f++) { tp_last[f] = 0xdeadbeef; tp_note(f, tp_read(f, 0)); }
+    if (w != 4256 || h != 2214)
+    { snprintf(tp_result, sizeof(tp_result), "MEM1 %dx%d, not 4K 4256x2214: set Movie 4K", (int)w, (int)h); goto out; }
+    if (orig[0] != 0 || orig[1] != 1 || orig[2] != 2 || orig[3] != 1 || orig[4] != 0 || w0 != w || MEM(TP_PATH) >= 0x14)
+    { snprintf(tp_result, sizeof(tp_result), "Mem1Path not Canon's default: not touched"); goto out; }
+    wset = ((w * 10 / 8) * 8 + 13) / 14;                         /* recorder's 10-bit width field (3040 at 4256) */
+    if (((wset * 14) >> 3) != w * 10 / 8) { snprintf(tp_result, sizeof(tp_result), "no 10-bit width field"); goto out; }
+    uint32_t old = cli();
+    MEM(TP_PATH + 0x18) = wset; MEM(TP_PATH + 0x64 + 8) = 0; MEM(TP_PATH + 0x64 + 12) = 0;   /* 10-bit, ML order */
+    sei(old);
+    applied = 1;
+    NotifyBox(3000, "Tap test running: magnify in/out now (30 s)");
+    uint32_t t0 = get_ms_clock(), last_sum = tp_rowsum(), last_change = t0;
+    while (get_ms_clock() - t0 < TP_MS)
+    {
+        if (gui_menu_shown()) { tp_cancel = 1; break; }
+        uint32_t now = get_ms_clock(), sum = tp_rowsum();
+        if (sum != last_sum) { last_sum = sum; last_change = now; }
+        uint32_t stall = now - last_change > 1000;
+        for (int f = 0; f < TP_NF; f++) tp_note(f, tp_read(f, stall));
+        /* reflex: width field rewritten by Canon while f2 still says 10-bit -> back to 14-bit defaults */
+        if (MEM(TP_PATH + 0x18) != wset && MEM(TP_PATH + 0x64 + 8) == 0)
+        {
+            uint32_t o2 = cli();
+            MEM(TP_PATH + 0x64 + 8) = orig[2]; MEM(TP_PATH + 0x64 + 12) = orig[3];
+            sei(o2);
+            tp_reflex++; applied = 0;
+            for (int f = 0; f < TP_NF; f++) tp_note(f, tp_read(f, stall));
+        }
+        /* reflex 2: Canon put the pack cfg back to 14-bit but left our narrowed width field -> width = current w */
+        else if (MEM(TP_PATH + 0x18) == wset && MEM(TP_PATH + 0x64 + 8) != 0)
+        {
+            uint32_t o2 = cli();
+            MEM(TP_PATH + 0x18) = MEM(TP_PATH + 0x10);
+            sei(o2);
+            tp_reflex += 0x100; applied = 0;
+            for (int f = 0; f < TP_NF; f++) tp_note(f, tp_read(f, stall));
+        }
+        msleep(20);
+    }
+    snprintf(tp_result, sizeof(tp_result), "%s: %d events, reflex %x", tp_cancel ? "cancelled" : "done", tp_nev, tp_reflex);
+out:
+    if (applied && MEM(TP_PATH + 0x18) == wset)
+    {
+        uint32_t o3 = cli();
+        MEM(TP_PATH + 0x18) = w0; MEM(TP_PATH + 0x64 + 8) = orig[2]; MEM(TP_PATH + 0x64 + 12) = orig[3];
+        sei(o3);
+    }
+    else if (applied)
+    {
+        uint32_t o3 = cli();
+        MEM(TP_PATH + 0x64 + 8) = orig[2]; MEM(TP_PATH + 0x64 + 12) = orig[3];
+        sei(o3);
+    }
+    msleep(100);
+    if (raw) call("lv_save_raw", 0);
+    msleep(200);
+    tp_note(13, tp_read(13, 0)); tp_note(3, tp_read(3, 0)); tp_note(10, tp_read(10, 0));
+    tp_running = 0;
+    NotifyBox(5000, "Tap test %s. Open Sensor regs log > Save log.", tp_result);
+}
+
+static void tp_select(void *priv, int delta)
+{
+    if (tp_running || sr_run) { NotifyBox(2000, "Busy: stop Watch / wait for the tap test"); return; }
+    if (!tp_ev && !(tp_ev = malloc(TP_NEV * sizeof(*tp_ev)))) { NotifyBox(2000, "not enough memory"); return; }
+    tp_running = 1;
+    tp_result[0] = 0;
+    task_create("sr_tap", 0x1e, 0x1000, tp_task, 0);
+    NotifyBox(4000, "Tap test: close the ML menu to start");
+}
+
+static void tp_save_log(void)
+{
+    if (!tp_ev || !tp_nev) return;
+    static const char *nm[TP_NF] = { "m1 mode", "m1 w", "m1 h", "m1 +18 width", "m1 +1c", "m1 +28", "m1 +50", "m1 +58 addr",
+                                     "pack f0", "pack f1", "pack f2", "pack f3", "pack f4", "unit reg", "m_SensorMode", "stall" };
+    sr_printf("=== tap test v4.60: %s (%d events, %d lost); fields: Mem1Path 0x133CC, pack unit %x\n", tp_result,
+              tp_nev, tp_lost, (int)TP_UNIT);
+    int t0 = tp_ev[0].ms;
+    for (int i = 0; i < tp_nev; i++)
+    {
+        sr_printf("  +%d ms  %s = %x (%d)\n", (int)tp_ev[i].ms - t0, nm[tp_ev[i].f], (int)tp_ev[i].v, (int)tp_ev[i].v);
+        if (i % 32 == 31) sr_flush();
+    }
+    sr_flush();
+    tp_nev = 0;
+}
+
 /* ---- menu ---- */
 static void sr_watch_toggle(void *priv, int delta)
 {
+    if (tp_running) { NotifyBox(2000, "Tap test running"); return; }
     if (sr_run) { sr_run = 0; NotifyBox(2000, "Sensor regs: watch OFF (%d snapshots kept)", sr_n); return; }
     if (sr_task_alive) { NotifyBox(2000, "Sensor regs: still stopping, try again"); return; }
     if (!sr_cnt) sr_cnt = malloc(SR_NBUF * 1024);
@@ -255,7 +416,8 @@ static void sr_save_select(void *priv, int delta)
         for (int i = 0; i < 40 && sr_task_alive; i++) msleep(25);
         if (sr_task_alive) { NotifyBox(3000, "Sensor regs: watch still stopping, Save again"); return; }
     }
-    if (!sr_snaps) { NotifyBox(2000, "Sensor regs: nothing recorded (Watch was never ON)"); return; }
+    if (tp_running) { NotifyBox(2000, "Tap test still running"); return; }
+    if (!sr_snaps && !tp_nev_get()) { NotifyBox(2000, "Sensor regs: nothing recorded"); return; }
     int r = sr_save();
     if (r >= 0) NotifyBox(3000, "Saved %d snapshots to " SR_LOG, r);
     else NotifyBox(3000, "Save failed (%d)", r);
@@ -281,6 +443,12 @@ static struct menu_entry sr_menu[] = {
                 .select = sr_watch_toggle,
                 .update = sr_update,
                 .help   = "SET: ON/OFF. ON keeps a snapshot at every change (max 48).",
+            },
+            {
+                .name   = "Tap test (4K)",
+                .select = tp_select,
+                .help   = "Movie 4K only: 10-bit raw tap like the recorder, then logs what magnify in/out",
+                .help2  = "does to it for 30 s. Opening the ML menu cancels. Then Save log.",
             },
             {
                 .name   = "Save log",
