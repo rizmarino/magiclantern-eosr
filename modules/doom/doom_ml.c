@@ -764,6 +764,210 @@ static MENU_SELECT_FUNC(doom_sound_test)
     task_create("doom_snd", 0x1d, 0x2000, sound_task, 0);
 }
 
+/* ------------------------------------------------------------------ stream test (Canon movie-play audio path)
+ * The beep player above leaves ~12 ms between buffers. Movie playback is gapless: it streams through
+ * AudioDS::SoundApi.c play mode, the same API Canon's FileMgr::SoundState.c player (BGM) and the factory audio
+ * test use (ghidra notes "Gapless PCM: SoundDev play path", snd-decomp8-11.c):
+ *   SetAudioInit(5, 0, sync, fmt) -> SetPlayParam({48000, 16, 2, endian 0, fmt 1 = LPCM, 0, 0, sync, StartCBR,
+ *   FreeCBR, PlayCBR, StopCBR, inst, ErrorCBR, errinst}) -> SetStartPlayBuffer(buf) x4 -> SetMovieStart(6);
+ *   StartCBR(inst, err): SetOutStart() + unmute; PlayCBR: queue one more buffer (SetNextPlayBuffer); FreeCBR(inst,
+ *   adr): that buffer may be reused; stop = SetMovieStop(7) -> StopCBR, then SetAudioEnd(8).
+ * Play format is fixed at 48 kHz 16-bit stereo (SoundDev_CheckSamplingRate). Every ACTRL play call asserts while
+ * Canon records ("Just Recording", ACTRL_IsActiveState(0x22)), so check that first. Buffers are passed BY VALUE
+ * as a 0xE4-byte struct: w[0] = 1 block, w[1] = bytes, w[0x33] start adr, w[0x34] end adr, w[0x35] adr,
+ * w[0x36] bytes. Log: ML/DOOM/SOUND.TXT. */
+struct sd_buf { uint32_t w[57]; };
+static int  (*const actrl_is_active)(int mask, int lock) = (void *)0xE024D0FD;
+static int  (*const sd_set_out)(int out) = (void *)0xE05EE115;
+static void (*const sd_set_out_volume)(int vol) = (void *)0xE05EE141;
+static int  (*const sd_audio_init)(int mode, int a, int sync, int fmt) = (void *)0xE05EDAF7;
+static int  (*const sd_play_param)(const int *p) = (void *)0xE05EE2EB;
+static int  (*const sd_start_buf)(struct sd_buf b, uint32_t delay_ms) = (void *)0xE05EE8D9;
+static int  (*const sd_next_buf)(struct sd_buf b) = (void *)0xE05EE941;
+static int  (*const sd_movie_start)(int m) = (void *)0xE05EDB95;
+static int  (*const sd_movie_stop)(int m) = (void *)0xE05EDD73;
+static int  (*const sd_audio_end)(int m) = (void *)0xE05EDDAF;
+static int  (*const sd_out_start)(void) = (void *)0xE05EDE15;
+static void (*const sd_mute)(int on) = (void *)0xE05EEA77;
+
+#define ST_SLOTS 8
+#define ST_EV    160
+static struct { uint32_t us; uint8_t type; uint32_t a, b; } st_ev[ST_EV];
+static volatile int st_nev;
+static volatile int st_plays, st_frees, st_starts, st_stops, st_errs, st_err_id, st_start_err;
+static struct semaphore *st_sem, *st_stop_sem;
+static uint8_t *st_mem;
+static int st_chunk;
+static uint32_t st_freed;                 /* bit per slot: Canon gave it back */
+static uint64_t st_t0;
+
+static void st_log_ev(int type, uint32_t a, uint32_t b)
+{
+    int i = st_nev;
+    if (i >= ST_EV) return;
+    st_ev[i].us = (uint32_t)(get_us_clock() - st_t0); st_ev[i].type = type; st_ev[i].a = a; st_ev[i].b = b;
+    st_nev = i + 1;
+}
+static void st_start_cbr(int inst, int err)
+{
+    st_start_err = err; st_starts++; st_log_ev('S', err, 0);
+    if (err == 0) { sd_out_start(); sd_mute(0); }      /* what Canon's BGM player and factory test do here */
+}
+static void st_free_cbr(int inst, uint32_t adr, int c, int d)
+{
+    st_frees++; st_log_ev('F', adr, c);
+    if (st_mem && adr >= (uint32_t)st_mem && st_chunk) st_freed |= 1u << (((adr - (uint32_t)st_mem) / st_chunk) % ST_SLOTS);
+}
+static void st_play_cbr(int inst, int b, int c, int d) { st_plays++; st_log_ev('P', b, c); give_semaphore(st_sem); }
+static void st_stop_cbr(int inst) { st_stops++; st_log_ev('E', 0, 0); give_semaphore(st_stop_sem); }
+static void st_err_cbr(int inst, int id) { st_errs++; st_err_id = id; st_log_ev('X', id, 0); }
+
+/* phase-continuous test signal, 48 kHz stereo: t < 2 s 440 Hz both, 2-3 s 440 Hz left only, 3-4 s 660 Hz right
+ * only, then a 440 -> 880 Hz sweep on both. Any gap or repeated buffer is an audible click. */
+static uint32_t st_phase, st_frame;
+static int st_sine(uint32_t ph)               /* parabolic sine, ph in [0, 2^32): about -/+ 24000 */
+{
+    int x = (int)(ph >> 16) - 32768;          /* -32768..32767 = -pi..pi */
+    int y = (x * 4 / 2 * (32768 - (x < 0 ? -x : x))) >> 15;     /* 4/pi x - 4/pi^2 x|x|, scaled */
+    return -(y * 5 / 4);                      /* peak ~20500, like the beep test tones (26000 was loud enough) */
+}
+static void st_fill(int16_t *d, int frames)
+{
+    for (int i = 0; i < frames; i++, st_frame++)
+    {
+        uint32_t f = st_frame;
+        uint32_t hz = f < 96000 ? 440 : f < 144000 ? 440 : f < 192000 ? 660 : 440 + (f - 192000) / 240;
+        if (hz > 880) hz = 880;
+        st_phase += hz * 89478u;              /* 2^32 / 48000 = 89478.5 */
+        int v = st_sine(st_phase);
+        int l = f >= 144000 && f < 192000 ? 0 : v;
+        int r = f >= 96000 && f < 144000 ? 0 : v;
+        d[2 * i] = l; d[2 * i + 1] = r;
+    }
+}
+static int st_submit(int slot, int first)
+{
+    struct sd_buf b;
+    memset(&b, 0, sizeof b);
+    uint32_t adr = (uint32_t)st_mem + slot * st_chunk;
+    b.w[0] = 1; b.w[1] = st_chunk;
+    b.w[0x33] = adr; b.w[0x34] = adr + st_chunk; b.w[0x35] = adr; b.w[0x36] = st_chunk;
+    st_freed &= ~(1u << slot);
+    return first ? sd_start_buf(b, 0) : sd_next_buf(b);
+}
+
+/* one streaming run; returns 0 if it played to the end */
+static int stream_run(int chunk, int seconds, int vol)
+{
+#define SCALL(what, expr) ({ slogf("> %s\n", what); slog_flush(); int _r = (int)(expr); slogf("  rc %d\n", _r); _r; })
+    int total = seconds * 192000 / chunk, submitted = 0, underruns = 0, notfree = 0;
+    uint32_t tstart = get_ms_clock();
+    st_chunk = chunk; st_nev = 0; st_plays = st_frees = st_starts = st_stops = st_errs = st_err_id = 0;
+    st_start_err = -1; st_phase = st_frame = 0; st_freed = 0;
+    slogf("\n--- stream: chunk %d B (%d ms), %d s, volume %d; ACTRL active 0x22 %d, 0x11 %d, 0x20 %d\n", chunk,
+          chunk * 1000 / 192000, seconds, vol, actrl_is_active(0x22, 0), actrl_is_active(0x11, 0),
+          actrl_is_active(0x20, 0));
+    if (actrl_is_active(0x22, 0)) { slogf("Canon audio busy (recording): skipped\n"); return 1; }
+    st_mem = fio_malloc(ST_SLOTS * chunk);
+    if (!st_mem) { slogf("no memory\n"); return 1; }
+    memset(st_mem, 0, ST_SLOTS * chunk);
+    slogf("buffers %x, %d x %d B\n", (int)st_mem, ST_SLOTS, chunk);
+    static int param[15];
+    param[0] = 48000; param[1] = 16; param[2] = 2; param[3] = 0; param[4] = 1; param[5] = 0; param[6] = 0;
+    param[7] = 1; param[8] = (int)st_start_cbr; param[9] = (int)st_free_cbr; param[10] = (int)st_play_cbr;
+    param[11] = (int)st_stop_cbr; param[12] = 0x57; param[13] = (int)st_err_cbr; param[14] = 0x57;
+
+    SCALL("SetOut(0)", sd_set_out(0));
+    slogf("> SetOutVolume(%d)\n", vol); slog_flush(); sd_set_out_volume(vol);
+    if (SCALL("SetAudioInit(5, 0, 1, 1)", sd_audio_init(5, 0, 1, 1))) goto out_mem;
+    if (SCALL("SetPlayParam", sd_play_param(param))) goto out_end;
+    st_t0 = get_us_clock();
+    for (int i = 0; i < 4; i++)
+    {
+        st_fill((int16_t *)(st_mem + i * chunk), chunk / 4);
+        int r = st_submit(i, 1);
+        slogf("  start buf %d rc %d\n", i, r);
+        submitted++;
+    }
+    slog_flush();
+    tstart = get_ms_clock();
+    if (SCALL("SetMovieStart(6)", sd_movie_start(6))) goto out_stop;
+    /* steady state: one buffer per PlayCBR, prepared ahead in the next slot */
+    int slot = 4, seen = 0, ready = 0;
+    st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); ready = 1;
+    while (submitted < total && get_ms_clock() - tstart < (uint32_t)(seconds * 1000 + 3000))
+    {
+        take_semaphore(st_sem, 200);
+        while (seen < st_plays && submitted < total)
+        {
+            seen++;
+            if (!ready) { underruns++; st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); }
+            int r = st_submit(slot, 0);
+            if (r) st_log_ev('R', r, slot);
+            submitted++;
+            slot = (slot + 1) % ST_SLOTS;
+            if (!(st_freed & (1u << slot)) && submitted >= ST_SLOTS) notfree++;   /* refilling a slot Canon may still read */
+            st_fill((int16_t *)(st_mem + slot * chunk), chunk / 4); ready = 1;
+        }
+    }
+    msleep(4 * chunk * 1000 / 192000 + 100);  /* let the queued buffers play out */
+out_stop:
+    SCALL("SetMovieStop(7)", sd_movie_stop(7));
+    { int r = take_semaphore(st_stop_sem, 2000); slogf("  StopCBR wait %s\n", r ? "TIMEOUT" : "ok"); }
+out_end:
+    SCALL("SetAudioEnd(8)", sd_audio_end(8));
+    msleep(50);
+    slogf("result: submitted %d/%d, PlayCBR %d, FreeCBR %d, StartCBR %d (err %d), StopCBR %d, ErrorCBR %d (id %x),"
+          " underruns %d, refill-before-free %d, ran %d ms for %d ms of audio\n", submitted, total, st_plays, st_frees,
+          st_starts, st_start_err, st_stops, st_errs, st_err_id, underruns, notfree, (int)(get_ms_clock() - tstart),
+          submitted * chunk * 1000 / 192000);
+    {
+        uint32_t prev = 0; int dmin = 1 << 30, dmax = 0, np = 0;
+        for (int i = 0; i < st_nev; i++)
+        {
+            if (i < 24 || i >= st_nev - 6) slogf("  %c t=%u us a=%x b=%x\n", st_ev[i].type, st_ev[i].us, st_ev[i].a, st_ev[i].b);
+            if (st_ev[i].type == 'P') { if (np++) { int d = st_ev[i].us - prev; if (d < dmin) dmin = d; if (d > dmax) dmax = d; } prev = st_ev[i].us; }
+        }
+        if (np > 1) slogf("  PlayCBR spacing %d..%d us (one buffer = %d us), %d events logged\n", dmin, dmax,
+                          chunk * 1000000 / 192000, st_nev);
+    }
+    slog_flush();
+    msleep(200);
+out_mem:
+    free(st_mem); st_mem = NULL;
+    return st_plays > 0 && st_frees > 0 ? 0 : 1;
+#undef SCALL
+}
+
+static void stream_task(void *unused)
+{
+    slogf("\n=== stream test: %s fw %s, lv %d, movie mode %d (lv_movie_select %d)\n", camera_model, firmware_version,
+          lv, is_movie_mode(), lv_movie_select);
+    slog_flush();
+    if (!st_sem) st_sem = create_named_semaphore("doom_st", SEM_CREATE_LOCKED);
+    if (!st_stop_sem) st_stop_sem = create_named_semaphore("doom_st_stop", SEM_CREATE_LOCKED);
+    NotifyBox(3000, "Stream test 1/2: 6 s tone, 85 ms buffers");
+    int r1 = stream_run(16384, 6, 7);
+    msleep(800);
+    int r2 = 1;
+    if (!r1)
+    {
+        NotifyBox(3000, "Stream test 2/2: 4 s tone, 21 ms buffers");
+        r2 = stream_run(4096, 4, 7);
+    }
+    slogf("end: run1 %s, run2 %s; AudioBeep state %d\n", r1 ? "FAILED" : "ok", r1 ? "skipped" : r2 ? "FAILED" : "ok",
+          AB_BLOCK ? AB_INT(0x48) : -1);
+    slog_flush();
+    doom_running = 0;
+    NotifyBox(4000, "Stream test done: see ML/DOOM/SOUND.TXT");
+}
+static MENU_SELECT_FUNC(doom_stream_test)
+{
+    if (doom_running) return;
+    doom_running = 3;
+    task_create("doom_stream", 0x1c, 0x2000, stream_task, 0);
+}
+
 static MENU_UPDATE_FUNC(doom_play_update)
 {
     if (doom_played) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Already played this power-on: restart the camera.");
@@ -799,6 +1003,12 @@ static struct menu_entry doom_menu[] =
                 .select  = doom_sound_test,
                 .help    = "6 short sounds through Canon's speaker (~15 s). Log: ML/DOOM/SOUND.TXT.",
                 .help2   = "Mono only: stereo froze the camera twice (2026-11-10).",
+            },
+            {
+                .name    = "Stream test",
+                .select  = doom_stream_test,
+                .help    = "Gapless audio test (movie-play path): 6 s + 4 s continuous tone.",
+                .help2   = "Listen for clicks/gaps. Photo mode, not recording. Log: ML/DOOM/SOUND.TXT.",
             },
             MENU_EOL,
         },
