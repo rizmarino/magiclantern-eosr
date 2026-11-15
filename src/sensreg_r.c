@@ -1,4 +1,4 @@
-/* R: Debug > Sensor regs log (EOS R 1.8.0, v4.58). Personal diagnostic, not for upstream.
+/* R: Debug > Sensor regs log (EOS R 1.8.0, v4.58, v4.59 volatile-register filter). Personal diagnostic, not for upstream.
  *
  * Read-only survey for wider/taller 1:1 4K (crop_rec on the R). While "Watch" is ON a task polls, every 50 ms,
  * Canon's CMOS command buffers (the lists FUN_e06a19a4 sends to the sensor, 0xffffffff-terminated):
@@ -26,7 +26,9 @@
 #define SR_SDW      40
 #define SR_TG       0x5825c
 #define SR_TGW      20
-#define SR_NSNAP    40
+#define SR_NSNAP    48
+#define SR_NBUF     (SR_NLV + 1)        /* LV lists + still list */
+#define SR_VOLAT    3                   /* v4.59: a register that changed this often stops triggering snapshots */
 
 struct sr_snap {
     uint32_t ms, mode, m1w, m1h, m1w18, lvbase, stbase;
@@ -38,7 +40,6 @@ struct sr_snap {
 static struct sr_snap *sr_snaps;          /* malloc'd at the first Watch ON (~100 KB): bss would cost Canon heap */
 static volatile int sr_n, sr_lost, sr_polls, sr_bad_ptr;
 static volatile int sr_run, sr_task_alive;
-static uint32_t sr_last_hash;
 static int sr_saved_total;
 
 static int sr_ram_ok(uint32_t a) { return a >= 0x1000 && a < 0x80000000 && !(a & 3); }
@@ -92,21 +93,57 @@ static uint32_t sr_read(struct sr_snap *s)
     return h;
 }
 
+/* v4.59: v4.58 filled all 40 snapshots in 12 s of photo LV (4098 lost): AE rewrites regs 0x29/0x50/0x80 by +-1
+ * every few frames. Compare with the last KEPT snapshot and count changes per (list, register): a register that has
+ * changed SR_VOLAT times stops triggering snapshots (its value is still in every snapshot; Save lists them). */
+static uint8_t *sr_cnt;                   /* [SR_NBUF][1024] change counts, malloc'd with the snapshots */
+static volatile int sr_quiet;             /* polls with only volatile changes */
+
+static const uint32_t *sr_list(const struct sr_snap *s, int b, int *n)
+{
+    if (b < SR_NLV) { *n = SR_LVW; return s->lv[b]; }
+    *n = SR_STW; return s->st;
+}
+
+static int sr_worthy(const struct sr_snap *ref, const struct sr_snap *cur)
+{
+    if (ref->mode != cur->mode || ref->m1w != cur->m1w || ref->m1h != cur->m1h || ref->m1w18 != cur->m1w18) return 1;
+    for (int i = 0x70 / 4; i <= 0x80 / 4; i++) if (ref->sd[i] != cur->sd[i]) return 1;
+    int worthy = 0;
+    for (int b = 0; b < SR_NBUF; b++)
+    {
+        int n;
+        const uint32_t *x = sr_list(ref, b, &n), *y = sr_list(cur, b, &n);
+        for (int i = 0; i < n; i++)
+        {
+            if (x[i] == y[i]) continue;
+            int reg = (y[i] == 0xffffffff || x[i] == 0xffffffff || (x[i] >> 22) != (y[i] >> 22)) ? 0x3ff : (y[i] >> 22);
+            uint8_t *c = &sr_cnt[b * 1024 + reg];
+            if (reg == 0x3ff || *c < SR_VOLAT) worthy = 1;      /* list layout change: always keep */
+            if (*c < 255) (*c)++;
+        }
+    }
+    return worthy;
+}
+
 static void sr_task(void *unused)
 {
     sr_task_alive = 1;
-    struct sr_snap *tmp = &sr_snaps[SR_NSNAP];   /* scratch slot at the end of the malloc'd array */
+    struct sr_snap *tmp = &sr_snaps[SR_NSNAP];       /* scratch */
+    struct sr_snap *ref = &sr_snaps[SR_NSNAP + 1];   /* last kept state */
+    int have_ref = 0;
     while (sr_run)
     {
-        uint32_t h = sr_read(tmp);
+        sr_read(tmp);
         sr_polls++;
-        if (h != sr_last_hash)
+        if (!have_ref || sr_worthy(ref, tmp))
         {
-            sr_last_hash = h;
+            memcpy(ref, tmp, sizeof(*tmp)); have_ref = 1;
             int i = sr_n;
             if (i < SR_NSNAP) { memcpy(&sr_snaps[i], tmp, sizeof(*tmp)); sr_n = i + 1; }
             else sr_lost++;
         }
+        else sr_quiet++;
         msleep(50);
     }
     sr_task_alive = 0;
@@ -150,8 +187,21 @@ static int sr_save(void)
     sr_f = FIO_CreateFileOrAppend(SR_LOG);
     if (!sr_f) return -2;
     int n = sr_n;
-    sr_printf("=== sensreg v4.58 save at %d ms: %d snapshots (%d lost), %d polls, bad pointers %d\n",
-              (int)get_ms_clock(), n, sr_lost, sr_polls, sr_bad_ptr);
+    sr_printf("=== sensreg v4.59 save at %d ms: %d snapshots (%d lost), %d polls (%d volatile-only), bad pointers %d\n",
+              (int)get_ms_clock(), n, sr_lost, sr_polls, sr_quiet, sr_bad_ptr);
+    if (sr_cnt)
+    {
+        sr_printf("  changed registers (list:reg=count, >= %d = volatile):", SR_VOLAT);
+        int k = 0;
+        for (int b = 0; b < SR_NBUF; b++)
+            for (int r = 0; r < 1024; r++)
+                if (sr_cnt[b * 1024 + r])
+                {
+                    if (k++ % 8 == 0) sr_printf("\n    ");
+                    sr_printf(" %d:%x=%d", b, r, sr_cnt[b * 1024 + r]);
+                }
+        sr_printf("\n");
+    }
     for (int k = 0; k < n; k++)
     {
         struct sr_snap *s = &sr_snaps[k];
@@ -183,12 +233,15 @@ static void sr_watch_toggle(void *priv, int delta)
 {
     if (sr_run) { sr_run = 0; NotifyBox(2000, "Sensor regs: watch OFF (%d snapshots kept)", sr_n); return; }
     if (sr_task_alive) { NotifyBox(2000, "Sensor regs: still stopping, try again"); return; }
-    if (!sr_snaps && !(sr_snaps = malloc((SR_NSNAP + 1) * sizeof(struct sr_snap))))
+    if (!sr_cnt) sr_cnt = malloc(SR_NBUF * 1024);
+    if (!sr_snaps) sr_snaps = malloc((SR_NSNAP + 2) * sizeof(struct sr_snap));
+    if (!sr_snaps || !sr_cnt)
     {
         NotifyBox(3000, "Sensor regs: not enough memory");
         return;
     }
-    sr_last_hash = 0; sr_polls = 0; sr_bad_ptr = 0;
+    sr_polls = 0; sr_bad_ptr = 0; sr_quiet = 0;
+    memset(sr_cnt, 0, SR_NBUF * 1024);
     sr_run = 1;
     task_create("sensreg", 0x1e, 0x1000, sr_task, 0);
     NotifyBox(2000, "Sensor regs: watch ON");
@@ -227,7 +280,7 @@ static struct menu_entry sr_menu[] = {
                 .name   = "Watch",
                 .select = sr_watch_toggle,
                 .update = sr_update,
-                .help   = "SET: ON/OFF. ON keeps a snapshot at every change (max 40).",
+                .help   = "SET: ON/OFF. ON keeps a snapshot at every change (max 48).",
             },
             {
                 .name   = "Save log",
