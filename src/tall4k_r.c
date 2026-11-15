@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 programs the SAP block sizes directly). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -157,7 +157,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.62 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.63 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -255,19 +255,63 @@ static void t4_task(void *unused)
         l7[i69] = o69t + T4_DROWS / 2;
         t4_log("live lv7 0x69 still Canon's: written directly -> %x\n", (int)l7[i69]);
     }
-    /* frame interval and stall check from row 1100, 1.5 s */
+    /* v4.63: camera v4.62 showed Canon's rebuild still used h 2214 (the record is read where the cpu0-only remap
+     * doesn't reach, presumably cpu1). So program the size ourselves, as Canon's SAP block setup does: find the
+     * {engine register, value} pairs that hold the 4K size word (h-1) << 16 | (w/2 - 1) << 1 in the block structs
+     * (RAM 0x1af80..0x1b400, written by FUN_e06b92b4), write the +40-row value to register and struct, then
+     * Mem1Path +0x1c (port 3 height, copied to +0x14 every frame by FUN_e0638b7a). Only at 10-bit. */
+    int np = 0, nscaled = 0, stalled = 0;
+    uint32_t *pa[16];
+    const uint32_t v_old = ((T4_H - 1) & 0x3fff) << 16 | (((T4_W >> 1) - 1) & 0x3fff) << 1;
+    const uint32_t v_new = ((T4_H + T4_DROWS - 1) & 0x3fff) << 16 | (((T4_W >> 1) - 1) & 0x3fff) << 1;
+    for (uint32_t a = 0x1af80; a < 0x1b400; a += 4)
     {
-        uint32_t t0 = get_ms_clock(), last = t4_rowsum(1100), lt = t0, nchg = 0, maxgap = 0;
+        uint32_t r = MEM(a), v = MEM(a + 4);
+        if (r < 0xD0400000 || r >= 0xD0500000 || (r & 3)) continue;
+        if (v == v_old)
+        {
+            t4_log("  size pair at %x: reg %x = %x\n", (int)a, (int)r, (int)v);
+            if (np < 16) pa[np++] = (uint32_t *)a;
+        }
+        else if (((v >> 16) & 0x3fff) == T4_H - 1 || ((v >> 16) & 0x3fff) == T4_H)
+        {
+            nscaled++;
+            t4_log("  other pair with h at %x: reg %x = %x (not patched)\n", (int)a, (int)r, (int)v);
+        }
+    }
+    t4_log("size pairs %x: %d found (other h pairs %d); new value %x\n", (int)v_old, np, nscaled, (int)v_new);
+    int blocks_ok = np >= 3 && MEM(T4_PATH + 0x6c) == 0 && MEM(T4_PATH + 0x18) == T4_WSET && MEM(T4_PATH + 0x1c) == T4_H
+                    && MEM(T4_STATE + 0xc) == 12;
+    int blocks_on = 0;
+    uint32_t s1100 = t4_rowsum(1100), s2240 = t4_rowsum(2240);
+    if (blocks_ok)
+    {
+        uint32_t o = cli();
+        for (int k = 0; k < np; k++) { uint32_t r = pa[k][0]; MEM(r) = v_new; pa[k][1] = v_new; }
+        MEM(T4_PATH + 0x1c) = T4_H + T4_DROWS;
+        sei(o);
+        blocks_on = 1;
+        t4_log("blocks + Mem1Path +1c written (%d regs)\n", np);
+    }
+    else t4_log("block patch skipped (pairs %d, f2 %d, +18 %d, +1c %d, mode %d)\n", np, (int)MEM(T4_PATH + 0x6c),
+                (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_STATE + 0xc));
+    /* frame interval and stall check (row 1100) + do the new rows get written (row 2240), 1.5 s */
+    {
+        uint32_t t0 = get_ms_clock(), last = s1100, last2 = s2240, lt = t0, nchg = 0, nchg2 = 0, maxgap = 0;
         while (get_ms_clock() - t0 < 1500)
         {
             t4_reflex(&narrowed, &reflex14);
-            uint32_t s = t4_rowsum(1100), now = get_ms_clock();
-            if (s != last) { if (now - lt > maxgap) maxgap = now - lt; last = s; lt = now; nchg++; }
+            uint32_t sa = t4_rowsum(1100), sb = t4_rowsum(2240), now = get_ms_clock();
+            if (sa != last) { if (now - lt > maxgap) maxgap = now - lt; last = sa; lt = now; nchg++; }
+            if (sb != last2) { last2 = sb; nchg2++; }
+            if (now - lt > 1000) { stalled = 1; break; }
             msleep(2);
         }
-        t4_log("row 1100 changed %d times in 1.5 s (max gap %d ms)\n", (int)nchg, (int)maxgap);
+        t4_log("row 1100 changed %d x, row 2240 changed %d x in 1.5 s (max gap %d ms)%s; MEM1 %dx%d\n", (int)nchg,
+               (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
     }
-    if (m1w == T4_WSET && m1h == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
+    uint32_t m1h2 = MEM(T4_PATH + 0x14);
+    if (blocks_on && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
     {
         int nrows = (T4_H + T4_DROWS) - 2140 + 4;
         uint8_t *buf = fio_malloc(nrows * T4_PITCH + 64);
@@ -283,9 +327,20 @@ static void t4_task(void *unused)
             t4_log("saved rows 2140..%d + 1100..1103 to " T4_BIN "\n", T4_H + T4_DROWS - 1);
         }
         else t4_log("no memory for the row dump\n");
-        snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h);
+        snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h2);
     }
-    else snprintf(t4_result, sizeof(t4_result), "after rebuild MEM1 %dx%d, f2 %d", (int)m1w, (int)m1h, (int)MEM(T4_PATH + 0x6c));
+    else snprintf(t4_result, sizeof(t4_result), "%s MEM1 h %d, pairs %d", stalled ? "STALL," : "", (int)m1h2, np);
+    if (blocks_on)
+    {
+        uint32_t o = cli();
+        for (int k = 0; k < np; k++) { uint32_t r = pa[k][0]; MEM(r) = v_old; pa[k][1] = v_old; }
+        if (MEM(T4_PATH + 0x1c) == T4_H + T4_DROWS) MEM(T4_PATH + 0x1c) = T4_H;
+        sei(o);
+        blocks_on = 0;
+        msleep(200);
+        t4_log("blocks reverted: MEM1 %dx%d, row 1100 %s\n", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
+               t4_rowsum(1100) != s1100 ? "moving" : "same");
+    }
 
 revert:
     /* 6. revert the patch, then one more rebuild back to the normal 4K path */
@@ -296,7 +351,7 @@ revert:
         patched = 0;
         t4_log("reverted: record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4), (int)full[i69f],
                (int)full[i97f], (int)lvt[i69t]);
-        if (MEM(T4_PATH + 0x1c) != T4_H)
+        if (1)   /* v4.63: always rebuild once more (blocks and sensor back to Canon's own setup) */
         {
             NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             rc = t4_cycle(30000, &narrowed, &reflex14);
