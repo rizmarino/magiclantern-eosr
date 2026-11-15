@@ -1606,9 +1606,13 @@ static const int scantokey[128] =
 };
 
 
+/* ML port: config files are read and written (doomgeneric compiles both out), minus key bindings: the module sets
+ * its own camera-button keys, and the scancode translation below would not round-trip them. */
+#define DM_CONFIG_FILES 1
+
 static void SaveDefaultCollection(default_collection_t *collection)
 {
-#if ORIGCODE
+#if ORIGCODE || DM_CONFIG_FILES
     default_t *defaults;
     int i, v;
     FILE *f;
@@ -1629,6 +1633,12 @@ static void SaveDefaultCollection(default_collection_t *collection)
         {
             continue;
         }
+#if DM_CONFIG_FILES
+        if (defaults[i].type == DEFAULT_KEY)
+        {
+            continue;
+        }
+#endif
 
         // Print the name and line up all values at 30 characters
 
@@ -1770,11 +1780,12 @@ static void SetVariable(default_t *def, char *value)
 
 static void LoadDefaultCollection(default_collection_t *collection)
 {
-#if ORIGCODE
+#if ORIGCODE || DM_CONFIG_FILES
     FILE *f;
     default_t *def;
     char defname[80];
     char strparm[100];
+    char line[256];
 
     // read the file in, overriding any set defaults
     f = fopen(collection->filename, "r");
@@ -1787,9 +1798,21 @@ static void LoadDefaultCollection(default_collection_t *collection)
         return;
     }
 
-    while (!feof(f))
+    /* ML port: fgets + split instead of fscanf("%79s %99[^\n]\n") (the shim has no fscanf); same result: first
+     * word = name, rest of the line after the blanks = value */
+    while (fgets(line, sizeof line, f))
     {
-        if (fscanf(f, "%79s %99[^\n]\n", defname, strparm) != 2)
+        char *p = line;
+        int n = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && n < (int)sizeof defname - 1)
+            defname[n++] = *p++;
+        defname[n] = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        n = 0;
+        while (*p && *p != '\n' && n < (int)sizeof strparm - 1) strparm[n++] = *p++;
+        strparm[n] = 0;
+        if (!defname[0] || !strparm[0])
         {
             // This line doesn't match
 
@@ -1807,6 +1830,12 @@ static void LoadDefaultCollection(default_collection_t *collection)
 
             continue;
         }
+#if DM_CONFIG_FILES
+        if (def->type == DEFAULT_KEY)
+        {
+            continue;
+        }
+#endif
 
         // Strip off trailing non-printable characters (\r characters
         // from DOS text files)
@@ -1902,7 +1931,7 @@ void M_LoadDefaults (void)
     else
     {
         doom_defaults.filename
-            = M_StringJoin(configdir, default_main_config, NULL);
+            = M_StringJoin(configdir, DIR_SEPARATOR_S, default_main_config, NULL);   /* ML port: configdir has no trailing slash */
     }
 
     printf("saving config in %s\n", doom_defaults.filename);
@@ -1925,7 +1954,7 @@ void M_LoadDefaults (void)
     else
     {
         extra_defaults.filename
-            = M_StringJoin(configdir, default_extra_config, NULL);
+            = M_StringJoin(configdir, DIR_SEPARATOR_S, default_extra_config, NULL);
     }
 
     LoadDefaultCollection(&doom_defaults);

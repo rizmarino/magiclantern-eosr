@@ -282,6 +282,8 @@ void DG_SleepMs(uint32_t ms)
     t_last_sleep = get_ms_clock();
 }
 
+void M_SaveDefaults(void);          /* engine/m_config.c: writes ML/DOOM/default.cfg + extra.cfg */
+
 int DG_GetKey(int *pressed, unsigned char *key) { return dm_input_getkey(get_ms_clock(), pressed, key); }
 
 void DG_DrawFrame(void)
@@ -297,7 +299,7 @@ void DG_DrawFrame(void)
     if (frames == 1) log_flush();     /* breadcrumb: init finished, first frame drawn */
     /* if the engine is too slow to ever sleep, give lower-priority tasks a turn now and then */
     if (get_ms_clock() - t_last_sleep > 200) { msleep(10); t_last_sleep = get_ms_clock(); yields++; }
-    if (dm_input_quit) dm_exit(1);
+    if (dm_input_quit) { M_SaveDefaults(); dm_exit(1); }   /* MENU skips Doom's I_Quit, which saves the config */
 }
 
 /* ------------------------------------------------------------------ tasks */
