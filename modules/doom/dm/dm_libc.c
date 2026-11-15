@@ -503,6 +503,11 @@ int dm_sscanf(const char *s, const char *fmt, ...)
  * FIO_WriteFile costs ~10 ms, so an unbuffered ~20 KB save took minutes (camera 2026-11-10: "froze" on save,
  * 6252 bytes on the card when he switched off). Flushed when full, before read/seek, on fflush and fclose. */
 #define DM_WBUF (16 * 1024)
+/* Reads are buffered too (DM_RBUF): loading a savegame reads it one byte per fread (p_saveg.c saveg_read8), so
+ * an unbuffered ~25 KB load was ~25000 FIO_ReadFile calls (camera 2026-11-15: load "froze", MENU couldn't quit
+ * because quit is only checked between frames). Reads >= DM_RBUF bypass the buffer (WAD lumps); a seek inside
+ * the buffered window just moves the read offset; anything else drops it. */
+#define DM_RBUF (8 * 1024)
 struct dm_file
 {
     void *h;
@@ -511,9 +516,11 @@ struct dm_file
     long pos;           /* logical position, including buffered bytes */
     char *wb;           /* write buffer (allocated on the first write) */
     int wlen;
+    char *rb;           /* read buffer (allocated on the first small read) */
+    int rlen, roff;     /* valid bytes in rb, bytes already consumed; device position = pos + rlen - roff */
 };
 
-static struct dm_file f_out = { NULL, 1, 0, 0, 0, NULL, 0 }, f_err = { NULL, 2, 0, 0, 0, NULL, 0 };
+static struct dm_file f_out = { NULL, 1, 0, 0, 0, NULL, 0, NULL, 0, 0 }, f_err = { NULL, 2, 0, 0, 0, NULL, 0, NULL, 0, 0 };
 
 static int dm_wflush(FILE *f)
 {
@@ -522,6 +529,15 @@ static int dm_wflush(FILE *f)
     f->wlen = 0;
     int r = dm_io_write(f->h, f->wb, n);
     if (r != n) { f->err = 1; return EOF; }
+    return 0;
+}
+
+/* Drop read-ahead before a write: put the device back at the logical position. */
+static int dm_rdrop(FILE *f)
+{
+    if (!f || f->console || f->roff == f->rlen) { if (f) f->rlen = f->roff = 0; return 0; }
+    f->rlen = f->roff = 0;
+    if (dm_io_seek(f->h, f->pos)) { f->err = 1; return EOF; }
     return 0;
 }
 FILE *dm_stdout = &f_out, *dm_stderr = &f_err;
@@ -535,6 +551,7 @@ FILE *dm_fopen(const char *path, const char *mode)
     if (!f) { dm_io_close(h); return NULL; }
     f->h = h; f->console = 0; f->eof = 0; f->err = 0;
     f->wb = NULL; f->wlen = 0;
+    f->rb = NULL; f->rlen = f->roff = 0;
     f->pos = m == 2 ? dm_io_size(h) : 0;
     return f;
 }
@@ -545,6 +562,7 @@ int dm_fclose(FILE *f)
     int r = dm_wflush(f);
     dm_io_close(f->h);
     if (f->wb) dm_free(f->wb);
+    if (f->rb) dm_free(f->rb);
     dm_free(f);
     return r;
 }
@@ -553,11 +571,37 @@ size_t dm_fread(void *ptr, size_t size, size_t n, FILE *f)
 {
     if (!f || f->console || !size) return 0;
     if (dm_wflush(f)) return 0;
-    int r = dm_io_read(f->h, ptr, size * n);
-    if (r < 0) { f->err = 1; return 0; }
-    f->pos += r;
-    if ((size_t)r < size * n) f->eof = 1;
-    return (size_t)r / size;
+    size_t want = size * n, done = 0;
+    char *dst = ptr;
+    while (done < want)
+    {
+        if (f->roff < f->rlen)                      /* serve from the read-ahead */
+        {
+            size_t k = (size_t)(f->rlen - f->roff);
+            if (k > want - done) k = want - done;
+            memcpy(dst + done, f->rb + f->roff, k);
+            f->roff += (int)k;
+            f->pos += (long)k;
+            done += k;
+            continue;
+        }
+        f->rlen = f->roff = 0;
+        if (!f->rb && want - done < DM_RBUF) f->rb = dm_malloc(DM_RBUF);
+        if (!f->rb || want - done >= DM_RBUF)       /* big read (or no buffer): straight through */
+        {
+            int r = dm_io_read(f->h, dst + done, want - done);
+            if (r < 0) { f->err = 1; break; }
+            f->pos += r;
+            done += (size_t)r;
+            break;
+        }
+        int r = dm_io_read(f->h, f->rb, DM_RBUF);
+        if (r < 0) { f->err = 1; break; }
+        if (r == 0) { f->eof = 1; break; }
+        f->rlen = r;
+    }
+    if (done < want) f->eof = 1;
+    return done / size;
 }
 
 static int console_write(const char *s, size_t n)
@@ -579,6 +623,7 @@ size_t dm_fwrite(const void *ptr, size_t size, size_t n, FILE *f)
 {
     if (!f || !size) return 0;
     if (f->console) return console_write(ptr, size * n) / size;
+    if (f->rlen && dm_rdrop(f)) return 0;
     size_t k = size * n;
     if (!f->wb && k < DM_WBUF) f->wb = dm_malloc(DM_WBUF);
     if (!f->wb || k >= DM_WBUF)                 /* big write (or no buffer): straight through */
@@ -601,7 +646,17 @@ int dm_fseek(FILE *f, long off, int whence)
     if (!f || f->console) return -1;
     if (dm_wflush(f)) return -1;
     long p = whence == SEEK_SET ? off : whence == SEEK_CUR ? f->pos + off : dm_io_size(f->h) + off;
-    if (p < 0 || dm_io_seek(f->h, p)) return -1;
+    if (p < 0) return -1;
+    long start = f->pos - f->roff;                  /* file offset of rb[0] */
+    if (f->rlen && p >= start && p <= start + f->rlen)
+    {
+        f->roff = (int)(p - start);                 /* inside the read-ahead: no device seek */
+        f->pos = p;
+        f->eof = 0;
+        return 0;
+    }
+    f->rlen = f->roff = 0;
+    if (dm_io_seek(f->h, p)) return -1;
     f->pos = p;
     f->eof = 0;
     return 0;
