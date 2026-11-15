@@ -187,13 +187,20 @@ static volatile int      mus_req_play, mus_req_loop;
 /* service state */
 static void   *mus_file;
 static long    mus_data0, mus_data_end;         /* byte offsets of the sample data */
+static long    mus_end;                         /* end of what one pass plays: loop end when looping, else data end */
 static long    mus_pos;
 static int     mus_loop, mus_missing_logged;
 static int     n_mus_underrun, n_mus_reads, n_mus_open, n_mus_loops;
+/* loop tail: the samples after the loop end (notes still ringing when the score restarts); mixed into the start
+ * of every new pass, as the synth's voices would keep sounding over it */
+#define MUS_TAIL_MAX    48000                   /* 2 s; renders keep <= 1.5 s after the last note-off */
+static int16_t *mus_tail;
+static int      mus_tail_len, mus_tail_pos;
 
 static boolean Mus_Init(void)
 {
     if (!mus_ring) mus_ring = Z_Malloc(MUS_RING * 2, PU_STATIC, NULL);
+    if (!mus_tail) mus_tail = Z_Malloc(MUS_TAIL_MAX * 2, PU_STATIC, NULL);
     mus_wr = mus_rd = 0; mus_on = 0; mus_paused = 0;
     return true;
 }
@@ -234,8 +241,10 @@ static void Mus_Poll(void) { }
 
 static uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 
-/* open ML/DOOM/MUSIC/<name>.WAV: must be PCM 16-bit mono 24000 Hz; finds the data chunk */
-static int mus_open(const char *name)
+/* open ML/DOOM/MUSIC/<name>.WAV: must be PCM 16-bit mono 24000 Hz; finds the data chunk and the optional 'dmlp'
+ * chunk (uint32 loop end in samples, written by ~/ml/doom/musrender/add_loop.py: score end + 5 ms, where Chocolate
+ * Doom restarts the song) */
+static int mus_open(const char *name, int loop)
 {
     char path[64];
     M_snprintf(path, sizeof path, "ML/DOOM/MUSIC/%s.WAV", name);
@@ -247,7 +256,7 @@ static int mus_open(const char *name)
     }
     static uint8_t h[512];
     int n = dm_io_read(f, h, sizeof h);
-    long off = 12, data0 = -1, datalen = 0;
+    long off = 12, data0 = -1, datalen = 0, loop_end = -1;
     int fmt_ok = 0;
     if (n < 44 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) n = 0;
     while (n && off + 8 <= n)
@@ -256,6 +265,7 @@ static int mus_open(const char *name)
         if (!memcmp(h + off, "fmt ", 4) && off + 24 <= n)
             fmt_ok = (h[off + 8] | h[off + 9] << 8) == 1 && (h[off + 10] | h[off + 11] << 8) == 1
                      && rd32(h + off + 12) == 24000 && (h[off + 22] | h[off + 23] << 8) == 16;
+        if (!memcmp(h + off, "dmlp", 4) && sz >= 4 && off + 12 <= n) loop_end = rd32(h + off + 8);
         if (!memcmp(h + off, "data", 4)) { data0 = off + 8; datalen = sz; break; }
         off += 8 + sz + (sz & 1);
     }
@@ -268,6 +278,16 @@ static int mus_open(const char *name)
     long size = dm_io_size(f);
     if (data0 + datalen > size) datalen = size - data0;
     mus_file = f; mus_data0 = data0; mus_data_end = data0 + (datalen & ~1L); mus_pos = data0;
+    mus_end = mus_data_end;
+    mus_tail_len = mus_tail_pos = 0;
+    if (loop && loop_end >= 0 && data0 + loop_end * 2 < mus_data_end)
+    {
+        mus_end = data0 + loop_end * 2;
+        long t = (mus_data_end - mus_end) / 2;
+        if (t > MUS_TAIL_MAX) t = MUS_TAIL_MAX;
+        if (dm_io_seek(f, mus_end) == 0 && dm_io_read(f, mus_tail, t * 2) == t * 2) mus_tail_len = t;
+        mus_tail_pos = mus_tail_len;            /* nothing to add on the first pass */
+    }
     if (dm_io_seek(f, data0)) { dm_io_close(f); mus_file = NULL; return -1; }
     n_mus_open++;
     return 0;
@@ -279,50 +299,43 @@ static void mus_close(void)
     mus_file = NULL;
 }
 
-/* read up to MUS_BLOCK samples into the ring; returns samples added (0 when full or at the end of the song) */
+/* add one block of MUS_BLOCK samples to the ring (whole blocks only, so a block never wraps the ring: MUS_RING is a
+ * multiple of MUS_BLOCK). Looping songs restart seamlessly inside a block, with the loop tail mixed in; a
+ * non-looping song's last block is padded with silence. Returns samples added (0 when full or at the end). */
 static int mus_fill_block(void)
 {
     uint32_t space = MUS_RING - (mus_wr - mus_rd);
     if (space < MUS_BLOCK) return 0;
-    if (mus_pos >= mus_data_end)
+    if (mus_pos >= mus_end && !mus_loop) return 0;
+    int16_t *dst = mus_ring + mus_wr % MUS_RING;
+    int got = 0, wraps = 0;
+    while (got < MUS_BLOCK)
     {
-        if (!mus_loop) return 0;
-        if (dm_io_seek(mus_file, mus_data0)) return 0;
-        mus_pos = mus_data0;
-        n_mus_loops++;
-    }
-    /* whole blocks only, so a block never wraps the ring (MUS_RING is a multiple of MUS_BLOCK); the write
-     * position is kept block-aligned by padding a short tail (end of file) with silence */
-    long want = MUS_BLOCK * 2;
-    if (want > mus_data_end - mus_pos) want = mus_data_end - mus_pos;
-    uint32_t at = mus_wr % MUS_RING;
-    int r = dm_io_read(mus_file, mus_ring + at, want);
-    if (r <= 0) { mus_pos = mus_data_end; return 0; }
-    mus_pos += r;
-    n_mus_reads++;
-    int got = r / 2;
-    if (got < MUS_BLOCK)
-    {
-        if (mus_loop && mus_pos >= mus_data_end && got > 0)
+        if (mus_pos >= mus_end)
         {
-            /* loop: fill the rest of the block from the start of the song (seamless loop) */
-            while (got < MUS_BLOCK && dm_io_seek(mus_file, mus_data0) == 0)
-            {
-                long w2 = (MUS_BLOCK - got) * 2;
-                if (w2 > mus_data_end - mus_data0) w2 = mus_data_end - mus_data0;
-                int r2 = dm_io_read(mus_file, mus_ring + at + got, w2);
-                if (r2 <= 0) break;
-                got += r2 / 2;
-                mus_pos = mus_data0 + r2;
-                n_mus_loops++;
-                if (got < MUS_BLOCK && mus_pos < mus_data_end) break;   /* short read: card error, pad below */
-            }
+            if (!mus_loop || wraps++ > 2 || dm_io_seek(mus_file, mus_data0)) break;
+            mus_pos = mus_data0;
+            mus_tail_pos = 0;
+            n_mus_loops++;
         }
-        if (got < MUS_BLOCK) memset(mus_ring + at + got, 0, (MUS_BLOCK - got) * 2);
-        got = MUS_BLOCK;
+        long want = (long)(MUS_BLOCK - got) * 2;
+        if (want > mus_end - mus_pos) want = mus_end - mus_pos;
+        int r = dm_io_read(mus_file, dst + got, want);
+        if (r <= 0) { mus_pos = mus_end; mus_loop = 0; break; }     /* card error: end the song */
+        n_mus_reads++;
+        int k = r / 2;
+        for (int i = 0; i < k && mus_tail_pos < mus_tail_len; i++)
+        {
+            int v = dst[got + i] + mus_tail[mus_tail_pos++];
+            dst[got + i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+        }
+        got += k;
+        mus_pos += r;
     }
-    mus_wr = mus_wr + got;                          /* publish after the data */
-    return got;
+    if (!got) return 0;
+    if (got < MUS_BLOCK) memset(dst + got, 0, (MUS_BLOCK - got) * 2);
+    mus_wr = mus_wr + MUS_BLOCK;                    /* publish after the data */
+    return MUS_BLOCK;
 }
 
 /* platform: call regularly (camera: every ~20 ms from a low-priority task), never from the audio context */
@@ -343,7 +356,7 @@ void dm_mus_service(void)
         mus_close();
         mus_wr = mus_rd = 0;
         mus_last = 0;
-        if (play && mus_open(name) == 0)
+        if (play && mus_open(name, loop) == 0)
         {
             mus_loop = loop;
             while (mus_wr < MUS_RING / 2 && mus_fill_block() > 0) { }
@@ -351,7 +364,7 @@ void dm_mus_service(void)
         }
     }
     if (mus_on && mus_file) while (mus_fill_block() > 0) { }
-    if (mus_on && mus_file && !mus_loop && mus_pos >= mus_data_end && mus_wr == mus_rd) { mus_on = 0; mus_close(); }
+    if (mus_on && mus_file && !mus_loop && mus_pos >= mus_end && mus_wr == mus_rd) { mus_on = 0; mus_close(); }
 }
 
 /* game shutdown: close the file (the platform stops calling dm_mus_service first) */
