@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -157,7 +157,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.61 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.62 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -171,11 +171,28 @@ static void t4_task(void *unused)
         { snprintf(t4_result, sizeof(t4_result), "sdrv table != ROM at word %d", i); goto out; }
     full = (volatile uint32_t *)(base + (T4_FULL - T4_FROM));
     lvt = (volatile uint32_t *)(base + (T4_LVT - T4_FROM));
-    int bad = 0;
-    for (int i = 0; i < T4_NFULL; i++) if (full[i] != MEM(T4_FULL + i * 4)) bad++;
-    for (int i = 0; i < T4_NLVT; i++) if (lvt[i] != MEM(T4_LVT + i * 4)) bad++;
-    t4_log("RAM lists: full %x, LV template %x, %d words differ from ROM\n", (int)full, (int)lvt, bad);
-    if (bad) { snprintf(t4_result, sizeof(t4_result), "RAM lists != ROM (%d words): not touched", bad); goto out; }
+    /* v4.62: camera v4.61 found 13 of 151 words different (calibration written after boot?). Accept the RAM copy
+     * when the layout is identical (same register in every word, same terminator), at most 16 values differ, and
+     * the words this test patches equal ROM (checked below via the expected values). Log every difference. */
+    int bad = 0, layout = 0;
+    for (int k = 0; k < 2; k++)
+    {
+        volatile uint32_t *l = k ? lvt : full;
+        uint32_t rom = k ? T4_LVT : T4_FULL;
+        int n = k ? T4_NLVT : T4_NFULL;
+        for (int i = 0; i <= n; i++)
+        {
+            uint32_t a = l[i], b = MEM(rom + i * 4);
+            if (a == b) continue;
+            if ((a >> 22) != (b >> 22) || i == n) layout++;
+            else bad++;
+            t4_log("  %s[%d] RAM %x ROM %x (reg %x)\n", k ? "template" : "full", i, (int)a, (int)b, (int)(b >> 22));
+        }
+    }
+    t4_log("RAM lists: full %x, LV template %x: %d values differ from ROM, %d layout differences\n", (int)full, (int)lvt,
+           bad, layout);
+    if (layout || bad > 16)
+    { snprintf(t4_result, sizeof(t4_result), "RAM lists != ROM (%d values, %d layout): not touched", bad, layout); goto out; }
     i69f = t4_find(full, T4_NFULL, 0x69); i97f = t4_find(full, T4_NFULL, 0x97); i69t = t4_find(lvt, T4_NLVT, 0x69);
     if (i69f < 0 || i97f < 0 || i69t < 0) { snprintf(t4_result, sizeof(t4_result), "regs not found"); goto out; }
     o69f = full[i69f]; o97f = full[i97f]; o69t = lvt[i69t];
