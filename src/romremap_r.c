@@ -18,8 +18,9 @@ extern void change_mmu_tables(uint8_t *ttbr0, uint8_t *ttbr1, uint32_t cpu_id);
 extern void *_AllocateMemory(size_t size);
 extern void *_malloc(size_t size);
 
-/* page list: silent burst fps tables; dual ISO: m_AnalogIsoGainFix (ISO register 0x2D rows, 9 modes) */
-static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000 };
+/* page list: silent burst fps tables; dual ISO: m_AnalogIsoGainFix (ISO register 0x2D rows, 9 modes);
+ * v4.61 taller 4K: SAP/MEM1 size records 0xE0F2E5F8 (same 1 MB section as the silent fps page) */
+static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000, 0xE0F2E000 };
 static const uint32_t rmp_sections[] = { 0xE0F00000, 0xE0B00000 };
 #define RR_NSECT    2
 #define RR_L1_SIZE  0x4900              /* Canon L1 (0x4000) + core L2s for 0-1 MB + core L1s for 0-32 MB */
