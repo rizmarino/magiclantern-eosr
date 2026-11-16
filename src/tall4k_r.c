@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant; v4.68 FROM-blob engine init heights). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -46,11 +46,20 @@
 #define T4_REC      0xE0F2E608u         /* MEM1 record 1 (4K): {w, h, 0, 0} */
 #define T4_GEOM     0xE1C75B40u         /* v4.65: FROM-blob readout record for 4K (u16 4256, 2214, 0, 0, 144, 46 ..) */
 #define T4_ROD_OFF  (0x410 + 11 * 0x1a)  /* SensorDrive table: ROD u16 for mode 11 (4K), + slot * 2 */
+/* v4.68: 4K engine init values in the FROM blob ({reg, value} lists) that carry the frame height; v4.64-v4.67 left
+ * them at 2214, incl. the 0xD0411xxx block (sensor input side?) at h+1 = 2215. Value address (ROM), Canon's value. */
+static const struct { uint32_t a, v; } t4_eng[] = {
+    { 0xE1C680BC, 0x08A7109C }, { 0xE1C680CC, 0x08A7109C }, { 0xE1C680D4, 0x08A70002 }, { 0xE1C68994, 0x000008A7 },
+    { 0xE1D7E084, 0x08A5213C }, { 0xE1D7E09C, 0x08A6213E }, { 0xE1C6A1C0, 0x08A5109E }, { 0xE1C6A1E8, 0x08A5008E },
+    { 0xE1C6A89C, 0x08A5109E }, { 0xE1C6AF70, 0x08A5109E }, { 0xE1C6AF78, 0x08A5002E },
+};
+#define T4_NENG (sizeof(t4_eng) / sizeof(t4_eng[0]))
 #define T4_DROWS    40                  /* extra rows (sensor regs count 2-row units: +20) */
 #define T4_W        4256
 #define T4_H        2214
 #define T4_WSET     3040                /* 10-bit width field: (3040 * 14) >> 3 = 5320 = 4256 * 10 / 8 */
 #define T4_PITCH    5320
+static uint32_t t4_eng_new(uint32_t v) { return v < 0x10000 ? v + T4_DROWS : v + (T4_DROWS << 16); }
 
 static volatile int t4_running;
 static int t4_tap = 1;           /* v4.66: 0 = no raw tap (no lv_save_raw, no 10-bit, no reflex): A/B for the hang */
@@ -184,7 +193,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.67 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.68 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -234,6 +243,16 @@ static void t4_task(void *unused)
            *(volatile uint16_t *)T4_GEOM, *(volatile uint16_t *)(T4_GEOM + 2), rod[2], rod[3], rod[4], rod[9]);
     if (geo[0] != T4_W || geo[1] != T4_H || rod[2] != 1110 || rod[3] != 1110 || rod[4] != 1110 || rod[9] != 1110)
     { snprintf(t4_result, sizeof(t4_result), "geometry/ROD unexpected: not touched"); goto out; }
+    {
+        int ebad = 0;
+        for (unsigned k = 0; k < T4_NENG; k++)
+        {
+            uint32_t ram = MEM(base + (t4_eng[k].a - T4_FROM)), reg = MEM(base + (t4_eng[k].a - 4 - T4_FROM));
+            if (ram != t4_eng[k].v || (reg >> 20) != 0xD04) { ebad++; t4_log("  engine value %x: RAM %x reg %x (want %x)\n", (int)t4_eng[k].a, (int)ram, (int)reg, (int)t4_eng[k].v); }
+        }
+        t4_log("engine init values: %d checked, %d unexpected\n", (int)T4_NENG, ebad);
+        if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
+    }
     rc = romremap_init();
     rec_ram = (uint32_t *)romremap_ram(T4_REC);
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
@@ -285,6 +304,10 @@ static void t4_task(void *unused)
             *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2);
         }
         t4_log("geometry h -> %d, ROD -> %d %d %d %d\n", geo[1], rod[2], rod[3], rod[4], rod[9]);
+        for (unsigned k = 0; k < T4_NENG; k++)
+            t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
+        t4_log("engine init values -> +%d rows (first %x, 0xD041224c %x)\n", T4_DROWS,
+               (int)MEM(base + (t4_eng[0].a - T4_FROM)), (int)MEM(base + (t4_eng[3].a - T4_FROM)));
     }
     patched = 1;
     t4_log("patched: record reads %d, full 0x69 %x, 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4),
@@ -423,6 +446,8 @@ revert:
                 uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
                 *rc2 = 1110; romremap_flush(rc2, 2);
             }
+            for (unsigned k = 0; k < T4_NENG; k++)
+                t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
         }
         patched = 0;
         t4_log("reverted: record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4), (int)full[i69f],
