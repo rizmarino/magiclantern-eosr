@@ -745,8 +745,27 @@ static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes, uint32_t db)   
     return bad ? -1 : 0;
 }
 
+extern int tall4k_active(void);          /* v4.75 tall4k_r.c: taller 4K frame held (10-bit ML order, tap owned there) */
+static int rt_m1_4k(uint32_t w, uint32_t h) { return w == 4256 && h >= 2214 && h <= 3098; }   /* v4.75: 4K incl. taller */
+
 static int rt_pack_apply(int bpp, int ml_order)
 {
+    if (tall4k_active())
+    {
+        /* v4.75: the taller test holds port 3 at 10-bit, ML order, width field 3040. Only 10-bit fits MEM1 at that
+         * height; flip the bit order only (same bytes per line), and put it back the same way. */
+        for (int i = 0; i < 5; i++) pk_orig[i] = MEM(RT_PATH + 0x64 + 4 * i);
+        pk_w0 = MEM(RT_PATH + 0x18);
+        if (bpp != 10 || pk_orig[2] != 0 || pk_w0 != 3040)
+        { rt_printf("taller 4K held: needs 10-bit (bpp %d, f2 %d, width field %d)\n", bpp, pk_orig[2], pk_w0); return -1; }
+        uint32_t old = cli();
+        MEM(RT_PATH + 0x64 + 12) = ml_order ? 0 : 1;
+        sei(old);
+        pk_applied = 2;
+        msleep(100);
+        rt_printf("pack cfg (taller 4K held): order %d -> %d only, unit reg %08x\n", pk_orig[3], ml_order ? 0 : 1, MEM(0xD0422224u));
+        return 0;
+    }
     for (int i = 0; i < 5; i++) pk_orig[i] = MEM(RT_PATH + 0x64 + 4 * i);
     pk_w0 = MEM(RT_PATH + 0x18);
     uint32_t md = MEM(RT_PATH);
@@ -776,6 +795,13 @@ static int rt_pack_apply(int bpp, int ml_order)
 static void rt_pack_restore(void)
 {
     if (!pk_applied) return;
+    if (pk_applied == 2)                   /* v4.75: taller 4K held: bit order back only (never Canon's 14-bit here) */
+    {
+        uint32_t old = cli(); MEM(RT_PATH + 0x64 + 12) = pk_orig[3]; sei(old);
+        pk_applied = 0;
+        rt_printf("pack cfg order restored (taller 4K held), unit reg %08x\n", MEM(0xD0422224u));
+        return;
+    }
     uint32_t old = cli();
     MEM(RT_PATH + 0x18) = pk_w0;
     MEM(RT_PATH + 0x64 + 8) = pk_orig[2];
@@ -823,7 +849,7 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
      * converters crop them (DNG ActiveArea); the data stays in the file for black-level checks. */
     uint32_t ax = 0, ay = 0, obl = 0, obt = 0;
     if (m1_w == 2304 && m1_h == 1290) { obl = RT_OB_LEFT; obt = RT_OB_TOP; }
-    if (m1_w == 4256 && m1_h == 2214) { obl = 144; obt = 46; }   /* v17.1: 4K movie MEM1, measured on v17 RT00 (black 2049 @14-bit) */
+    if (rt_m1_4k(m1_w, m1_h)) { obl = 144; obt = 46; }   /* v17.1: 4K movie MEM1, measured on v17 RT00 (black 2049 @14-bit) */
     if (c_x0 < obl) ax = obl - c_x0;
     if (c_y0 < obt) ay = obt - c_y0;
     ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = c_ch - ay; /* jpeg crop, relative to the active area */
@@ -2078,7 +2104,7 @@ static int sp_dng_header(uint8_t *h, const char *desc, const char *dt)
     static const uint8_t cfa[4] = { 0, 1, 1, 2 }, dngv[4] = { 1, 4, 0, 0 };
     uint32_t obl = 0, obt = 0;
     if (m1_w == 2304 && m1_h == 1290) { obl = RT_OB_LEFT; obt = RT_OB_TOP; }
-    if (m1_w == 4256 && m1_h == 2214) { obl = 144; obt = 46; }
+    if (rt_m1_4k(m1_w, m1_h)) { obl = 144; obt = 46; }
     uint32_t ax = c_x0 < obl ? obl - c_x0 : 0, ay = c_y0 < obt ? obt - c_y0 : 0;
     uint32_t area[4] = { ay, ax, c_ch, c_cw }, corg[2] = { 0, 0 }, csz[2] = { c_cw - ax, c_ch - ay };
     int lsh = 14 - c_bpp;
@@ -3118,7 +3144,7 @@ static void rt_task(void *unused)
         if (!c_abort) rt_end();
         rt_unhook();
         rt_pack_restore();
-        if (lv_raw) { call("lv_save_raw", 0); lv_raw = 0; }
+        if (lv_raw && !tall4k_active()) { call("lv_save_raw", 0); lv_raw = 0; }
         rt_unlock();
         rt_printf("v20 capture ended: %d kept (%d before the press), writing DNGs\n", sp_kept, sp_pre_kept);
         rt_flush();
@@ -3335,7 +3361,7 @@ done:
     if (ra_buf && w_done && !ra_task_alive) { fio_free(ra_buf); ra_buf = 0; }   /* never under a live ra_task */
     rt_unhook();
     rt_pack_restore();
-    if (lv_raw) call("lv_save_raw", 0);
+    if (lv_raw && !tall4k_active()) call("lv_save_raw", 0);   /* v4.75: the taller test owns the tap */
     if (rt_begun) rt_end();
     if (c_crx && (w_done || !nch)) { crx_rec_end(); rt_free_staging(); c_crx = 0; }   /* v4.25: encoder back to Canon */
     if (w_done) rt_free_chunks();
@@ -3893,7 +3919,7 @@ static int rr_mark_rect(int *bx, int *by, int *bw, int *bh)
     uint32_t m1w = MEM(RT_PATH + 0x10), m1h = MEM(RT_PATH + 0x14);
     int obl, obt;
     rr_mark_assumed = 0;
-    if (m1w == 4256 && m1h == 2214) { obl = 144; obt = 46; rr_mark_4k_guess = 1; }
+    if (rt_m1_4k(m1w, m1h)) { obl = 144; obt = 46; rr_mark_4k_guess = 1; }
     else
     {
         if (!(m1w == 2304 && m1h == 1290)) rr_mark_assumed = 1;

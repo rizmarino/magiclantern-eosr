@@ -59,7 +59,10 @@ static const struct { uint32_t a, v; } t4_eng[] = {
 static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +480, 4 +560 */
 static const int t4_steps[5] = { 40, 200, 400, 480, 560 };
 static int t4_drows = 40;
-static int t4_place;                    /* v4.74 menu: 0 bottom (start reg 0x68 unchanged), 1 centred */
+static int t4_place;
+static int t4_hold;                     /* v4.75 menu: 0 revert after the test, 1 hold the taller frame for recording */
+static volatile int t4_holding;         /* v4.75: taller 4K path up, owned by this test (rectest_r.c asks) */
+int tall4k_active(void) { return t4_holding; }                    /* v4.74 menu: 0 bottom (start reg 0x68 unchanged), 1 centred */
 static int t4_d68, t4_d69;              /* change of 0x68 / 0x69 in 2-row units */
 #define T4_DROWS    ((uint32_t)t4_drows)
 #define T4_W        4256
@@ -190,19 +193,20 @@ static void t4_restore_all(void)
         t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
 }
 
+static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
     int seen13 = 0;
     uint32_t t0 = get_ms_clock();
     while (get_ms_clock() - t0 < (uint32_t)timeout_ms)
     {
-        if (gui_menu_shown()) return 1;
+        if (gui_menu_shown() && !t4_nocancel) return 1;
         if (t4_reflex(narrowed, reflex14))
             t4_log("  +%d ms reflex: mode %d, +18 %d, f2 %d, m1 %dx%d\n", (int)(get_ms_clock() - t0),
                    (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x6c),
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
-        if (m == 13) seen13 = 1;
+        if (m == 13) { seen13 = 1; t4_holding = 0; }
         if (!seen13 && t4_pend_apply)
         {
             static uint32_t hb;
@@ -294,7 +298,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.74 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.75 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -571,10 +575,24 @@ revert:
         else
         {
             t4_pend_all = 1;
-            t4_log("revert deferred until magnify is active\n");
-            NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
+            int hold = t4_hold && t4_tap && MEM(T4_PATH + 0x14) == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0;
+            if (hold)
+            {
+                /* v4.75: keep the taller frame (10-bit, ML order) for Movie > RAW video; the recorder only flips the
+                 * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
+                t4_holding = 1; t4_nocancel = 1;
+                t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
+                NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). Stop, then magnify x5+exit to end", T4_W, T4_H + T4_DROWS);
+            }
+            else
+            {
+                t4_log("revert deferred until magnify is active\n");
+                NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
+            }
             t4_trace_ms = 3000;
-            rc = t4_cycle(30000, &narrowed, &reflex14);
+            rc = t4_cycle(hold ? 4 * 3600 * 1000 : 30000, &narrowed, &reflex14);
+            t4_holding = 0; t4_nocancel = 0;
+            if (hold) t4_log("HOLD ended (%s)\n", rc == 0 ? "magnify" : "timeout");
             t4_log("cycle 2: %s, MEM1 %dx%d, +1c %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x1c));
             if (t4_pend_all)
@@ -636,6 +654,14 @@ static struct menu_entry t4_menu[] = {
         .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+480 (2694)", "+560 (2774)"),
         .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
         .help2   = "Resets to +40 at every power-on.",
+    },
+    {
+        .name    = "Taller 4K after test",
+        .priv    = &t4_hold,
+        .max     = 1,
+        .choices = CHOICES("Revert", "Hold for recording"),
+        .help    = "Hold: keep the taller frame after the checks, record with Movie > RAW video (LL 10-bit),",
+        .help2   = "then stop recording and magnify x5 + exit to restore. Resets to Revert at power-on.",
     },
     {
         .name    = "Taller 4K placement",
