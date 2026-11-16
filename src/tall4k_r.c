@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 programs the SAP block sizes directly). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -150,14 +150,14 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 
 static void t4_task(void *unused)
 {
-    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc;
+    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc, rebuilt = 0;
     uint32_t base = 0, orig_pack[5] = {0}, w0 = 0;
     volatile uint32_t *full = 0, *lvt = 0;
     int i69f = -1, i97f = -1, i69t = -1;
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.63 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.64 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -235,6 +235,16 @@ static void t4_task(void *unused)
     patched = 1;
     t4_log("patched: record reads %d, full 0x69 %x, 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4),
            (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
+    /* v4.64: make cpu1 (where SapSetPath reads the record, v4.62) use the remapped page too */
+    {
+        int c1 = -1, calls = 0; uint32_t v1 = 0;
+        t4_log("cpu1 switch via RPC: requesting\n");
+        int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
+        t4_log("cpu1 switch: rc %x, callee cpu %d, calls %d, cpu1 reads record h %d (want %d)\n", r1, c1, calls,
+               (int)v1, T4_H + T4_DROWS);
+        if (r1 || v1 != T4_H + T4_DROWS)
+        { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto revert; }
+    }
     NotifyBox(5000, "Taller 4K: now magnify x5, then exit magnify");
 
     /* 4. rebuild via magnify in/out */
@@ -242,6 +252,7 @@ static void t4_task(void *unused)
     t4_log("cycle 1: %s, narrowed %d, 14-bit reflex %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
            narrowed, reflex14);
     if (rc) { snprintf(t4_result, sizeof(t4_result), "%s before the rebuild", rc == 1 ? "cancelled" : "no magnify seen"); goto revert; }
+    rebuilt = 1;
 
     /* 5. measure */
     uint32_t m1w = MEM(T4_PATH + 0x10), m1h = MEM(T4_PATH + 0x14);
@@ -284,7 +295,7 @@ static void t4_task(void *unused)
                     && MEM(T4_STATE + 0xc) == 12;
     int blocks_on = 0;
     uint32_t s1100 = t4_rowsum(1100), s2240 = t4_rowsum(2240);
-    if (blocks_ok)
+    if (0 && blocks_ok)   /* v4.64: never write the SAP size registers live (v4.63 froze the camera) */
     {
         uint32_t o = cli();
         for (int k = 0; k < np; k++) { uint32_t r = pa[k][0]; MEM(r) = v_new; pa[k][1] = v_new; }
@@ -311,7 +322,7 @@ static void t4_task(void *unused)
                (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
     }
     uint32_t m1h2 = MEM(T4_PATH + 0x14);
-    if (blocks_on && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
+    if (!stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
     {
         int nrows = (T4_H + T4_DROWS) - 2140 + 4;
         uint8_t *buf = fio_malloc(nrows * T4_PITCH + 64);
@@ -351,7 +362,7 @@ revert:
         patched = 0;
         t4_log("reverted: record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4), (int)full[i69f],
                (int)full[i97f], (int)lvt[i69t]);
-        if (1)   /* v4.63: always rebuild once more (blocks and sensor back to Canon's own setup) */
+        if (rebuilt)   /* rebuild once more after any rebuild (sensor and blocks back to Canon's own setup) */
         {
             NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             rc = t4_cycle(30000, &narrowed, &reflex14);

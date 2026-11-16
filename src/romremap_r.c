@@ -128,10 +128,55 @@ void romremap_flush(void *ram, size_t n)
     dcache_clean(a, ((uint32_t)ram + n - a + 0x1F) & ~0x1F);
 }
 
+/* v4.64: switch cpu1 to the same tables via Canon's inter-core RPC (stub _request_RPC 0xDF002BAA: the other core
+ * calls f(arg) until clear_RPC_request()). The R's task_create_ex can't target cpu1 and CONFIG_RPC/SGI are off, so
+ * this is the only way to run code there. The callee checks it really runs on cpu1, switches TTBR with cpu1's
+ * per-core part (L1 + 0x4880, the slot copy_mmu_tables_ex fixes up for cpu1), then reads probe_addr through the ROM
+ * address so cpu0 can tell whether cpu1 sees the remapped page. Returns 0 if cpu1 switched; results in cpu, val. */
+extern int _request_RPC(void (*f)(void *), void *o);
+extern int clear_RPC_request(void);
+static volatile int rr1_done, rr1_cpu, rr1_calls;
+static volatile uint32_t rr1_val, rr1_probe_addr;
+static volatile int rmp_on1;
+static void rr1_func(void *unused)
+{
+    rr1_calls++;
+    if (!rr1_done)
+    {
+        int cpu = get_cpu_id();
+        rr1_cpu = cpu;
+        if (cpu == 1 && rmp_on)
+        {
+            uint32_t old = cli();
+            change_mmu_tables(rmp_l1 + RR_L1_SIZE - 0x100 + 0x80, rmp_l1, 1);
+            sei(old);
+            rmp_on1 = 1;
+        }
+        rr1_val = rr1_probe_addr ? *(volatile uint32_t *)rr1_probe_addr : 0;
+        rr1_done = 1;
+    }
+    clear_RPC_request();
+}
+
+int romremap_cpu1(uint32_t probe_addr, int *cpu, uint32_t *val, int *calls)
+{
+    if (!rmp_on) return -1;
+    if (get_cpu_id() != 0) return -2;
+    rr1_done = 0; rr1_cpu = -1; rr1_val = 0; rr1_calls = 0; rr1_probe_addr = probe_addr;
+    int st = _request_RPC(rr1_func, 0);
+    for (int i = 0; i < 100 && !rr1_done; i++) msleep(10);
+    *cpu = rr1_cpu; *val = rr1_val; *calls = rr1_calls;
+    if (!rr1_done) return 0x100 | (st & 0xff);
+    return rmp_on1 ? 0 : -3;
+}
+int romremap_on_cpu1(void) { return rmp_on1; }
+
 #else
 int romremap_init(void) { return -1; }
 int romremap_on(void) { return 0; }
 const char *romremap_stage(void) { return "no MMU"; }
 uint8_t *romremap_ram(uint32_t rom_addr) { return NULL; }
 void romremap_flush(void *ram, size_t n) { }
+int romremap_cpu1(uint32_t probe_addr, int *cpu, uint32_t *val, int *calls) { return -1; }
+int romremap_on_cpu1(void) { return 0; }
 #endif
