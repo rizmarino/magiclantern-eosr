@@ -3658,9 +3658,12 @@ static void sp_sim_select(void *priv, int delta)
     task_create("sp_sim", 0x1e, 0x1000, sp_sim_task, 0);
 }
 
+extern int tall4k_keys(int k);          /* v4.79 tall4k_r.c: Taller 4K mode key guard */
+int rawrec_on(void) { return rr_on; }
 int handle_rawrec_keys(struct event *event)
 {
     int p0 = event->param;
+    if (p0 != 0x9D && !tall4k_keys(p0)) return 0;
     if ((sp_mode || sp_active) && p0 != 0x9D)  /* v20: silent-picture keys first; every key is logged while it's on */
     {
         int r = sp_keys(p0);

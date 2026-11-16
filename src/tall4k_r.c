@@ -24,6 +24,7 @@
 #include "mem.h"
 #include "propvalues.h"
 #include "property.h"
+#include "config.h"
 #include "romremap_r.h"
 
 #ifndef MEM
@@ -197,6 +198,21 @@ static void t4_restore_all(void)
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
 static int t4_auto;                     /* v4.77 menu: 0 manual magnify, 1 ML requests magnify in/out itself */
 static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
+/* v4.79 persistent mode (Debug > Taller 4K mode, kept in magic.cfg): a watcher switches 4K 23.98p movie LV to the
+ * taller frame by itself and back before anything that could rebuild 4K at another size or rate. */
+static CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694) */
+static int t4_persist_run;              /* the running t4_task was started by the watcher */
+static int t4_pmode_run;                /* the mode value the running switch was started for */
+static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
+static volatile int t4_key_pend;        /* key held back until normal 4K is back, then re-sent */
+static int t4_gm0;                      /* Canon GUI mode when the hold started (v4.79: idle value unverified) */
+static volatile int t4_suspend;         /* watcher: stop auto switching until the mode is changed (after a failure) */
+#define T4_PND "ML/SETTINGS/TALL4K.PND"  /* crash marker: exists only while a switch is in progress */
+static void t4_marker(int on)
+{
+    if (on) { FILE *f = FIO_CreateFile(T4_PND); if (f) { FIO_WriteFile(f, "t4", 2); FIO_CloseFile(f); } }
+    else FIO_RemoveFile(T4_PND);
+}
 /* v4.78: on the R PROP_LV_DISPSIZE is 8 bytes (camera v4.77: ML's length check asserted "correct:8 called:4" and
  * nothing was sent). Canon's LVGMT handler (FUN_e04b46b4, case 0x80050015) takes word 0 = zoom and stores word 1 at
  * its +0x504, passing both to FUN_e02cd6e6; word 1's meaning is unknown, so keep Canon's current value. */
@@ -214,18 +230,47 @@ static void t4_zoom(int z)
     t4_log("  zoom request %d (current %x/%x, len %d, seen %d; mode %d)\n", z, (int)t4_dz[0], (int)t4_dz[1],
            (int)t4_dz_len, (int)t4_dz_n, (int)MEM(T4_STATE + 0xc));
     if (t4_dz_len != 8 || !t4_dz_n) { t4_log("  zoom: property not seen as 8 bytes: not sent\n"); return; }
+    if (t4_persist_run && z != 1) t4_marker(1);     /* v4.79: a switch starts (apply or end) */
     prop_request_change(PROP_LV_DISPSIZE, v, 8);
 }
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
-    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0;
-    uint32_t t0 = get_ms_clock(), t13 = 0, trq = 0;
+    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0;
+    uint32_t t0 = get_ms_clock(), t13 = 0, trq = 0, tstop = 0;
     while (get_ms_clock() - t0 < (uint32_t)timeout_ms)
     {
         if (gui_menu_shown() && !t4_nocancel) return 1;
         /* v4.77 auto magnify: in, wait until this cycle's apply/restore has run, then out. While holding, only
          * after "End taller 4K". A request that changes nothing is retried once after 3 s, then given up. */
+        if (t4_persist_run && t4_holding && t4_pmode != t4_pmode_run && !ending)
+        { ending = 1; t4_log("  mode changed to %d while held: ending\n", t4_pmode); }   /* zoom waits for the menu to close */
         if (t4_end_req) ending = 1;                 /* kept after t4_end_req is cleared at magnify */
+        if (t4_holding && !seen13)
+        {
+            /* v4.79: LV stopped or another sensor mode (photo LV, FHD): the 4K path is not running, so Canon's
+             * values can go back at once (the rule is only: never under a running 4K path) */
+            int mm = MEM(T4_STATE + 0xc);
+            if (!lv || (mm != 12 && mm != 13))
+            {
+                if (!tstop) tstop = get_ms_clock();
+                else if (get_ms_clock() - tstop > 300)
+                {
+                    if (t4_pend_all && t4_restore_fn) { t4_restore_fn(); t4_pend_all = 0; }
+                    t4_holding = 0;
+                    t4_log("  4K path stopped while held (lv %d, mode %d): Canon's values restored\n", lv, mm);
+                    return 3;
+                }
+            }
+            else tstop = 0;
+            /* a Canon dialog opened anyway (e.g. touch Q): try to end via magnify, log what happens */
+            if (CURRENT_GUI_MODE != t4_gm0 && !gui_menu_shown() && !dlg_warned)
+            {
+                dlg_warned = 1;
+                t4_log("  Canon dialog %d opened while held: ending taller 4K\n", (int)CURRENT_GUI_MODE);
+                NotifyBox(5000, "Taller 4K: close this screen, back to normal 4K first");
+                ending = 1;
+            }
+        }
         int autonow = ending || (t4_auto && !t4_holding);
         if (autonow && !seen13 && (!rq5 || (rq5 == 1 && get_ms_clock() - trq > 3000)) && !gui_menu_shown())
         { rq5++; trq = get_ms_clock(); t4_zoom(5); }
@@ -317,7 +362,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 
 static void t4_task(void *unused)
 {
-    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc, rebuilt = 0;
+    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc = 0, rebuilt = 0, held = 0;
     static uint32_t base; uint32_t orig_pack[5] = {0}, w0 = 0;
     base = 0;
     static volatile uint32_t *full, *lvt;
@@ -329,7 +374,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.78 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.79 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -469,6 +514,7 @@ static void t4_task(void *unused)
     else NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
 
     /* 4. rebuild via magnify in/out */
+    if (t4_persist_run) t4_marker(1);
     rc = t4_cycle(30000, &narrowed, &reflex14);
     t4_log("cycle 1: %s, narrowed %d, 14-bit reflex %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
            narrowed, reflex14);
@@ -546,7 +592,7 @@ static void t4_task(void *unused)
                rlo, (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
     }
     uint32_t m1h2 = MEM(T4_PATH + 0x14);
-    if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
+    if (t4_tap && t4_dump && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
     {
         /* v4.71: every 8th row of 0..2139 (whole-frame preview) + every row 2140..h-1 (old edge + new rows),
          * written in 16-row chunks (no big buffer) */
@@ -577,6 +623,8 @@ static void t4_task(void *unused)
         if (buf) fio_free(buf);
         snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h2);
     }
+    else if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
+        snprintf(t4_result, sizeof(t4_result), "%dx%d on", T4_W, (int)m1h2);
     else if (!t4_tap) snprintf(t4_result, sizeof(t4_result), "no tap: survived the taller rebuild (+1c %d)", (int)MEM(T4_PATH + 0x1c));
     else snprintf(t4_result, sizeof(t4_result), "%s MEM1 h %d, pairs %d", stalled ? "STALL," : "", (int)m1h2, np);
     if (blocks_on)
@@ -607,15 +655,19 @@ revert:
         else
         {
             t4_pend_all = 1;
-            int hold = t4_hold && t4_tap && MEM(T4_PATH + 0x14) == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0;
+            int hold = t4_hold && t4_tap && !stalled && MEM(T4_PATH + 0x14) == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0;
+            if (t4_persist_run && !hold) t4_suspend = 1;   /* came up wrong: no automatic retries */
             if (hold)
             {
                 /* v4.75: keep the taller frame (10-bit, ML order) for Movie > RAW video; the recorder only flips the
                  * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
-                t4_holding = 1; t4_nocancel = 1;
+                t4_holding = 1; t4_nocancel = 1; t4_gm0 = CURRENT_GUI_MODE; held = 1;
+                t4_log("hold: Canon GUI mode %d\n", t4_gm0);
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
                 t4_end_req = 0;
-                NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
+                if (t4_persist_run) t4_marker(0);
+                if (t4_persist_run) NotifyBox(4000, "Taller 4K %dx%d", T4_W, T4_H + T4_DROWS);
+                else NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
             {
@@ -624,9 +676,13 @@ revert:
                 else NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             }
             t4_trace_ms = 3000;
-            rc = t4_cycle(hold ? 4 * 3600 * 1000 : 30000, &narrowed, &reflex14);
+            if (t4_persist_run && !hold) t4_marker(1);
+            /* the hold wait has no time limit in practice (24 h); the marker goes on when the ending starts */
+            rc = t4_cycle(hold ? 24 * 3600 * 1000 : 30000, &narrowed, &reflex14);
             t4_holding = 0; t4_nocancel = 0;
-            if (hold) t4_log("HOLD ended (%s)\n", rc == 0 ? "magnify" : "timeout");
+            if (hold) t4_log("HOLD ended (%s)\n", rc == 0 ? "magnify" : rc == 3 ? "4K path stopped" : "timeout");
+            if (rc == 3) snprintf(t4_result, sizeof(t4_result), "ended (LV left 4K)");
+            else if (hold && rc == 0) snprintf(t4_result, sizeof(t4_result), "ended");
             t4_log("cycle 2: %s, MEM1 %dx%d, +1c %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x1c));
             if (t4_pend_all)
@@ -639,7 +695,7 @@ revert:
         }
     }
 out:
-    if (raw && MEM(T4_PATH + 0x1c) != T4_H && MEM(T4_PATH + 0x1c) != 1496)
+    if (raw && MEM(T4_STATE + 0xc) == 12 && MEM(T4_PATH + 0x1c) != T4_H && MEM(T4_PATH + 0x1c) != 1496)
     {
         /* path still tall: stop the tap first, so no 14-bit frame of the taller size reaches MEM1 */
         call("lv_save_raw", 0); raw = 0;
@@ -657,13 +713,30 @@ out:
     if (raw) call("lv_save_raw", 0);
     t4_log("end: %s; narrowed %d, 14-bit reflex %d; MEM1 %dx%d, +18 %d, f2 %d\n", t4_result, narrowed, reflex14,
            (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x6c));
+    if (t4_persist_run)
+    {
+        t4_marker(0);
+        if (!held && rc != 1) t4_suspend = 1;   /* refused or came up wrong: no automatic retries until the mode changes */
+        if (t4_key_pend) t4_log("key %x ended the taller frame\n", t4_key_pend);
+        if (t4_suspend) NotifyBox(8000, "Taller 4K mode paused: %s (see ML/LOGS/TALL4K.TXT)", t4_result);
+    }
+    else NotifyBox(8000, "Taller 4K: %s", t4_result);
     t4_running = 0;
-    NotifyBox(8000, "Taller 4K: %s", t4_result);
+    if (t4_key_pend)
+    {
+        /* v4.79: the key that ended the taller frame (MENU / PLAY / Q) goes to Canon now */
+        int k = t4_key_pend; t4_key_pend = 0;
+        msleep(300);
+        t4_log("re-sending key %x\n", k);
+        fake_simple_button(k);
+    }
 }
 
 static void t4_select(void *priv, int delta)
 {
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
+    if (t4_pmode) { NotifyBox(3000, "Set Taller 4K mode OFF first"); return; }
+    t4_persist_run = 0; t4_dump = 1;
     t4_tap = priv ? *(int *)priv : 1;
     t4_drows = t4_steps[(t4_sel >= 0 && t4_sel <= 4) ? t4_sel : 0];
     t4_d68 = 0; t4_d69 = t4_drows / 2;
@@ -732,12 +805,100 @@ static MENU_SELECT_FUNC(t4_end_select)
 {
     if (!t4_holding) { NotifyBox(3000, "Taller 4K is not on"); return; }
     if (rawrec_running()) { NotifyBox(3000, "Stop recording first"); return; }
+    if (t4_persist_run) t4_pmode = 0;      /* v4.79: in the persistent mode End = mode OFF */
     t4_end_req = 1;
     NotifyBox(4000, "Taller 4K: close the ML menu, normal 4K follows");
 }
 
+/* v4.79: key hook (rectest_r.c handle_rawrec_keys calls this first). While the taller frame is held: MENU, PLAY
+ * and Q/SET would open Canon screens where movie size / frame rate can change (a 4K rebuild at 29.97p with the
+ * taller values can't fit the frame time), so they end the taller frame first and are re-sent after it. Canon's
+ * own REC is blocked unless Movie > RAW video (R) is on. While recording, MENU/PLAY/Q are blocked. */
+extern int rawrec_on(void);
+int tall4k_keys(int k)
+{
+    if (gui_menu_shown()) return 1;
+    if (t4_running && t4_persist_run && !t4_holding && (k == BGMT_MENU || k == BGMT_PLAY || k == BGMT_PRESS_SET))
+    { NotifyBox(2000, "Taller 4K: switching, one moment"); return 0; }   /* never open Canon screens mid-switch */
+    if (!t4_holding) return 1;
+    if (k == 0x20 && !rawrec_on()) { NotifyBox(3000, "Taller 4K: record with Movie > RAW video (R)"); return 0; }
+    if (k != BGMT_MENU && k != BGMT_PLAY && k != BGMT_PRESS_SET) return 1;
+    if (rawrec_running() || RECORDING) { NotifyBox(2000, "Stop recording first"); return 0; }
+    if (!t4_key_pend)
+    {
+        t4_key_pend = k; t4_end_req = 1;   /* logged by the t4 task (no card writes from the GUI task) */
+        NotifyBox(3000, "Taller 4K: back to normal 4K first...");
+    }
+    return 0;
+}
+
+/* v4.79 watcher: switches on when Taller 4K mode is set and 4K 23.98/24p movie LV has been idle for 2 s */
+extern int get_global_draw(void);
+extern int ml_started;
+static void t4_watch_task(void *unused)
+{
+    while (!ml_started) msleep(200);
+    msleep(2000);
+    uint32_t sz = 0;
+    if (FIO_GetFileSize(T4_PND, &sz) == 0)
+    {
+        t4_log("=== boot: crash marker found (camera stopped during a switch): Taller 4K mode was %d, now OFF\n", t4_pmode);
+        FIO_RemoveFile(T4_PND);
+        t4_pmode = 0;
+        NotifyBox(10000, "Taller 4K mode switched OFF: the camera froze while switching last time");
+    }
+    int last_mode = t4_pmode;
+    uint32_t idle_since = 0;
+    for (;;)
+    {
+        msleep(250);
+        if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; idle_since = 0; }
+        if (!t4_pmode || t4_suspend || t4_running || t4_zt_running) { idle_since = 0; continue; }
+        int slot = (int)MEM(T4_SDRV + 0x70);
+        int ok = lv && MEM(T4_STATE + 0xc) == 12 && (slot == 4 || slot == 9) && CURRENT_GUI_MODE == 0 &&
+                 !gui_menu_shown() && !rawrec_running() && !RECORDING && lv_dispsize == 1 && !get_global_draw();
+        if (!ok)
+        {
+            /* log once per value why it isn't switching (camera v4.79: is idle LV GUI mode 0 on the R?) */
+            static int lastwhy = -1;
+            int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && slot != 9) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
+                      : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 8;
+            if (why != lastwhy) { lastwhy = why; t4_log("mode watcher: waiting (%d)\n", why); }
+            idle_since = 0; continue;
+        }
+        if (!idle_since) { idle_since = get_ms_clock(); continue; }
+        if (get_ms_clock() - idle_since < 2000) continue;
+        idle_since = 0;
+        t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1;
+        t4_pmode_run = t4_pmode;
+        t4_drows = t4_pmode == 2 ? 480 : 200;
+        t4_d68 = 0; t4_d69 = t4_drows / 2;
+        t4_running = 1;
+        t4_task(0);                         /* runs here, until the taller frame ends */
+        t4_persist_run = 0;
+        msleep(1000);
+    }
+}
+
+static MENU_UPDATE_FUNC(t4_mode_update)
+{
+    if (t4_pmode && t4_holding && t4_persist_run) MENU_SET_RINFO("ON");
+    else if (t4_pmode && t4_suspend) MENU_SET_RINFO("paused");
+    if (t4_pmode && get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
+    else if (t4_pmode) MENU_SET_WARNING(MENU_WARN_INFO, "Movie 4K 23.98/24p. Record with Movie > RAW video (R), Lossless 10-bit.");
+}
+
 static int t4_one = 1, t4_zero = 0;
 static struct menu_entry t4_menu[] = {
+    {
+        .name    = "Taller 4K mode",
+        .priv    = &t4_pmode,
+        .max     = 2,
+        .choices = CHOICES("OFF", "4256x2414 (16:9 in post)", "4256x2694"),
+        .update  = t4_mode_update,
+        .help    = "v4.79 test: switches 4K 23.98p movie LV to a taller raw frame by itself (centred, 10-bit).",
+        .help2   = "MENU / PLAY / Q go back to normal 4K first. Needs Global Draw OFF.",
+    },
     {
         .name    = "Taller 4K rows",
         .priv    = &t4_sel,
@@ -801,6 +962,7 @@ static struct menu_entry t4_menu[] = {
 static void t4_init(void *unused)
 {
     menu_add("Debug", t4_menu, COUNT(t4_menu));
+    task_create("t4watch", 0x1e, 0x1000, t4_watch_task, 0);
 }
 
 INIT_FUNC("tall4k_r", t4_init);
