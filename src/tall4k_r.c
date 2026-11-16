@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant; v4.68 FROM-blob engine init heights). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant; v4.68 FROM-blob engine init heights; v4.69 safe revert). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -64,6 +64,9 @@ static uint32_t t4_eng_new(uint32_t v) { return v < 0x10000 ? v + T4_DROWS : v +
 static volatile int t4_running;
 static int t4_tap = 1;           /* v4.66: 0 = no raw tap (no lv_save_raw, no 10-bit, no reflex): A/B for the hang */
 static int t4_trace_ms;          /* v4.65: breadcrumb window after the first magnify exit */
+/* v4.69: the live 4K list word to restore once magnify is active (lv7 is then not the list being sent) */
+static volatile uint32_t *t4_pend_lv;
+static uint32_t t4_pend_val;
 static char t4_result[80];
 
 static void t4_log(const char *fmt, ...)
@@ -150,6 +153,15 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
         if (m == 13) seen13 = 1;
+        if (m == 13 && t4_pend_lv)
+        {
+            /* v4.69 (camera v4.68 froze when the live 4K list went back to 2214 rows while the taller path ran):
+             * restore it only now, while magnify's own list is the one being sent */
+            msleep(200);
+            t4_put(t4_pend_lv, t4_pend_val);
+            t4_log("  magnify active: live 4K list 0x69 restored -> %x\n", (int)*t4_pend_lv);
+            t4_pend_lv = 0;
+        }
         if (seen13 && m == 12 && t4_trace_ms)
         {
             /* v4.65: magnify exit seen: breadcrumb every 50 ms (file closed each time) while running the reflex,
@@ -193,7 +205,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.68 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.69 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -437,7 +449,9 @@ revert:
     if (patched)
     {
         rec_ram[1] = orec_h; romremap_flush(&rec_ram[1], 4);
-        t4_put(&full[i69f], o69f); t4_put(&full[i97f], o97f); t4_put(&lvt[i69t], o69t);
+        t4_put(&full[i69f], o69f); t4_put(&full[i97f], o97f);
+        if (rebuilt) { t4_pend_lv = &lvt[i69t]; t4_pend_val = o69t; }   /* v4.69: live list restored during magnify */
+        else t4_put(&lvt[i69t], o69t);                                   /* no taller rebuild happened: safe now */
         {
             uint16_t *gc = (uint16_t *)((uint32_t)&geo[1] & ~0x40000000);
             *gc = T4_H; romremap_flush(gc, 2);
@@ -450,12 +464,19 @@ revert:
                 t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
         }
         patched = 0;
-        t4_log("reverted: record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4), (int)full[i69f],
-               (int)full[i97f], (int)lvt[i69t]);
+        t4_log("reverted (live list %s): record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n",
+               rebuilt ? "waits for magnify" : "now", (int)MEM(T4_REC + 4), (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
         if (rebuilt)   /* rebuild once more after any rebuild (sensor and blocks back to Canon's own setup) */
         {
             NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
+            t4_trace_ms = 3000;
             rc = t4_cycle(30000, &narrowed, &reflex14);
+            if (t4_pend_lv)
+            {
+                t4_log("live 4K list still taller (no magnify seen): power-cycle the camera\n");
+                t4_pend_lv = 0;
+                snprintf(t4_result, sizeof(t4_result), "not restored: power-cycle the camera");
+            }
             t4_log("cycle 2: %s, MEM1 %dx%d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         }
