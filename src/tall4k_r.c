@@ -30,7 +30,7 @@
 #endif
 
 #define T4_LOG      "ML/LOGS/TALL4K.TXT"
-#define T4_BIN      "ML/LOGS/TALL4K.BIN"
+#define T4_BIN      "ML/LOGS/T4_%d.BIN"   /* v4.71: one file per height */
 #define T4_PATH     0x133CC
 #define T4_STATE    0xef24              /* ImageSequence: +0xc m_SensorMode (12 = 4K, 13 = magnify) */
 #define T4_SDRV     0xcfd4
@@ -54,7 +54,12 @@ static const struct { uint32_t a, v; } t4_eng[] = {
     { 0xE1C6A89C, 0x08A5109E }, { 0xE1C6AF70, 0x08A5109E }, { 0xE1C6AF78, 0x08A5002E },
 };
 #define T4_NENG (sizeof(t4_eng) / sizeof(t4_eng[0]))
-#define T4_DROWS    40                  /* extra rows (sensor regs count 2-row units: +20) */
+/* v4.71: extra rows selectable (sensor regs count 2-row units). Limit: 23.98p VD 1444 HD, ROD = 1110 + rows/2 must
+ * stay <= RPS - 10 (1399) and VD - 45 (Canon's own tightest gap, 4K 29.97p) -> <= +578 rows. */
+static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +560 */
+static const int t4_steps[4] = { 40, 200, 400, 560 };
+static int t4_drows = 40;
+#define T4_DROWS    ((uint32_t)t4_drows)
 #define T4_W        4256
 #define T4_H        2214
 #define T4_WSET     3040                /* 10-bit width field: (3040 * 14) >> 3 = 5320 = 4256 * 10 / 8 */
@@ -239,7 +244,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.70 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.71 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -290,6 +295,18 @@ static void t4_task(void *unused)
            *(volatile uint16_t *)T4_GEOM, *(volatile uint16_t *)(T4_GEOM + 2), rod[2], rod[3], rod[4], rod[9]);
     if (geo[0] != T4_W || geo[1] != T4_H || rod[2] != 1110 || rod[3] != 1110 || rod[4] != 1110 || rod[9] != 1110)
     { snprintf(t4_result, sizeof(t4_result), "geometry/ROD unexpected: not touched"); goto out; }
+    /* v4.71: timing check for the chosen height in the active fps slot (SensorDrive state +0x70) */
+    static int slot;
+    slot = (int)MEM(T4_SDRV + 0x70);
+    {
+        int vd = (slot >= 0 && slot < 13) ? *(volatile uint16_t *)(sd + 11 * 0x1a + slot * 2) : 0;
+        int rps = (slot >= 0 && slot < 13) ? *(volatile uint16_t *)(sd + 0x618 + 11 * 0x1a + slot * 2) : 0;
+        int rodn = 1110 + T4_DROWS / 2;
+        t4_log("step +%d rows (h %d): fps slot %d, VD %d, RPS %d, ROD 1110 -> %d (gap %d)\n", T4_DROWS, T4_H + T4_DROWS,
+               slot, vd, rps, rodn, vd - rodn);
+        if ((slot != 4 && slot != 9 && T4_DROWS > 40) || vd - rodn < 45 || rodn > rps - 10)
+        { snprintf(t4_result, sizeof(t4_result), "+%d rows needs 23.98p (slot %d): not touched", T4_DROWS, slot); goto out; }
+    }
     {
         int ebad = 0;
         for (unsigned k = 0; k < T4_NENG; k++)
@@ -348,9 +365,9 @@ static void t4_task(void *unused)
         for (int k = 0; k < 4; k++)
         {
             uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
-            *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2);
+            if (rod_slots[k] == slot || T4_DROWS <= 40) { *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2); }
         }
-        t4_log("geometry h -> %d, ROD -> %d %d %d %d\n", geo[1], rod[2], rod[3], rod[4], rod[9]);
+        t4_log("geometry h -> %d, ROD slots 2/3/4/9 -> %d %d %d %d\n", geo[1], rod[2], rod[3], rod[4], rod[9]);
         for (unsigned k = 0; k < T4_NENG; k++)
             t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
         t4_log("engine init values -> +%d rows (first %x, 0xD041224c %x)\n", T4_DROWS,
@@ -373,7 +390,7 @@ static void t4_task(void *unused)
         { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto revert; }
     }
     t4_trace_ms = t4_tap ? 2000 : 4000;
-    NotifyBox(5000, "Taller 4K: now magnify x5, then exit magnify");
+    NotifyBox(5000, "Taller 4K +%d: now magnify x5, then exit magnify", T4_DROWS);
 
     /* 4. rebuild via magnify in/out */
     rc = t4_cycle(30000, &narrowed, &reflex14);
@@ -422,7 +439,8 @@ static void t4_task(void *unused)
     int blocks_ok = np >= 3 && MEM(T4_PATH + 0x6c) == 0 && MEM(T4_PATH + 0x18) == T4_WSET && MEM(T4_PATH + 0x1c) == T4_H
                     && MEM(T4_STATE + 0xc) == 12;
     int blocks_on = 0;
-    uint32_t s1100 = t4_rowsum(1100), s2240 = t4_rowsum(2240);
+    int rlo = T4_H + T4_DROWS - 14;
+    uint32_t s1100 = t4_rowsum(1100), s2240 = t4_rowsum(rlo);
     if (0 && blocks_ok)   /* v4.64: never write the SAP size registers live (v4.63 froze the camera) */
     {
         uint32_t o = cli();
@@ -440,32 +458,45 @@ static void t4_task(void *unused)
         while (get_ms_clock() - t0 < 1500)
         {
             t4_reflex(&narrowed, &reflex14);
-            uint32_t sa = t4_rowsum(1100), sb = t4_rowsum(2240), now = get_ms_clock();
+            uint32_t sa = t4_rowsum(1100), sb = t4_rowsum(rlo), now = get_ms_clock();
             if (sa != last) { if (now - lt > maxgap) maxgap = now - lt; last = sa; lt = now; nchg++; }
             if (sb != last2) { last2 = sb; nchg2++; }
             if (t4_tap && now - lt > 1000) { stalled = 1; break; }
             msleep(2);
         }
-        t4_log("row 1100 changed %d x, row 2240 changed %d x in 1.5 s (max gap %d ms)%s; MEM1 %dx%d\n", (int)nchg,
-               (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
+        t4_log("row 1100 changed %d x, row %d changed %d x in 1.5 s (max gap %d ms)%s; MEM1 %dx%d\n", (int)nchg,
+               rlo, (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
     }
     uint32_t m1h2 = MEM(T4_PATH + 0x14);
     if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
     {
-        int nrows = (T4_H + T4_DROWS) - 2140 + 4;
-        uint8_t *buf = fio_malloc(nrows * T4_PITCH + 64);
-        if (buf)
+        /* v4.71: every 8th row of 0..2139 (whole-frame preview) + every row 2140..h-1 (old edge + new rows),
+         * written in 16-row chunks (no big buffer) */
+        int hh = T4_H + T4_DROWS, nsp = 2140 / 8, nct = hh - 2140, ok = 0;
+        uint8_t *buf = fio_malloc(16 * T4_PITCH);
+        char fn[32]; snprintf(fn, sizeof(fn), T4_BIN, hh);
+        FILE *f = buf ? FIO_CreateFile(fn) : 0;
+        if (f)
         {
-            uint32_t hdr[16] = { 0x4b344c54 /* "TL4K" */, T4_W, T4_H + T4_DROWS, 10, T4_PITCH, 2140, nrows - 4, 1100, 4 };
-            memcpy(buf, hdr, 64);
-            for (int r = 0; r < nrows - 4; r++) memcpy(buf + 64 + r * T4_PITCH, (void *)(T4_MEM1 + (2140 + r) * T4_PITCH), T4_PITCH);
-            for (int r = 0; r < 4; r++) memcpy(buf + 64 + (nrows - 4 + r) * T4_PITCH, (void *)(T4_MEM1 + (1100 + r) * T4_PITCH), T4_PITCH);
-            FILE *f = FIO_CreateFile(T4_BIN);
-            if (f) { FIO_WriteFile(f, buf, 64 + nrows * T4_PITCH); FIO_CloseFile(f); }
-            fio_free(buf);
-            t4_log("saved rows 2140..%d + 1100..1103 to " T4_BIN "\n", T4_H + T4_DROWS - 1);
+            uint32_t hdr[16] = { 0x4b344c54 /* "TL4K" */, T4_W, hh, 10, T4_PITCH, 0, 8, nsp, 2140, nct, 2 /* layout */ };
+            FIO_WriteFile(f, hdr, 64);
+            int tot = nsp + nct;
+            for (int i = 0; i < tot; i += 16)
+            {
+                int n = MIN(16, tot - i);
+                for (int k = 0; k < n; k++)
+                {
+                    int j = i + k, row = j < nsp ? j * 8 : 2140 + (j - nsp);
+                    memcpy(buf + k * T4_PITCH, (void *)(T4_MEM1 + row * T4_PITCH), T4_PITCH);
+                }
+                if (FIO_WriteFile(f, buf, n * T4_PITCH) != n * T4_PITCH) break;
+                ok += n;
+            }
+            FIO_CloseFile(f);
+            t4_log("saved %d of %d rows (every 8th of 0..2139, all of 2140..%d) to %s\n", ok, tot, hh - 1, fn);
         }
-        else t4_log("no memory for the row dump\n");
+        else t4_log("row dump: no buffer or file\n");
+        if (buf) fio_free(buf);
         snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h2);
     }
     else if (!t4_tap) snprintf(t4_result, sizeof(t4_result), "no tap: survived the taller rebuild (+1c %d)", (int)MEM(T4_PATH + 0x1c));
@@ -539,6 +570,7 @@ static void t4_select(void *priv, int delta)
 {
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
     t4_tap = priv ? *(int *)priv : 1;
+    t4_drows = t4_steps[t4_sel & 3];
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
     NotifyBox(4000, "Taller 4K: close the ML menu to start");
@@ -554,20 +586,28 @@ static MENU_UPDATE_FUNC(t4_update)
 static int t4_one = 1, t4_zero = 0;
 static struct menu_entry t4_menu[] = {
     {
-        .name   = "Taller 4K, no raw tap",
-        .priv   = &t4_zero,
-        .select = t4_select,
-        .update = t4_update,
-        .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
-        .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
+        .name    = "Taller 4K rows",
+        .priv    = &t4_sel,
+        .max     = 3,
+        .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+560 (2774)"),
+        .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
+        .help2   = "Resets to +40 at every power-on.",
     },
     {
         .name   = "Taller 4K (test)",
         .priv   = &t4_one,
         .select = t4_select,
         .update = t4_update,
-        .help   = "Movie 4K 23.98p: first sensor-window test, +40 rows. Follow the on-screen prompts",
-        .help2  = "(magnify in/out). Reverts at the end; ML menu cancels. Log ML/LOGS/TALL4K.TXT.",
+        .help   = "Movie 4K 23.98p: sensor-window test, rows from Taller 4K rows. Follow the prompts",
+        .help2  = "(magnify in/out). Reverts at the end; ML menu cancels. ML/LOGS/TALL4K.TXT, T4_<h>.BIN.",
+    },
+    {
+        .name   = "Taller 4K, no raw tap",
+        .priv   = &t4_zero,
+        .select = t4_select,
+        .update = t4_update,
+        .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
+        .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
     },
 };
 
