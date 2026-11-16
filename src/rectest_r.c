@@ -3418,6 +3418,7 @@ static void rr_key_flush(void);
 #define RR_STATUS_Y 8                   /* v19.3: meters sit to the right of it (RA_M_X) */
 #define RR_STATUS_CLEAR_W (RA_M_X - 12)   /* clearing the status never touches the meters */
 static uint32_t x_ms_last, x_kb_last, x_rate;   /* v4.26 status line rate (status task only) */
+extern void tall4k_tick(void);
 static void rr_status_task(void *unused)
 {
     /* on-screen status while a REC-button run is active. v16 redrew every 250 ms and that run wrote
@@ -3428,6 +3429,7 @@ static void rr_status_task(void *unused)
     for (;;)
     {
         msleep(250);
+        tall4k_tick();                     /* v4.81: Taller 4K mode watcher (no task of its own: DryOS task limit) */
         if (++tick % 4 == 0 && !rr_active && !rt_osd_run && !rt_busy && (rr_diag || sp_mode)) rr_key_flush();   /* no card writes of ours during a recording; v18: key log only with REC diagnostics; v20: or silent pictures on */
         int on = rr_active || rt_osd_run || sp_active;
         if (!on) { x_ms_last = 0; x_rate = 0; }       /* v4.26 */

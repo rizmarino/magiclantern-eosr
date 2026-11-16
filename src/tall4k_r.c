@@ -832,55 +832,62 @@ int tall4k_keys(int k)
     return 0;
 }
 
-/* v4.79 watcher: switches on when Taller 4K mode is set and 4K 23.98/24p movie LV has been idle for 2 s */
+/* v4.79 watcher: switches on when Taller 4K mode is set and 4K 23.98/24p movie LV has been idle for 2 s.
+ * v4.81: a tick called every 250 ms from rectest's rr_status task instead of a task of its own: v4.79/v4.80's
+ * permanent "t4watch" task gave Err 70 at every boot (KerTask.c:207 in module_task = task creation failed: the
+ * DryOS task limit; heap was fine at 488 KB). The switching task exists only while a switch / hold runs. */
 extern int get_global_draw(void);
 extern int ml_started;
-static void t4_watch_task(void *unused)
+static void t4_persist_task(void *unused)
 {
-    while (!ml_started) msleep(200);
-    msleep(2000);
-    uint32_t sz = 0;
-    if (FIO_GetFileSize(T4_PND, &sz) == 0)
+    t4_task(0);                             /* until the taller frame ends */
+    t4_persist_run = 0;
+}
+void tall4k_tick(void)
+{
+    static int booted, last_mode, lastwhy = -1;
+    static uint32_t t_start, idle_since, t_end;
+    if (!ml_started) return;
+    if (!t_start) { t_start = get_ms_clock(); return; }
+    if (!booted)
     {
-        t4_log("=== boot: crash marker found (camera stopped during a switch): Taller 4K mode was %d, now OFF\n", t4_pmode);
-        FIO_RemoveFile(T4_PND);
-        t4_pmode = 0;
-        NotifyBox(10000, "Taller 4K mode switched OFF: the camera froze while switching last time");
-    }
-    int last_mode = t4_pmode;
-    uint32_t idle_since = 0;
-    for (;;)
-    {
-        msleep(250);
-        if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; idle_since = 0; }
-        if (!t4_pmode || t4_suspend || t4_running || t4_zt_running) { idle_since = 0; continue; }
-        int slot = (int)MEM(T4_SDRV + 0x70);
-        int ok = lv && MEM(T4_STATE + 0xc) == 12 && (slot == 4 || slot == 9) && CURRENT_GUI_MODE == 0 &&
-                 !gui_menu_shown() && !rawrec_running() && !RECORDING && lv_dispsize == 1 && !get_global_draw();
-        if (!ok)
+        if (get_ms_clock() - t_start < 2000) return;
+        booted = 1;
+        uint32_t sz = 0;
+        if (FIO_GetFileSize(T4_PND, &sz) == 0)
         {
-            /* log once per value why it isn't switching (camera v4.79: is idle LV GUI mode 0 on the R?) */
-            static int lastwhy = -1;
-            int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && slot != 9) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
-                      : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 8;
-            if (why != lastwhy) { lastwhy = why; t4_log("mode watcher: waiting (%d)\n", why); }
-            idle_since = 0; continue;
+            t4_log("=== boot: crash marker found (camera stopped during a switch): Taller 4K mode was %d, now OFF\n", t4_pmode);
+            FIO_RemoveFile(T4_PND);
+            t4_pmode = 0;
+            NotifyBox(10000, "Taller 4K mode switched OFF: the camera froze while switching last time");
         }
-        if (!idle_since) { idle_since = get_ms_clock(); continue; }
-        if (get_ms_clock() - idle_since < 2000) continue;
-        idle_since = 0;
-        t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1;
-        t4_pmode_run = t4_pmode;
-        t4_drows = t4_pmode == 2 ? 480 : 200;
-        t4_d68 = 0; t4_d69 = t4_drows / 2;
-        t4_running = 1;
-        t4_task(0);                         /* runs here, until the taller frame ends */
-        t4_persist_run = 0;
-        msleep(1000);
+        last_mode = t4_pmode;
     }
+    if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; idle_since = 0; }
+    if (t4_running) { t_end = get_ms_clock(); idle_since = 0; return; }
+    if (!t4_pmode || t4_suspend || t4_zt_running || get_ms_clock() - t_end < 1000) { idle_since = 0; return; }
+    int slot = (int)MEM(T4_SDRV + 0x70);
+    int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && slot != 9) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
+              : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 0;
+    if (why)
+    {
+        /* log once per value why it isn't switching (is idle LV GUI mode 0 on the R?) */
+        if (why != lastwhy && why != 5) t4_log("mode watcher: waiting (%d)\n", why);   /* 5 = recording: no card writes */
+        lastwhy = why;
+        idle_since = 0; return;
+    }
+    lastwhy = 0;
+    if (!idle_since) { idle_since = get_ms_clock(); return; }
+    if (get_ms_clock() - idle_since < 2000) return;
+    idle_since = 0;
+    t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1;
+    t4_pmode_run = t4_pmode;
+    t4_drows = t4_pmode == 2 ? 480 : 200;
+    t4_d68 = 0; t4_d69 = t4_drows / 2;
+    t4_running = 1;
+    task_create("tall4k", 0x1d, 0x1000, t4_persist_task, 0);
 }
 
-extern int GetFreeMemForMalloc(void);
 static MENU_UPDATE_FUNC(t4_mode_update)
 {
     MENU_SET_HELP("Canon heap free: %d KB (keep >= ~490 KB)", GetFreeMemForMalloc() / 1024);
@@ -964,7 +971,6 @@ static struct menu_entry t4_menu[] = {
 static void t4_init(void *unused)
 {
     menu_add("Debug", t4_menu, COUNT(t4_menu));
-    task_create("t4watch", 0x1e, 0x800, t4_watch_task, 0);   /* v4.80: 2 KB (Canon heap) */
 }
 
 INIT_FUNC("tall4k_r", t4_init);
