@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant; v4.68 FROM-blob engine init heights; v4.69 safe revert). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant; v4.68 FROM-blob engine init heights; v4.69/v4.70 revert while magnify is active). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -67,6 +67,10 @@ static int t4_trace_ms;          /* v4.65: breadcrumb window after the first mag
 /* v4.69: the live 4K list word to restore once magnify is active (lv7 is then not the list being sent) */
 static volatile uint32_t *t4_pend_lv;
 static uint32_t t4_pend_val;
+/* v4.70: everything the revert writes, so it can run while magnify is active (camera v4.69 froze when the
+ * init values were restored under the running taller path: some are evidently used per frame) */
+static volatile int t4_pend_all;
+static void (*t4_restore_fn)(void);
 static char t4_result[80];
 
 static void t4_log(const char *fmt, ...)
@@ -153,6 +157,13 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
         if (m == 13) seen13 = 1;
+        if (m == 13 && t4_pend_all && t4_restore_fn)
+        {
+            msleep(200);
+            t4_restore_fn();
+            t4_pend_all = 0;
+            t4_log("  magnify active: all values restored\n");
+        }
         if (m == 13 && t4_pend_lv)
         {
             /* v4.69 (camera v4.68 froze when the live 4K list went back to 2214 rows while the taller path ran):
@@ -196,16 +207,39 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
     return 2;
 }
 
+static uint32_t t4s_base; static volatile uint32_t *t4s_full, *t4s_lvt; static int t4s_i69f, t4s_i97f, t4s_i69t;
+static uint32_t t4s_o69f, t4s_o97f, t4s_o69t, t4s_orec_h; static uint32_t *t4s_rec_ram; static volatile uint16_t *t4s_geo, *t4s_rod;
+static const uint8_t t4s_rod_slots[4] = { 2, 3, 4, 9 };
+static void t4_restore_all(void)
+{
+    t4s_rec_ram[1] = t4s_orec_h; romremap_flush(&t4s_rec_ram[1], 4);
+    t4_put(&t4s_full[t4s_i69f], t4s_o69f); t4_put(&t4s_full[t4s_i97f], t4s_o97f); t4_put(&t4s_lvt[t4s_i69t], t4s_o69t);
+    uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
+    *gc = T4_H; romremap_flush(gc, 2);
+    for (int k = 0; k < 4; k++)
+    {
+        uint16_t *rc2 = (uint16_t *)((uint32_t)&t4s_rod[t4s_rod_slots[k]] & ~0x40000000);
+        *rc2 = 1110; romremap_flush(rc2, 2);
+    }
+    for (unsigned k = 0; k < T4_NENG; k++)
+        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
+}
+
 static void t4_task(void *unused)
 {
     int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc, rebuilt = 0;
-    uint32_t base = 0, orig_pack[5] = {0}, w0 = 0;
-    volatile uint32_t *full = 0, *lvt = 0;
-    int i69f = -1, i97f = -1, i69t = -1;
-    uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
-    uint32_t *rec_ram = 0;
+    static uint32_t base; uint32_t orig_pack[5] = {0}, w0 = 0;
+    base = 0;
+    static volatile uint32_t *full, *lvt;
+    full = 0; lvt = 0;
+    static int i69f, i97f, i69t;
+    i69f = i97f = i69t = -1;
+    static uint32_t o69f, o97f, o69t, orec_h;
+    o69f = o97f = o69t = orec_h = 0;
+    static uint32_t *rec_ram;
+    rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.69 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.70 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -248,8 +282,9 @@ static void t4_task(void *unused)
     if ((o69f & 0x3fffff) != 0x6aa || (o97f & 0x3fffff) != 0x453 || (o69t & 0x3fffff) != 0x6aa)
     { snprintf(t4_result, sizeof(t4_result), "reg values unexpected"); goto out; }
     if (MEM(T4_REC) != T4_W || MEM(T4_REC + 4) != T4_H) { snprintf(t4_result, sizeof(t4_result), "MEM1 record unexpected"); goto out; }
-    volatile uint16_t *geo = (volatile uint16_t *)(base + (T4_GEOM - T4_FROM));
-    volatile uint16_t *rod = (volatile uint16_t *)(sd + T4_ROD_OFF);
+    static volatile uint16_t *geo, *rod;
+    geo = (volatile uint16_t *)(base + (T4_GEOM - T4_FROM));
+    rod = (volatile uint16_t *)(sd + T4_ROD_OFF);
     static const uint8_t rod_slots[4] = { 2, 3, 4, 9 };
     t4_log("geometry RAM %x: %d x %d (ROM %d x %d); ROD slots 2/3/4/9: %d %d %d %d\n", (int)geo, geo[0], geo[1],
            *(volatile uint16_t *)T4_GEOM, *(volatile uint16_t *)(T4_GEOM + 2), rod[2], rod[3], rod[4], rod[9]);
@@ -322,6 +357,9 @@ static void t4_task(void *unused)
                (int)MEM(base + (t4_eng[0].a - T4_FROM)), (int)MEM(base + (t4_eng[3].a - T4_FROM)));
     }
     patched = 1;
+    t4s_base = base; t4s_full = full; t4s_lvt = lvt; t4s_i69f = i69f; t4s_i97f = i97f; t4s_i69t = i69t;
+    t4s_o69f = o69f; t4s_o97f = o97f; t4s_o69t = o69t; t4s_orec_h = orec_h; t4s_rec_ram = rec_ram; t4s_geo = geo; t4s_rod = rod;
+    t4_restore_fn = t4_restore_all;
     t4_log("patched: record reads %d, full 0x69 %x, 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4),
            (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
     /* v4.64: make cpu1 (where SapSetPath reads the record, v4.62) use the remapped page too */
@@ -445,40 +483,33 @@ static void t4_task(void *unused)
     }
 
 revert:
-    /* 6. revert the patch, then one more rebuild back to the normal 4K path */
+    /* 6. revert. v4.70: after a taller rebuild nothing is restored under the running taller path (v4.68 froze on
+     * the live list, v4.69 on the init values); everything is restored at once while magnify is active, and the
+     * magnify exit rebuilds normal 4K from Canon's values. Without a rebuild everything is inactive: restore now. */
     if (patched)
     {
-        rec_ram[1] = orec_h; romremap_flush(&rec_ram[1], 4);
-        t4_put(&full[i69f], o69f); t4_put(&full[i97f], o97f);
-        if (rebuilt) { t4_pend_lv = &lvt[i69t]; t4_pend_val = o69t; }   /* v4.69: live list restored during magnify */
-        else t4_put(&lvt[i69t], o69t);                                   /* no taller rebuild happened: safe now */
+        if (!rebuilt)
         {
-            uint16_t *gc = (uint16_t *)((uint32_t)&geo[1] & ~0x40000000);
-            *gc = T4_H; romremap_flush(gc, 2);
-            for (int k = 0; k < 4; k++)
-            {
-                uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
-                *rc2 = 1110; romremap_flush(rc2, 2);
-            }
-            for (unsigned k = 0; k < T4_NENG; k++)
-                t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
+            t4_restore_all();
+            patched = 0;
+            t4_log("reverted now (no taller rebuild happened)\n");
         }
-        patched = 0;
-        t4_log("reverted (live list %s): record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n",
-               rebuilt ? "waits for magnify" : "now", (int)MEM(T4_REC + 4), (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
-        if (rebuilt)   /* rebuild once more after any rebuild (sensor and blocks back to Canon's own setup) */
+        else
         {
+            t4_pend_all = 1;
+            t4_log("revert deferred until magnify is active\n");
             NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             t4_trace_ms = 3000;
             rc = t4_cycle(30000, &narrowed, &reflex14);
-            if (t4_pend_lv)
+            t4_log("cycle 2: %s, MEM1 %dx%d, +1c %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
+                   (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x1c));
+            if (t4_pend_all)
             {
-                t4_log("live 4K list still taller (no magnify seen): power-cycle the camera\n");
-                t4_pend_lv = 0;
+                t4_pend_all = 0;
+                t4_log("not restored (no magnify seen): power-cycle the camera\n");
                 snprintf(t4_result, sizeof(t4_result), "not restored: power-cycle the camera");
             }
-            t4_log("cycle 2: %s, MEM1 %dx%d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
-                   (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
+            patched = 0;
         }
     }
 out:
