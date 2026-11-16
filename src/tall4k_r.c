@@ -234,6 +234,7 @@ static int t4_persist_run;              /* the running t4_task was started by th
 static int t4_pmode_run;                /* the mode value the running switch was started for */
 static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
 static volatile int t4_key_pend;        /* key held back until normal 4K is back, then re-sent */
+static volatile int t4_soon;            /* v4.86: the watcher is counting down to a switch (REC held back) */
 static int t4_gm0;                      /* Canon GUI mode when the hold started (v4.79: idle value unverified) */
 static volatile int t4_suspend;         /* watcher: stop auto switching until the mode is changed (after a failure) */
 #define T4_PND "ML/SETTINGS/TALL4K.PND"  /* crash marker: exists only while a switch is in progress */
@@ -264,15 +265,30 @@ static void t4_zoom(int z)
 }
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
-    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0;
+    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0, mchg = 0;
     uint32_t t0 = get_ms_clock(), t13 = 0, trq = 0, tstop = 0;
     while (get_ms_clock() - t0 < (uint32_t)timeout_ms)
     {
         if (gui_menu_shown() && !t4_nocancel) return 1;
         /* v4.77 auto magnify: in, wait until this cycle's apply/restore has run, then out. While holding, only
          * after "End taller 4K". A request that changes nothing is retried once after 3 s, then given up. */
-        if (t4_persist_run && t4_holding && t4_pmode != t4_pmode_run && !ending)
-        { ending = 1; t4_log("  mode changed to %d while held: ending\n", t4_pmode); }   /* zoom waits for the menu to close */
+        if (t4_persist_run && t4_holding && !ending)
+        {
+            /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
+             * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
+            int ch = t4_pmode != t4_pmode_run;
+            if (ch != mchg)
+            {
+                mchg = ch;
+                t4_log(ch ? "  height changed to %d while held (ends when the menu closes)\n" : "  height back to %d: stays on\n", t4_pmode);
+            }
+            if (mchg && !gui_menu_shown())
+            {
+                ending = 1;
+                t4_log("  menu closed: ending for height %d\n", t4_pmode);
+                NotifyBox(3000, "4K frame height changed: back to normal 4K first...");
+            }
+        }
         if (t4_end_req) ending = 1;                 /* kept after t4_end_req is cleared at magnify */
         if (t4_holding && !seen13)
         {
@@ -405,7 +421,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.85 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.86 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -869,8 +885,10 @@ extern int rawrec_on(void);
 int tall4k_keys(int k)
 {
     if (gui_menu_shown()) return 1;
-    if (t4_running && t4_persist_run && !t4_holding && (k == BGMT_MENU || k == BGMT_PLAY || k == BGMT_PRESS_SET))
+    if (t4_running && t4_persist_run && !t4_holding && (k == BGMT_MENU || k == BGMT_PLAY || k == BGMT_PRESS_SET || k == 0x20))
     { NotifyBox(2000, "Taller 4K: switching, one moment"); return 0; }   /* never open Canon screens mid-switch */
+    if (k == 0x20 && !t4_running && t4_soon)
+    { NotifyBox(2000, "Taller 4K: switching, one moment"); return 0; }   /* v4.86: REC hit the switch in v4.85 */
     if (!t4_holding) return 1;
     if (k == 0x20 && !rawrec_on()) { NotifyBox(3000, "Taller 4K: record with Movie > RAW video (R)"); return 0; }
     if (k != BGMT_MENU && k != BGMT_PLAY && k != BGMT_PRESS_SET) return 1;
@@ -915,8 +933,10 @@ void tall4k_tick(void)
         last_mode = t4_pmode;
     }
     if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; idle_since = 0; }
+    t4_soon = 0;
     if (t4_running) { t_end = get_ms_clock(); idle_since = 0; return; }
-    if (!t4_pmode || t4_suspend || t4_zt_running || get_ms_clock() - t_end < 1000) { idle_since = 0; return; }
+    if (!t4_pmode || t4_suspend || t4_zt_running) { idle_since = 0; return; }
+    if (get_ms_clock() - t_end < 1000) { idle_since = 0; t4_soon = !t4_holding; return; }
     int slot = (int)MEM(T4_SDRV + 0x70);
     int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && slot != 9) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
               : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 0;
@@ -928,6 +948,7 @@ void tall4k_tick(void)
         idle_since = 0; return;
     }
     lastwhy = 0;
+    t4_soon = 1;
     if (!idle_since) { idle_since = get_ms_clock(); return; }
     if (get_ms_clock() - idle_since < 2000) return;
     idle_since = 0;
