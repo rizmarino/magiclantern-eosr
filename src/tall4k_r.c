@@ -54,6 +54,12 @@
  * centred on the image, so the centred taller frame needs y + rows/2 (and in_h = the real height) for the screen
  * and Canon's video path to show the same centre as the raw. Magnify (mode 16) has its own entries. */
 #define T4_YUV      0x022fee34u
+/* v4.83: ROM "valid area" records (11 words {in_w, in_h, 1, x, y, w, h, 0, 0, w, h}), two for 4K: 272/47 3848x2166.
+ * The 3848 width matches the LV DAF (dual-pixel AF) buffer's line (notes, v5 dump), and camera v4.82 focused on the
+ * background with the AF point just inside a near object's top edge at +480 centred: the AF data still came from
+ * 240 rows higher. Shifted like the YUV crop (y + rows/2, in_h = real height) through the ROM remap. */
+static const uint32_t t4_va[2] = { 0xE12250B8, 0xE12251C0 };
+static uint32_t *t4s_var[2];
 #define T4_NYUV     4
 /* v4.68: 4K engine init values in the FROM blob ({reg, value} lists) that carry the frame height; v4.64-v4.67 left
  * them at 2214, incl. the 0xD0411xxx block (sensor input side?) at h+1 = 2215. Value address (ROM), Canon's value. */
@@ -190,6 +196,8 @@ static void t4_apply_all(void)
         t4_put(&e[1], T4_H + T4_DROWS);
         t4_put(&e[5], 58 + 2 * t4_d68);
     }
+    for (int k = 0; k < 2; k++)
+        if (t4s_var[k]) { t4s_var[k][1] = T4_H + T4_DROWS; t4s_var[k][4] = 47 + 2 * t4_d68; romremap_flush(t4s_var[k], 20); }
 }
 
 static void t4_restore_all(void)
@@ -212,6 +220,8 @@ static void t4_restore_all(void)
         t4_put(&e[1], T4_H);
         t4_put(&e[5], 58);
     }
+    for (int k = 0; k < 2; k++)
+        if (t4s_var[k]) { t4s_var[k][1] = T4_H; t4s_var[k][4] = 47; romremap_flush(t4s_var[k], 20); }
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
@@ -317,9 +327,10 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             t4_applied = 1; t4_pend_apply = 0;
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
-            t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
+            t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, AF area h %d y %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
                    "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_rec_ram[1],
-                   (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)t4s_full[t4s_i68f],
+                   (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)MEM(t4_va[0] + 4), (int)MEM(t4_va[0] + 16),
+                   (int)t4s_full[t4s_i68f],
                    (int)t4s_full[t4s_i69f], (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i68t], (int)t4s_lvt[t4s_i69t],
                    t4s_rod[t4s_slot], r1, c1, (int)v1);
             if (r1 || v1 != T4_H + T4_DROWS)
@@ -394,7 +405,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.82 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.83 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -485,6 +496,19 @@ static void t4_task(void *unused)
     }
     rc = romremap_init();
     rec_ram = (uint32_t *)romremap_ram(T4_REC);
+    for (int k = 0; k < 2; k++)
+    {
+        uint32_t *v = rc ? 0 : (uint32_t *)romremap_ram(t4_va[k]);
+        t4s_var[k] = 0;
+        if (!v || v[0] != T4_W || v[1] != T4_H || v[2] != 1 || v[3] != 272 || v[4] != 47 || v[5] != 3848 || v[6] != 2166)
+        {
+            t4_log("valid-area record %x: %s %d %d %d %d %d %d %d\n", (int)t4_va[k], v ? "unexpected" : "not mapped",
+                   v ? (int)v[0] : 0, v ? (int)v[1] : 0, v ? (int)v[2] : 0, v ? (int)v[3] : 0, v ? (int)v[4] : 0,
+                   v ? (int)v[5] : 0, v ? (int)v[6] : 0);
+            snprintf(t4_result, sizeof(t4_result), "AF area record unexpected: not touched"); goto out;
+        }
+        t4s_var[k] = v;
+    }
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
     if (rc || !rec_ram) { snprintf(t4_result, sizeof(t4_result), "ROM remap failed (%d)", rc); goto out; }
 

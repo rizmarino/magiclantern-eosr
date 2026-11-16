@@ -19,12 +19,15 @@ extern void *_AllocateMemory(size_t size);
 extern void *_malloc(size_t size);
 
 /* page list: silent burst fps tables; dual ISO: m_AnalogIsoGainFix (ISO register 0x2D rows, 9 modes);
- * v4.61 taller 4K: SAP/MEM1 size records 0xE0F2E5F8 (same 1 MB section as the silent fps page) */
-static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000, 0xE0F2E000 };
-static const uint32_t rmp_sections[] = { 0xE0F00000, 0xE0B00000 };
-#define RR_NSECT    2
+ * v4.61 taller 4K: SAP/MEM1 size records 0xE0F2E5F8 (same 1 MB section as the silent fps page);
+ * v4.83 taller 4K: "valid area" records 0xE12250B8 / 0xE12251C0 (AF data window, 16 MB supersection 0xE1) */
+static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000, 0xE0F2E000, 0xE1225000 };
+static const uint32_t rmp_sections[] = { 0xE0F00000, 0xE0B00000, 0xE1200000 };
+static const uint32_t rmp_supers[] = { 0xE0000000, 0xE1000000 };
+#define RR_NSECT    3
+#define RR_NSUPER   2
 #define RR_L1_SIZE  0x4900              /* Canon L1 (0x4000) + core L2s for 0-1 MB + core L1s for 0-32 MB */
-#define RR_L2_OFF   0x4C00              /* RR_NSECT x 1 KB L2 tables */
+#define RR_L2_OFF   0x4C00              /* RR_NSECT x 1 KB L2 tables (3 KB: ends at 0x5800 < RR_PAGE_OFF) */
 #define RR_PAGE_OFF 0x6000              /* RR_NPAGES x 4 KB RAM pages */
 #define RR_SPAN     (RR_PAGE_OFF + RR_NPAGES * 0x1000)
 #define RR_ALLOC    (RR_SPAN + 0x4000)  /* slack for the 16 KB L1 alignment: a full 0x4000 (silenttest v3.15) */
@@ -58,7 +61,12 @@ static int rmp_setup(void)
     for (int i = 0; i < RR_L1_SIZE / 4; i++) if (a[i] != b[i] && i != 0x1200 && i != 0x1220) diff++;
     rmp_log("copy-diff", diff, a[0xE0F00000 >> 20]);
     if (diff) return -3;
-    if (split_l1_supersection(0xE0000000, l1)) return -4;
+    for (int k = 0; k < RR_NSUPER; k++)
+    {
+        /* v4.83: only split a supersection (bit 18 set in a section descriptor); a plain section needs nothing */
+        uint32_t d = a[rmp_supers[k] >> 20];
+        if ((d & 3) == 2 && (d & (1 << 18)) && split_l1_supersection(rmp_supers[k], l1)) return -4;
+    }
     for (int s = 0; s < RR_NSECT; s++)
     {
         uint32_t sect = rmp_sections[s];
