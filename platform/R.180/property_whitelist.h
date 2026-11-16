@@ -72,7 +72,11 @@ const uint32_t prop_write_allow[] =
     // LV lens focus step (v4.39): Canon's own FUN_e034ff36 writes this property with 1/2/3 (near) and
     // 0x8001/2/3 (far), 4 bytes - ML's lens_focus() encoding. Master FUN_e036033c forwards it to the LV AF task
     // (Tvaf DAFDeliverer message 0x38).
-    PROP_LV_LENS_DRIVE_REMOTE
+    PROP_LV_LENS_DRIVE_REMOTE,
+    // LV magnify (v4.77, Taller 4K auto switch): Canon's LVGMT handles RequestChangeProperty 0x80050015 itself
+    // ("ReqChg PROP_LV_DISPSIZE ST:%d Pre:0x%x Next:0x%x", DbgMgr logs at every LV start, Next 0x1); 4 bytes,
+    // values 1 / 5 / 0xA as set_lv_zoom() sends. First runtime use on the R: Debug > Auto magnify test.
+    PROP_LV_DISPSIZE
 };
 
 // anything not listed above will allow reads but not writes

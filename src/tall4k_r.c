@@ -23,6 +23,7 @@
 #include "gui.h"
 #include "mem.h"
 #include "propvalues.h"
+#include "property.h"
 #include "romremap_r.h"
 
 #ifndef MEM
@@ -194,19 +195,36 @@ static void t4_restore_all(void)
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
+static int t4_auto;                     /* v4.77 menu: 0 manual magnify, 1 ML requests magnify in/out itself */
+static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
+static void t4_zoom(int z)
+{
+    int v = z;
+    t4_log("  zoom request %d (lv_dispsize %d, mode %d)\n", z, lv_dispsize, (int)MEM(T4_STATE + 0xc));
+    prop_request_change(PROP_LV_DISPSIZE, &v, 4);
+}
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
-    int seen13 = 0;
-    uint32_t t0 = get_ms_clock();
+    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0;
+    uint32_t t0 = get_ms_clock(), t13 = 0, trq = 0;
     while (get_ms_clock() - t0 < (uint32_t)timeout_ms)
     {
         if (gui_menu_shown() && !t4_nocancel) return 1;
+        /* v4.77 auto magnify: in, wait until this cycle's apply/restore has run, then out. While holding, only
+         * after "End taller 4K". A request that changes nothing is retried once after 3 s, then given up. */
+        if (t4_end_req) ending = 1;                 /* kept after t4_end_req is cleared at magnify */
+        int autonow = ending || (t4_auto && !t4_holding);
+        if (autonow && !seen13 && (!rq5 || (rq5 == 1 && get_ms_clock() - trq > 3000)) && !gui_menu_shown())
+        { rq5++; trq = get_ms_clock(); t4_zoom(5); }
+        if (autonow && seen13 && !rq1 && MEM(T4_STATE + 0xc) == 13 && !t4_pend_apply && !t4_pend_all && !t4_pend_lv
+            && get_ms_clock() - t13 > 700)
+        { rq1 = 1; t4_zoom(1); }
         if (t4_reflex(narrowed, reflex14))
             t4_log("  +%d ms reflex: mode %d, +18 %d, f2 %d, m1 %dx%d\n", (int)(get_ms_clock() - t0),
                    (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x6c),
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
-        if (m == 13) { seen13 = 1; t4_holding = 0; }
+        if (m == 13) { if (!seen13) { t13 = get_ms_clock(); t4_log("  magnify seen at +%d ms (lv_dispsize %d)\n", (int)(t13 - t0), lv_dispsize); } seen13 = 1; t4_holding = 0; t4_end_req = 0; }
         if (!seen13 && t4_pend_apply)
         {
             static uint32_t hb;
@@ -232,7 +250,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                 t4_log("  cpu1 does not see the record: restored (still in magnify)\n");
                 NotifyBox(5000, "Taller 4K: cpu1 check failed, exit magnify (normal 4K)");
             }
-            else NotifyBox(5000, "Taller 4K +%d: now exit magnify", T4_DROWS);
+            else if (!t4_auto) NotifyBox(5000, "Taller 4K +%d: now exit magnify", T4_DROWS);
         }
         if (m == 13 && t4_pend_all && t4_restore_fn)
         {
@@ -298,7 +316,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.75 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.77 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -434,7 +452,8 @@ static void t4_task(void *unused)
     }
     t4_applied = 0; t4_apply_fail = 0; t4_pend_apply = 1;
     t4_trace_ms = t4_tap ? 2000 : 4000;
-    NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
+    if (t4_auto) NotifyBox(5000, "Taller 4K +%d: switching (auto magnify)...", T4_DROWS);
+    else NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
 
     /* 4. rebuild via magnify in/out */
     rc = t4_cycle(30000, &narrowed, &reflex14);
@@ -582,12 +601,14 @@ revert:
                  * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
                 t4_holding = 1; t4_nocancel = 1;
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
-                NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). Stop, then magnify x5+exit to end", T4_W, T4_H + T4_DROWS);
+                t4_end_req = 0;
+                NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
             {
                 t4_log("revert deferred until magnify is active\n");
-                NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
+                if (t4_auto) NotifyBox(5000, "Taller 4K: restoring normal 4K (auto magnify)...");
+                else NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             }
             t4_trace_ms = 3000;
             rc = t4_cycle(hold ? 4 * 3600 * 1000 : 30000, &narrowed, &reflex14);
@@ -645,6 +666,62 @@ static MENU_UPDATE_FUNC(t4_update)
     else MENU_SET_VALUE("OFF");
 }
 
+/* v4.77: Debug > Auto magnify test: no patches; ML requests magnify x5 and back via PROP_LV_DISPSIZE (first runtime
+ * use on the R) and logs Canon's mode / MEM1 every 50 ms around each request. */
+static volatile int t4_zt_running;
+static void t4_zt_watch(int ms, int want)
+{
+    uint32_t t0 = get_ms_clock(), tl = 0; int last = -1, lastd = -1;
+    while (get_ms_clock() - t0 < (uint32_t)ms)
+    {
+        int m = MEM(T4_STATE + 0xc), d = lv_dispsize;
+        if (m != last || d != lastd || get_ms_clock() - tl > 500)
+        {
+            tl = get_ms_clock();
+            t4_log("  +%d ms: mode %d, lv_dispsize %d, MEM1 %dx%d, +18 %d\n", (int)(tl - t0), m, d,
+                   (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
+            last = m; lastd = d;
+        }
+        if (m == want && d == (want == 13 ? 5 : 1) && get_ms_clock() - t0 > 1500) break;
+        msleep(20);
+    }
+}
+static void t4_zt_task(void *unused)
+{
+    for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
+    t4_log("=== auto magnify test (v4.77) at %d ms: lv %d, mode %d, lv_dispsize %d\n", (int)get_ms_clock(), lv,
+           (int)MEM(T4_STATE + 0xc), lv_dispsize);
+    if (!lv || gui_menu_shown() || MEM(T4_STATE + 0xc) != 12 || lv_dispsize != 1)
+    {
+        t4_log("not started (needs 4K movie LV, not magnified, menu closed)\n");
+        NotifyBox(5000, "Auto magnify test: needs 4K movie LV, menu closed");
+        t4_zt_running = 0; return;
+    }
+    t4_zoom(5); t4_zt_watch(5000, 13);
+    int in = MEM(T4_STATE + 0xc) == 13;
+    msleep(1000);
+    t4_zoom(1); t4_zt_watch(5000, 12);
+    int out = MEM(T4_STATE + 0xc) == 12 && lv_dispsize == 1;
+    t4_log("auto magnify test: in %s, out %s\n", in ? "OK" : "NO", out ? "OK" : "NO");
+    NotifyBox(6000, "Auto magnify test: in %s, out %s", in ? "OK" : "NO", out ? "OK" : "NO");
+    t4_zt_running = 0;
+}
+static MENU_SELECT_FUNC(t4_zt_select)
+{
+    if (t4_zt_running || t4_running) return;
+    t4_zt_running = 1;
+    task_create("t4zoom", 0x1d, 0x1000, t4_zt_task, 0);
+    NotifyBox(4000, "Auto magnify test: close the ML menu to start");
+}
+extern int rawrec_running(void);
+static MENU_SELECT_FUNC(t4_end_select)
+{
+    if (!t4_holding) { NotifyBox(3000, "Taller 4K is not on"); return; }
+    if (rawrec_running()) { NotifyBox(3000, "Stop recording first"); return; }
+    t4_end_req = 1;
+    NotifyBox(4000, "Taller 4K: close the ML menu, normal 4K follows");
+}
+
 static int t4_one = 1, t4_zero = 0;
 static struct menu_entry t4_menu[] = {
     {
@@ -662,6 +739,24 @@ static struct menu_entry t4_menu[] = {
         .choices = CHOICES("Revert", "Hold for recording"),
         .help    = "Hold: keep the taller frame after the checks, record with Movie > RAW video (LL 10-bit),",
         .help2   = "then stop recording and magnify x5 + exit to restore. Resets to Revert at power-on.",
+    },
+    {
+        .name    = "Auto magnify test",
+        .select  = t4_zt_select,
+        .help    = "v4.77: ML magnifies x5 and back by itself (no sensor changes). Movie 4K LV.",
+        .help2   = "Result on screen and in ML/LOGS/TALL4K.TXT.",
+    },
+    {
+        .name    = "Taller 4K magnify",
+        .priv    = &t4_auto,
+        .max     = 1,
+        .choices = CHOICES("Manual", "Auto"),
+        .help    = "Auto: the test magnifies in/out by itself (v4.77). Resets to Manual at power-on.",
+    },
+    {
+        .name    = "End taller 4K",
+        .select  = t4_end_select,
+        .help    = "While held: back to normal 4K (auto magnify). Don't use while recording.",
     },
     {
         .name    = "Taller 4K placement",
