@@ -880,8 +880,10 @@ static void t4_watch_task(void *unused)
     }
 }
 
+extern int GetFreeMemForMalloc(void);
 static MENU_UPDATE_FUNC(t4_mode_update)
 {
+    MENU_SET_HELP("Canon heap free: %d KB (keep >= ~490 KB)", GetFreeMemForMalloc() / 1024);
     if (t4_pmode && t4_holding && t4_persist_run) MENU_SET_RINFO("ON");
     else if (t4_pmode && t4_suspend) MENU_SET_RINFO("paused");
     if (t4_pmode && get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
@@ -962,7 +964,7 @@ static struct menu_entry t4_menu[] = {
 static void t4_init(void *unused)
 {
     menu_add("Debug", t4_menu, COUNT(t4_menu));
-    task_create("t4watch", 0x1e, 0x1000, t4_watch_task, 0);
+    task_create("t4watch", 0x1e, 0x800, t4_watch_task, 0);   /* v4.80: 2 KB (Canon heap) */
 }
 
 INIT_FUNC("tall4k_r", t4_init);

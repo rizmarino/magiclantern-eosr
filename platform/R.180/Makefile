@@ -21,13 +21,14 @@ PLATFORM_ARCH = armv7-a
 ML_BOOT_OBJ = boot-d678.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o $(BUILD_DIR)/test_features.o
 # riz/eosr-dmlog: Debug -> LV log capture (Canon DbgMgr, no ROM patching)
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/lvjob_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
+# v4.80: lvjob_r.o (Debug > LV job dump, v3 research, finished) left out: Canon heap (v4.79 boot Err 70 at 476 KB free)
 # v4.9: RAW histogram / RAW zebras in movie mode (LV raw tap)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crxtest_r.o   # v4.17 lossless 4K step 2
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/romremap_r.o   # v4.51 shared ROM remap (silent burst fps patch)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rackfocus_r.o  # v4.56 Focus > Rack focus (stored points, lens-distance loop)
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/sensreg_r.o    # v4.58 Debug > Sensor regs log (read-only, wider-4K research)
+# v4.80: sensreg_r.o (Debug > Sensor regs log, v4.58-v4.60) left out for Canon heap; re-add for the wider-4K stage
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/tall4k_r.o     # v4.61 Debug > Taller 4K (test): first sensor-window write
 # v4.55: dualiso_r.o (Shoot > Dual ISO (test)) left out: no per-line ISO control found on the R (parked 2026-11-11);
 # the source stays for reference (skill references/dual-iso.md)
