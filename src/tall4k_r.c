@@ -184,7 +184,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.66 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.67 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -240,7 +240,14 @@ static void t4_task(void *unused)
     if (rc || !rec_ram) { snprintf(t4_result, sizeof(t4_result), "ROM remap failed (%d)", rc); goto out; }
 
     /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
-    t4_log("variant: %s\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap");
+    t4_log("variant: %s; tap flags 0x1311c+4 %d, Mem1Path +40 %d, +50 %d\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap",
+           (int)MEM(0x1311C + 4), (int)MEM(T4_PATH + 0x40), (int)MEM(T4_PATH + 0x50));
+    if (!t4_tap && (MEM(0x1311C + 4) || MEM(T4_PATH + 0x40)))
+    {
+        /* v4.67: camera v4.66 ran "no tap" with the tap on (RAW zebras/histogram keep lv_save_raw on in movie LV) */
+        snprintf(t4_result, sizeof(t4_result), "raw tap in use (RAW zebras?): set Global Draw OFF");
+        goto out;
+    }
     if (t4_tap) { call("lv_save_raw", 1); raw = 1; msleep(500); }
     for (int i = 0; i < 5; i++) orig_pack[i] = MEM(T4_PATH + 0x64 + 4 * i);
     w0 = MEM(T4_PATH + 0x18);
@@ -475,7 +482,7 @@ static struct menu_entry t4_menu[] = {
         .select = t4_select,
         .update = t4_update,
         .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
-        .help2  = "Movie 4K 23.98p; magnify in/out when asked. Log ML/LOGS/TALL4K.TXT.",
+        .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
     },
     {
         .name   = "Taller 4K (test)",
