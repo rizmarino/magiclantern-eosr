@@ -48,6 +48,13 @@
 #define T4_REC      0xE0F2E608u         /* MEM1 record 1 (4K): {w, h, 0, 0} */
 #define T4_GEOM     0xE1C75B40u         /* v4.65: FROM-blob readout record for 4K (u16 4256, 2214, 0, 0, 144, 46 ..) */
 #define T4_ROD_OFF  (0x410 + 11 * 0x1a)  /* SensorDrive table: ROD u16 for mode 11 (4K), + slot * 2 */
+/* v4.82: Canon's LV/YUV crop table (RAM copy of ROM data, privileged RW, shareable): FUN_022a9bf8(mode, variant)
+ * returns &table[mode][variant]; sensor mode 11 (4K) -> 4 entries at 0x022fee34, 32 bytes each:
+ * {in_w 4256, in_h 2214, out_w 3840, out_h 2144, x 276, y 58, grid 160, 134}. y = 46 OB rows + (2168 - 2144) / 2:
+ * centred on the image, so the centred taller frame needs y + rows/2 (and in_h = the real height) for the screen
+ * and Canon's video path to show the same centre as the raw. Magnify (mode 16) has its own entries. */
+#define T4_YUV      0x022fee34u
+#define T4_NYUV     4
 /* v4.68: 4K engine init values in the FROM blob ({reg, value} lists) that carry the frame height; v4.64-v4.67 left
  * them at 2214, incl. the 0xD0411xxx block (sensor input side?) at h+1 = 2215. Value address (ROM), Canon's value. */
 static const struct { uint32_t a, v; } t4_eng[] = {
@@ -177,6 +184,12 @@ static void t4_apply_all(void)
     }
     for (unsigned k = 0; k < T4_NENG; k++)
         t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
+    for (int k = 0; k < T4_NYUV; k++)          /* v4.82: Canon's display crop follows the centred window */
+    {
+        volatile uint32_t *e = (volatile uint32_t *)(T4_YUV + k * 0x20);
+        t4_put(&e[1], T4_H + T4_DROWS);
+        t4_put(&e[5], 58 + 2 * t4_d68);
+    }
 }
 
 static void t4_restore_all(void)
@@ -193,6 +206,12 @@ static void t4_restore_all(void)
     }
     for (unsigned k = 0; k < T4_NENG; k++)
         t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
+    for (int k = 0; k < T4_NYUV; k++)
+    {
+        volatile uint32_t *e = (volatile uint32_t *)(T4_YUV + k * 0x20);
+        t4_put(&e[1], T4_H);
+        t4_put(&e[5], 58);
+    }
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
@@ -298,8 +317,9 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             t4_applied = 1; t4_pend_apply = 0;
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
-            t4_log("  magnify active: applied +%d rows; record %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
-                   "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_full[t4s_i68f],
+            t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
+                   "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_rec_ram[1],
+                   (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)t4s_full[t4s_i68f],
                    (int)t4s_full[t4s_i69f], (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i68t], (int)t4s_lvt[t4s_i69t],
                    t4s_rod[t4s_slot], r1, c1, (int)v1);
             if (r1 || v1 != T4_H + T4_DROWS)
@@ -374,7 +394,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.79 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.82 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -453,7 +473,14 @@ static void t4_task(void *unused)
             uint32_t ram = MEM(base + (t4_eng[k].a - T4_FROM)), reg = MEM(base + (t4_eng[k].a - 4 - T4_FROM));
             if (ram != t4_eng[k].v || (reg >> 20) != 0xD04) { ebad++; t4_log("  engine value %x: RAM %x reg %x (want %x)\n", (int)t4_eng[k].a, (int)ram, (int)reg, (int)t4_eng[k].v); }
         }
-        t4_log("engine init values: %d checked, %d unexpected\n", (int)T4_NENG, ebad);
+        for (int k = 0; k < T4_NYUV; k++)
+        {
+            volatile uint32_t *e = (volatile uint32_t *)(T4_YUV + k * 0x20);
+            if (e[0] != T4_W || e[1] != T4_H || e[2] != 3840 || e[3] != 2144 || e[4] != 276 || e[5] != 58)
+            { ebad++; t4_log("  YUV crop entry %d: %d %d %d %d %d %d (want 4256 2214 3840 2144 276 58)\n", k, (int)e[0],
+                             (int)e[1], (int)e[2], (int)e[3], (int)e[4], (int)e[5]); }
+        }
+        t4_log("engine init values + %d YUV crop entries: %d checked, %d unexpected\n", T4_NYUV, (int)T4_NENG, ebad);
         if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
     }
     rc = romremap_init();
@@ -683,7 +710,7 @@ revert:
             if (hold) t4_log("HOLD ended (%s)\n", rc == 0 ? "magnify" : rc == 3 ? "4K path stopped" : "timeout");
             if (rc == 3) snprintf(t4_result, sizeof(t4_result), "ended (LV left 4K)");
             else if (hold && rc == 0) snprintf(t4_result, sizeof(t4_result), "ended");
-            t4_log("cycle 2: %s, MEM1 %dx%d, +1c %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
+            t4_log("cycle 2: %s, MEM1 %dx%d, +1c %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : rc == 3 ? "4K path stopped" : "timeout",
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x1c));
             if (t4_pend_all)
             {
@@ -695,7 +722,7 @@ revert:
         }
     }
 out:
-    if (raw && MEM(T4_STATE + 0xc) == 12 && MEM(T4_PATH + 0x1c) != T4_H && MEM(T4_PATH + 0x1c) != 1496)
+    if (raw && lv && MEM(T4_STATE + 0xc) == 12 && MEM(T4_PATH + 0x1c) != T4_H && MEM(T4_PATH + 0x1c) != 1496)
     {
         /* path still tall: stop the tap first, so no 14-bit frame of the taller size reaches MEM1 */
         call("lv_save_raw", 0); raw = 0;
