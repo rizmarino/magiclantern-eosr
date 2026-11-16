@@ -145,7 +145,7 @@ static void rr1_func(void *unused)
     {
         int cpu = get_cpu_id();
         rr1_cpu = cpu;
-        if (cpu == 1 && rmp_on)
+        if (cpu == 1 && rmp_on && !rmp_on1)   /* v4.72: later calls only probe */
         {
             uint32_t old = cli();
             change_mmu_tables(rmp_l1 + RR_L1_SIZE - 0x100 + 0x80, rmp_l1, 1);

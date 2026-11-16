@@ -75,6 +75,7 @@ static uint32_t t4_pend_val;
 /* v4.70: everything the revert writes, so it can run while magnify is active (camera v4.69 froze when the
  * init values were restored under the running taller path: some are evidently used per frame) */
 static volatile int t4_pend_all;
+static volatile int t4_pend_apply, t4_applied, t4_apply_fail;   /* v4.72: apply only while magnify is active */
 static void (*t4_restore_fn)(void);
 static char t4_result[80];
 
@@ -149,6 +150,42 @@ static int t4_reflex(int *narrowed, int *reflex14)
 }
 
 /* wait for a magnify-in/-out cycle (m_SensorMode 13 then 12) while running the reflex; 0 = done, 1 = cancel, 2 = timeout */
+static uint32_t t4s_base; static volatile uint32_t *t4s_full, *t4s_lvt; static int t4s_i69f, t4s_i97f, t4s_i69t;
+static uint32_t t4s_o69f, t4s_o97f, t4s_o69t, t4s_orec_h; static uint32_t *t4s_rec_ram; static volatile uint16_t *t4s_geo, *t4s_rod;
+static const uint8_t t4s_rod_slots[4] = { 2, 3, 4, 9 };
+static int t4s_slot;
+static void t4_apply_all(void)
+{
+    t4s_rec_ram[1] = T4_H + T4_DROWS; romremap_flush(&t4s_rec_ram[1], 4);
+    t4_put(&t4s_full[t4s_i69f], t4s_o69f + T4_DROWS / 2);
+    t4_put(&t4s_full[t4s_i97f], t4s_o97f + T4_DROWS / 2);
+    t4_put(&t4s_lvt[t4s_i69t], t4s_o69t + T4_DROWS / 2);
+    uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
+    *gc = T4_H + T4_DROWS; romremap_flush(gc, 2);
+    for (int k = 0; k < 4; k++)
+    {
+        uint16_t *rc2 = (uint16_t *)((uint32_t)&t4s_rod[t4s_rod_slots[k]] & ~0x40000000);
+        if (t4s_rod_slots[k] == t4s_slot || T4_DROWS <= 40) { *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2); }
+    }
+    for (unsigned k = 0; k < T4_NENG; k++)
+        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
+}
+
+static void t4_restore_all(void)
+{
+    t4s_rec_ram[1] = t4s_orec_h; romremap_flush(&t4s_rec_ram[1], 4);
+    t4_put(&t4s_full[t4s_i69f], t4s_o69f); t4_put(&t4s_full[t4s_i97f], t4s_o97f); t4_put(&t4s_lvt[t4s_i69t], t4s_o69t);
+    uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
+    *gc = T4_H; romremap_flush(gc, 2);
+    for (int k = 0; k < 4; k++)
+    {
+        uint16_t *rc2 = (uint16_t *)((uint32_t)&t4s_rod[t4s_rod_slots[k]] & ~0x40000000);
+        *rc2 = 1110; romremap_flush(rc2, 2);
+    }
+    for (unsigned k = 0; k < T4_NENG; k++)
+        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
+}
+
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
     int seen13 = 0;
@@ -162,6 +199,32 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
         if (m == 13) seen13 = 1;
+        if (!seen13 && t4_pend_apply)
+        {
+            static uint32_t hb;
+            if (get_ms_clock() - hb >= 1000) { hb = get_ms_clock(); t4_log("  waiting for magnify: +%d ms, mode %d\n", (int)(hb - t0), m); }
+        }
+        if (m == 13 && t4_pend_apply)
+        {
+            /* v4.72 (camera v4.71 froze at +560 before magnify, with every value already patched under the running
+             * normal 4K path): apply everything only while magnify is active, then check cpu1 sees the record */
+            msleep(200);
+            if (MEM(T4_STATE + 0xc) != 13) { t4_log("  magnify left within 200 ms: not applied\n"); t4_pend_apply = 0; continue; }
+            t4_apply_all();
+            t4_applied = 1; t4_pend_apply = 0;
+            int c1 = -1, calls = 0; uint32_t v1 = 0;
+            int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
+            t4_log("  magnify active: applied +%d rows; record %d, full 0x69 %x 0x97 %x, template 0x69 %x, ROD %d; "
+                   "cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_full[t4s_i69f],
+                   (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i69t], t4s_rod[t4s_slot], r1, c1, (int)v1);
+            if (r1 || v1 != T4_H + T4_DROWS)
+            {
+                t4_restore_all(); t4_applied = 0; t4_apply_fail = 1;
+                t4_log("  cpu1 does not see the record: restored (still in magnify)\n");
+                NotifyBox(5000, "Taller 4K: cpu1 check failed, exit magnify (normal 4K)");
+            }
+            else NotifyBox(5000, "Taller 4K +%d: now exit magnify", T4_DROWS);
+        }
         if (m == 13 && t4_pend_all && t4_restore_fn)
         {
             msleep(200);
@@ -212,24 +275,6 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
     return 2;
 }
 
-static uint32_t t4s_base; static volatile uint32_t *t4s_full, *t4s_lvt; static int t4s_i69f, t4s_i97f, t4s_i69t;
-static uint32_t t4s_o69f, t4s_o97f, t4s_o69t, t4s_orec_h; static uint32_t *t4s_rec_ram; static volatile uint16_t *t4s_geo, *t4s_rod;
-static const uint8_t t4s_rod_slots[4] = { 2, 3, 4, 9 };
-static void t4_restore_all(void)
-{
-    t4s_rec_ram[1] = t4s_orec_h; romremap_flush(&t4s_rec_ram[1], 4);
-    t4_put(&t4s_full[t4s_i69f], t4s_o69f); t4_put(&t4s_full[t4s_i97f], t4s_o97f); t4_put(&t4s_lvt[t4s_i69t], t4s_o69t);
-    uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
-    *gc = T4_H; romremap_flush(gc, 2);
-    for (int k = 0; k < 4; k++)
-    {
-        uint16_t *rc2 = (uint16_t *)((uint32_t)&t4s_rod[t4s_rod_slots[k]] & ~0x40000000);
-        *rc2 = 1110; romremap_flush(rc2, 2);
-    }
-    for (unsigned k = 0; k < T4_NENG; k++)
-        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
-}
-
 static void t4_task(void *unused)
 {
     int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc, rebuilt = 0;
@@ -244,7 +289,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.71 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.72 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -290,7 +335,6 @@ static void t4_task(void *unused)
     static volatile uint16_t *geo, *rod;
     geo = (volatile uint16_t *)(base + (T4_GEOM - T4_FROM));
     rod = (volatile uint16_t *)(sd + T4_ROD_OFF);
-    static const uint8_t rod_slots[4] = { 2, 3, 4, 9 };
     t4_log("geometry RAM %x: %d x %d (ROM %d x %d); ROD slots 2/3/4/9: %d %d %d %d\n", (int)geo, geo[0], geo[1],
            *(volatile uint16_t *)T4_GEOM, *(volatile uint16_t *)(T4_GEOM + 2), rod[2], rod[3], rod[4], rod[9]);
     if (geo[0] != T4_W || geo[1] != T4_H || rod[2] != 1110 || rod[3] != 1110 || rod[4] != 1110 || rod[9] != 1110)
@@ -351,52 +395,36 @@ static void t4_task(void *unused)
     }
     t4_log("10-bit: MEM1 w %d, unit %x\n", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_UNIT));
 
-    /* 3. patch */
-    t4_log("patching: record h %d -> %d, 0x69 %x -> %x, 0x97 %x -> %x\n", T4_H, T4_H + T4_DROWS, (int)o69f,
-           (int)(o69f + T4_DROWS / 2), (int)o97f, (int)(o97f + T4_DROWS / 2));
+    /* 3. v4.72: nothing is patched here (normal 4K is running); everything is applied while magnify is active */
     orec_h = rec_ram[1];
-    rec_ram[1] = T4_H + T4_DROWS; romremap_flush(&rec_ram[1], 4);
-    t4_put(&full[i69f], o69f + T4_DROWS / 2);
-    t4_put(&full[i97f], o97f + T4_DROWS / 2);
-    t4_put(&lvt[i69t], o69t + T4_DROWS / 2);
-    {
-        uint16_t *gc = (uint16_t *)((uint32_t)&geo[1] & ~0x40000000);
-        *gc = T4_H + T4_DROWS; romremap_flush(gc, 2);
-        for (int k = 0; k < 4; k++)
-        {
-            uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
-            if (rod_slots[k] == slot || T4_DROWS <= 40) { *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2); }
-        }
-        t4_log("geometry h -> %d, ROD slots 2/3/4/9 -> %d %d %d %d\n", geo[1], rod[2], rod[3], rod[4], rod[9]);
-        for (unsigned k = 0; k < T4_NENG; k++)
-            t4_put((volatile uint32_t *)(base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
-        t4_log("engine init values -> +%d rows (first %x, 0xD041224c %x)\n", T4_DROWS,
-               (int)MEM(base + (t4_eng[0].a - T4_FROM)), (int)MEM(base + (t4_eng[3].a - T4_FROM)));
-    }
-    patched = 1;
     t4s_base = base; t4s_full = full; t4s_lvt = lvt; t4s_i69f = i69f; t4s_i97f = i97f; t4s_i69t = i69t;
-    t4s_o69f = o69f; t4s_o97f = o97f; t4s_o69t = o69t; t4s_orec_h = orec_h; t4s_rec_ram = rec_ram; t4s_geo = geo; t4s_rod = rod;
+    t4s_o69f = o69f; t4s_o97f = o97f; t4s_o69t = o69t; t4s_orec_h = orec_h; t4s_rec_ram = rec_ram; t4s_geo = geo;
+    t4s_rod = rod; t4s_slot = slot;
     t4_restore_fn = t4_restore_all;
-    t4_log("patched: record reads %d, full 0x69 %x, 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4),
-           (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
-    /* v4.64: make cpu1 (where SapSetPath reads the record, v4.62) use the remapped page too */
+    t4_log("plan: record h %d -> %d, 0x69 %x -> %x, 0x97 %x -> %x, ROD slot %d -> %d, %d engine values; applied in magnify\n",
+           T4_H, T4_H + T4_DROWS, (int)o69f, (int)(o69f + T4_DROWS / 2), (int)o97f, (int)(o97f + T4_DROWS / 2), slot,
+           1110 + T4_DROWS / 2, (int)T4_NENG);
+    /* cpu1 onto the remap now (record still Canon's: cpu1 must read 2214); the probe after the apply needs 2214+N */
     {
         int c1 = -1, calls = 0; uint32_t v1 = 0;
         t4_log("cpu1 switch via RPC: requesting\n");
         int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
-        t4_log("cpu1 switch: rc %x, callee cpu %d, calls %d, cpu1 reads record h %d (want %d)\n", r1, c1, calls,
-               (int)v1, T4_H + T4_DROWS);
-        if (r1 || v1 != T4_H + T4_DROWS)
-        { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto revert; }
+        t4_log("cpu1 switch: rc %x, callee cpu %d, calls %d, cpu1 reads record h %d (want %d)\n", r1, c1, calls, (int)v1, T4_H);
+        if (r1 || v1 != T4_H)
+        { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto out; }
     }
+    t4_applied = 0; t4_apply_fail = 0; t4_pend_apply = 1;
     t4_trace_ms = t4_tap ? 2000 : 4000;
-    NotifyBox(5000, "Taller 4K +%d: now magnify x5, then exit magnify", T4_DROWS);
+    NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
 
     /* 4. rebuild via magnify in/out */
     rc = t4_cycle(30000, &narrowed, &reflex14);
     t4_log("cycle 1: %s, narrowed %d, 14-bit reflex %d\n", rc == 0 ? "done" : rc == 1 ? "cancelled" : "timeout",
            narrowed, reflex14);
+    t4_pend_apply = 0;
+    patched = t4_applied;
     if (rc) { snprintf(t4_result, sizeof(t4_result), "%s before the rebuild", rc == 1 ? "cancelled" : "no magnify seen"); goto revert; }
+    if (!patched) { snprintf(t4_result, sizeof(t4_result), "%s", t4_apply_fail ? "cpu1 check failed: not applied" : "magnify too short: not applied"); goto revert; }
     rebuilt = 1;
 
     /* 5. measure */
@@ -408,8 +436,7 @@ static void t4_task(void *unused)
            i68 >= 0 ? (int)l7[i68] : -1, i69 >= 0 ? (int)l7[i69] : -1);
     if (i69 >= 0 && (l7[i69] & 0x3fffff) == (o69t & 0x3fffff))
     {
-        l7[i69] = o69t + T4_DROWS / 2;
-        t4_log("live lv7 0x69 still Canon's: written directly -> %x\n", (int)l7[i69]);
+        t4_log("live lv7 0x69 still Canon's after the rebuild (not written: v4.72)\n");
     }
     /* v4.63: camera v4.62 showed Canon's rebuild still used h 2214 (the record is read where the cpu0-only remap
      * doesn't reach, presumably cpu1). So program the size ourselves, as Canon's SAP block setup does: find the
@@ -521,6 +548,7 @@ revert:
     {
         if (!rebuilt)
         {
+            /* applied in magnify but no exit seen (cancel/timeout): the 4K path has not been rebuilt tall */
             t4_restore_all();
             patched = 0;
             t4_log("reverted now (no taller rebuild happened)\n");
