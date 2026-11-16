@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -44,6 +44,8 @@
 #define T4_LVT      0xE1C6288Cu
 #define T4_NLVT     38
 #define T4_REC      0xE0F2E608u         /* MEM1 record 1 (4K): {w, h, 0, 0} */
+#define T4_GEOM     0xE1C75B40u         /* v4.65: FROM-blob readout record for 4K (u16 4256, 2214, 0, 0, 144, 46 ..) */
+#define T4_ROD_OFF  (0x410 + 11 * 0x1a)  /* SensorDrive table: ROD u16 for mode 11 (4K), + slot * 2 */
 #define T4_DROWS    40                  /* extra rows (sensor regs count 2-row units: +20) */
 #define T4_W        4256
 #define T4_H        2214
@@ -51,6 +53,7 @@
 #define T4_PITCH    5320
 
 static volatile int t4_running;
+static int t4_trace_ms;          /* v4.65: breadcrumb window after the first magnify exit */
 static char t4_result[80];
 
 static void t4_log(const char *fmt, ...)
@@ -136,6 +139,28 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
         int m = MEM(T4_STATE + 0xc);
         if (m == 13) seen13 = 1;
+        if (seen13 && m == 12 && t4_trace_ms)
+        {
+            /* v4.65: magnify exit seen: breadcrumb every 50 ms (file closed each time) while running the reflex,
+             * so a hang shows how far the taller path got */
+            uint32_t t1 = get_ms_clock(), tl = 0, s0 = t4_rowsum(1100), nchg = 0;
+            while (get_ms_clock() - t1 < (uint32_t)t4_trace_ms)
+            {
+                t4_reflex(narrowed, reflex14);
+                uint32_t now = get_ms_clock(), sr = t4_rowsum(1100);
+                if (sr != s0) { s0 = sr; nchg++; }
+                if (now - tl >= 50)
+                {
+                    tl = now;
+                    t4_log("  trace +%d: mode %d m1 %dx%d +18 %d +1c %d f2 %d unit %x frames %d\n", (int)(now - t1),
+                           (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
+                           (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c),
+                           (int)MEM(T4_UNIT), (int)nchg);
+                }
+                msleep(5);
+            }
+            t4_trace_ms = 0;
+        }
         if (seen13 && m == 12 && MEM(T4_PATH + 0x1c) != 1496 && MEM(T4_PATH + 0x14) != 1496)
         {
             /* back in 4K and port 3 reprogrammed: give it 1 s of reflexes to settle */
@@ -157,7 +182,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.64 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.65 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -200,6 +225,13 @@ static void t4_task(void *unused)
     if ((o69f & 0x3fffff) != 0x6aa || (o97f & 0x3fffff) != 0x453 || (o69t & 0x3fffff) != 0x6aa)
     { snprintf(t4_result, sizeof(t4_result), "reg values unexpected"); goto out; }
     if (MEM(T4_REC) != T4_W || MEM(T4_REC + 4) != T4_H) { snprintf(t4_result, sizeof(t4_result), "MEM1 record unexpected"); goto out; }
+    volatile uint16_t *geo = (volatile uint16_t *)(base + (T4_GEOM - T4_FROM));
+    volatile uint16_t *rod = (volatile uint16_t *)(sd + T4_ROD_OFF);
+    static const uint8_t rod_slots[4] = { 2, 3, 4, 9 };
+    t4_log("geometry RAM %x: %d x %d (ROM %d x %d); ROD slots 2/3/4/9: %d %d %d %d\n", (int)geo, geo[0], geo[1],
+           *(volatile uint16_t *)T4_GEOM, *(volatile uint16_t *)(T4_GEOM + 2), rod[2], rod[3], rod[4], rod[9]);
+    if (geo[0] != T4_W || geo[1] != T4_H || rod[2] != 1110 || rod[3] != 1110 || rod[4] != 1110 || rod[9] != 1110)
+    { snprintf(t4_result, sizeof(t4_result), "geometry/ROD unexpected: not touched"); goto out; }
     rc = romremap_init();
     rec_ram = (uint32_t *)romremap_ram(T4_REC);
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
@@ -232,6 +264,16 @@ static void t4_task(void *unused)
     t4_put(&full[i69f], o69f + T4_DROWS / 2);
     t4_put(&full[i97f], o97f + T4_DROWS / 2);
     t4_put(&lvt[i69t], o69t + T4_DROWS / 2);
+    {
+        uint16_t *gc = (uint16_t *)((uint32_t)&geo[1] & ~0x40000000);
+        *gc = T4_H + T4_DROWS; romremap_flush(gc, 2);
+        for (int k = 0; k < 4; k++)
+        {
+            uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
+            *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2);
+        }
+        t4_log("geometry h -> %d, ROD -> %d %d %d %d\n", geo[1], rod[2], rod[3], rod[4], rod[9]);
+    }
     patched = 1;
     t4_log("patched: record reads %d, full 0x69 %x, 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4),
            (int)full[i69f], (int)full[i97f], (int)lvt[i69t]);
@@ -245,6 +287,7 @@ static void t4_task(void *unused)
         if (r1 || v1 != T4_H + T4_DROWS)
         { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto revert; }
     }
+    t4_trace_ms = 2000;
     NotifyBox(5000, "Taller 4K: now magnify x5, then exit magnify");
 
     /* 4. rebuild via magnify in/out */
@@ -359,6 +402,15 @@ revert:
     {
         rec_ram[1] = orec_h; romremap_flush(&rec_ram[1], 4);
         t4_put(&full[i69f], o69f); t4_put(&full[i97f], o97f); t4_put(&lvt[i69t], o69t);
+        {
+            uint16_t *gc = (uint16_t *)((uint32_t)&geo[1] & ~0x40000000);
+            *gc = T4_H; romremap_flush(gc, 2);
+            for (int k = 0; k < 4; k++)
+            {
+                uint16_t *rc2 = (uint16_t *)((uint32_t)&rod[rod_slots[k]] & ~0x40000000);
+                *rc2 = 1110; romremap_flush(rc2, 2);
+            }
+        }
         patched = 0;
         t4_log("reverted: record %d, full 0x69 %x 0x97 %x, template 0x69 %x\n", (int)MEM(T4_REC + 4), (int)full[i69f],
                (int)full[i97f], (int)lvt[i69t]);
