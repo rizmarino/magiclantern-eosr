@@ -197,11 +197,24 @@ static void t4_restore_all(void)
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
 static int t4_auto;                     /* v4.77 menu: 0 manual magnify, 1 ML requests magnify in/out itself */
 static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
+/* v4.78: on the R PROP_LV_DISPSIZE is 8 bytes (camera v4.77: ML's length check asserted "correct:8 called:4" and
+ * nothing was sent). Canon's LVGMT handler (FUN_e04b46b4, case 0x80050015) takes word 0 = zoom and stores word 1 at
+ * its +0x504, passing both to FUN_e02cd6e6; word 1's meaning is unknown, so keep Canon's current value. */
+static volatile uint32_t t4_dz[2], t4_dz_len, t4_dz_n;
+PROP_HANDLER(PROP_LV_DISPSIZE)
+{
+    t4_dz_len = len;
+    t4_dz[0] = buf[0];
+    t4_dz[1] = len >= 8 ? buf[1] : 0;
+    t4_dz_n++;
+}
 static void t4_zoom(int z)
 {
-    int v = z;
-    t4_log("  zoom request %d (lv_dispsize %d, mode %d)\n", z, lv_dispsize, (int)MEM(T4_STATE + 0xc));
-    prop_request_change(PROP_LV_DISPSIZE, &v, 4);
+    uint32_t v[2] = { (uint32_t)z, t4_dz[1] };
+    t4_log("  zoom request %d (current %x/%x, len %d, seen %d; mode %d)\n", z, (int)t4_dz[0], (int)t4_dz[1],
+           (int)t4_dz_len, (int)t4_dz_n, (int)MEM(T4_STATE + 0xc));
+    if (t4_dz_len != 8 || !t4_dz_n) { t4_log("  zoom: property not seen as 8 bytes: not sent\n"); return; }
+    prop_request_change(PROP_LV_DISPSIZE, v, 8);
 }
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
@@ -316,7 +329,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.77 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.78 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -678,7 +691,7 @@ static void t4_zt_watch(int ms, int want)
         if (m != last || d != lastd || get_ms_clock() - tl > 500)
         {
             tl = get_ms_clock();
-            t4_log("  +%d ms: mode %d, lv_dispsize %d, MEM1 %dx%d, +18 %d\n", (int)(tl - t0), m, d,
+            t4_log("  +%d ms: mode %d, lv_dispsize %d (%x/%x), MEM1 %dx%d, +18 %d\n", (int)(tl - t0), m, d, (int)t4_dz[0], (int)t4_dz[1],
                    (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
             last = m; lastd = d;
         }
@@ -689,8 +702,9 @@ static void t4_zt_watch(int ms, int want)
 static void t4_zt_task(void *unused)
 {
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
-    t4_log("=== auto magnify test (v4.77) at %d ms: lv %d, mode %d, lv_dispsize %d\n", (int)get_ms_clock(), lv,
-           (int)MEM(T4_STATE + 0xc), lv_dispsize);
+    t4_log("=== auto magnify test (v4.78) at %d ms: lv %d, mode %d, lv_dispsize %d, prop %x/%x len %d (%d updates)\n",
+           (int)get_ms_clock(), lv, (int)MEM(T4_STATE + 0xc), lv_dispsize, (int)t4_dz[0], (int)t4_dz[1], (int)t4_dz_len,
+           (int)t4_dz_n);
     if (!lv || gui_menu_shown() || MEM(T4_STATE + 0xc) != 12 || lv_dispsize != 1)
     {
         t4_log("not started (needs 4K movie LV, not magnified, menu closed)\n");
