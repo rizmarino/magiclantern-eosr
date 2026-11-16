@@ -391,6 +391,28 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
     return 2;
 }
 
+/* v4.84 read-only diagnostic: camera v4.82 showed the LV screen still shifted by ~rows/2 although the YUV crop table
+ * at 0x022fee34 held y 298: the display path must use a copy made earlier. Log every RAM copy of the 4K crop
+ * (3840, 2144) and of the valid area (3848, 2166) in 0x1000..0x2400000 (all mapped: TTBR0 core L1 0-32 MB,
+ * TTBR1 supersection 0x02), with neighbours, once per power-on while the first hold is up. */
+static void t4_scan_copies(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    int n = 0;
+    uint32_t t0 = get_ms_clock();
+    for (uint32_t a = 0x1010; a < 0x2400000 - 0x20 && n < 48; a += 4)
+    {
+        uint32_t *w = (uint32_t *)a;
+        if (!((w[0] == 3840 && w[1] == 2144) || (w[0] == 3848 && w[1] == 2166))) continue;
+        t4_log("  copy %08x: %d %d %d %d [%d %d] %d %d %d %d\n", (int)a, (int)w[-4], (int)w[-3], (int)w[-2], (int)w[-1],
+               (int)w[0], (int)w[1], (int)w[2], (int)w[3], (int)w[4], (int)w[5]);
+        n++;
+    }
+    t4_log("copy scan: %d hits in %d ms\n", n, (int)(get_ms_clock() - t0));
+}
+
 static void t4_task(void *unused)
 {
     int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc = 0, rebuilt = 0, held = 0;
@@ -405,7 +427,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.83 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.84 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -714,6 +736,7 @@ revert:
                  * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
                 t4_holding = 1; t4_nocancel = 1; t4_gm0 = CURRENT_GUI_MODE; held = 1;
                 t4_log("hold: Canon GUI mode %d\n", t4_gm0);
+                t4_scan_copies();
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
