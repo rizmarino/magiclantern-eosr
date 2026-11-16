@@ -2870,6 +2870,14 @@ static void rt_task(void *unused)
     lv_raw = 1;
     msleep(500);
     m1_w = MEM(RT_PATH + 0x10); m1_h = MEM(RT_PATH + 0x14);
+    if (tall4k_active() && m1_w == 3040 && MEM(RT_PATH + 0x18) == 3040 && MEM(RT_PATH + 0x64 + 8) == 0)
+    {
+        /* v4.76: with the taller frame held at 10-bit, +0x10 holds the narrowed width field (3040 = 5320 bytes/line
+         * at 10-bit), not pixels: v4.75 took 3040 as the width (pitch 3800), the sync survey saw no frame edge and
+         * every frame was dropped. The frame is 4256 px. */
+        rt_printf("taller 4K held: width field %d -> frame width 4256 px\n", m1_w);
+        m1_w = 4256;
+    }
     /* v17: Mem1Path layout fields, logged before any pack change (4K-mode survey: rt_pack_apply only runs
      * with mode < 0x14 and width source == width, as tested in FHD) */
     rt_printf("M1 path: mode %d, alt %d, width src %dx%d, w/h %dx%d, pack cfg {%d,%d,%d,%d,%d}\n", MEM(RT_PATH),
