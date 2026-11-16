@@ -1,4 +1,4 @@
-/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace). Personal diagnostic, not for upstream.
+/* R: Debug > Taller 4K (test) (EOS R 1.8.0, v4.61; v4.62 RAM-list check tolerates calibrated values; v4.63 SAP block write (froze, removed); v4.64 cpu1 remap via RPC; v4.65 geometry/ROD + exit trace; v4.66 no-tap variant). Personal diagnostic, not for upstream.
  *
  * First sensor-window write: 4K mode +40 rows (MEM1 4256x2214 -> 4256x2254), notes lv-survey stages 2-5.
  *   1. Checks: movie 4K live view (MEM1 4256x2214 after lv_save_raw), Mem1Path pack cfg at Canon's default, the
@@ -53,6 +53,7 @@
 #define T4_PITCH    5320
 
 static volatile int t4_running;
+static int t4_tap = 1;           /* v4.66: 0 = no raw tap (no lv_save_raw, no 10-bit, no reflex): A/B for the hang */
 static int t4_trace_ms;          /* v4.65: breadcrumb window after the first magnify exit */
 static char t4_result[80];
 
@@ -103,6 +104,7 @@ static uint32_t t4_rowsum(int row)
 /* keep the pack setup consistent with whatever width Canon just wrote; returns 1 if it acted */
 static int t4_reflex(int *narrowed, int *reflex14)
 {
+    if (!t4_tap) return 0;
     uint32_t w18 = MEM(T4_PATH + 0x18), f2 = MEM(T4_PATH + 0x6c);
     if (w18 == T4_W && f2 == 0)                         /* 4K rebuild: re-narrow for 10-bit */
     {
@@ -152,10 +154,10 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                 if (now - tl >= 50)
                 {
                     tl = now;
-                    t4_log("  trace +%d: mode %d m1 %dx%d +18 %d +1c %d f2 %d unit %x frames %d\n", (int)(now - t1),
+                    t4_log("  trace +%d: mode %d m1 %dx%d +18 %d +1c %d f2 %d unit %x frames %d (tap %d)\n", (int)(now - t1),
                            (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
                            (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c),
-                           (int)MEM(T4_UNIT), (int)nchg);
+                           (int)MEM(T4_UNIT), (int)nchg, t4_tap);
                 }
                 msleep(5);
             }
@@ -182,7 +184,7 @@ static void t4_task(void *unused)
     uint32_t o69f = 0, o97f = 0, o69t = 0, orec_h = 0;
     uint32_t *rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.65 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.66 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -237,23 +239,26 @@ static void t4_task(void *unused)
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
     if (rc || !rec_ram) { snprintf(t4_result, sizeof(t4_result), "ROM remap failed (%d)", rc); goto out; }
 
-    /* 2. raw tap + 10-bit */
-    call("lv_save_raw", 1); raw = 1;
-    msleep(500);
+    /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
+    t4_log("variant: %s\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap");
+    if (t4_tap) { call("lv_save_raw", 1); raw = 1; msleep(500); }
     for (int i = 0; i < 5; i++) orig_pack[i] = MEM(T4_PATH + 0x64 + 4 * i);
     w0 = MEM(T4_PATH + 0x18);
     t4_log("MEM1 %dx%d, +18 %d, mode %d, pack {%d,%d,%d,%d,%d}, m_SensorMode %d\n", (int)MEM(T4_PATH + 0x10),
            (int)MEM(T4_PATH + 0x14), (int)w0, (int)MEM(T4_PATH), (int)orig_pack[0], (int)orig_pack[1], (int)orig_pack[2],
            (int)orig_pack[3], (int)orig_pack[4], (int)MEM(T4_STATE + 0xc));
-    if (MEM(T4_PATH + 0x10) != T4_W || MEM(T4_PATH + 0x14) != T4_H || w0 != T4_W || MEM(T4_STATE + 0xc) != 12)
+    if ((t4_tap && (MEM(T4_PATH + 0x10) != T4_W || MEM(T4_PATH + 0x14) != T4_H || w0 != T4_W)) || MEM(T4_STATE + 0xc) != 12)
     { snprintf(t4_result, sizeof(t4_result), "not movie 4K (MEM1 %dx%d)", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14)); goto out; }
     if (orig_pack[0] != 0 || orig_pack[1] != 1 || orig_pack[2] != 2 || orig_pack[3] != 1 || orig_pack[4] != 0)
     { snprintf(t4_result, sizeof(t4_result), "pack cfg not Canon's default"); goto out; }
-    uint32_t o = cli();
-    MEM(T4_PATH + 0x18) = T4_WSET; MEM(T4_PATH + 0x6c) = 0; MEM(T4_PATH + 0x70) = 0;
-    sei(o);
-    packed = 1;
-    msleep(300);
+    if (t4_tap)
+    {
+        uint32_t o = cli();
+        MEM(T4_PATH + 0x18) = T4_WSET; MEM(T4_PATH + 0x6c) = 0; MEM(T4_PATH + 0x70) = 0;
+        sei(o);
+        packed = 1;
+        msleep(300);
+    }
     t4_log("10-bit: MEM1 w %d, unit %x\n", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_UNIT));
 
     /* 3. patch */
@@ -287,7 +292,7 @@ static void t4_task(void *unused)
         if (r1 || v1 != T4_H + T4_DROWS)
         { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto revert; }
     }
-    t4_trace_ms = 2000;
+    t4_trace_ms = t4_tap ? 2000 : 4000;
     NotifyBox(5000, "Taller 4K: now magnify x5, then exit magnify");
 
     /* 4. rebuild via magnify in/out */
@@ -358,14 +363,14 @@ static void t4_task(void *unused)
             uint32_t sa = t4_rowsum(1100), sb = t4_rowsum(2240), now = get_ms_clock();
             if (sa != last) { if (now - lt > maxgap) maxgap = now - lt; last = sa; lt = now; nchg++; }
             if (sb != last2) { last2 = sb; nchg2++; }
-            if (now - lt > 1000) { stalled = 1; break; }
+            if (t4_tap && now - lt > 1000) { stalled = 1; break; }
             msleep(2);
         }
         t4_log("row 1100 changed %d x, row 2240 changed %d x in 1.5 s (max gap %d ms)%s; MEM1 %dx%d\n", (int)nchg,
                (int)nchg2, (int)maxgap, stalled ? " STALLED" : "", (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14));
     }
     uint32_t m1h2 = MEM(T4_PATH + 0x14);
-    if (!stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
+    if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
     {
         int nrows = (T4_H + T4_DROWS) - 2140 + 4;
         uint8_t *buf = fio_malloc(nrows * T4_PITCH + 64);
@@ -383,6 +388,7 @@ static void t4_task(void *unused)
         else t4_log("no memory for the row dump\n");
         snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h2);
     }
+    else if (!t4_tap) snprintf(t4_result, sizeof(t4_result), "no tap: survived the taller rebuild (+1c %d)", (int)MEM(T4_PATH + 0x1c));
     else snprintf(t4_result, sizeof(t4_result), "%s MEM1 h %d, pairs %d", stalled ? "STALL," : "", (int)m1h2, np);
     if (blocks_on)
     {
@@ -448,6 +454,7 @@ out:
 static void t4_select(void *priv, int delta)
 {
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
+    t4_tap = priv ? *(int *)priv : 1;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
     NotifyBox(4000, "Taller 4K: close the ML menu to start");
@@ -460,9 +467,19 @@ static MENU_UPDATE_FUNC(t4_update)
     else MENU_SET_VALUE("OFF");
 }
 
+static int t4_one = 1, t4_zero = 0;
 static struct menu_entry t4_menu[] = {
     {
+        .name   = "Taller 4K, no raw tap",
+        .priv   = &t4_zero,
+        .select = t4_select,
+        .update = t4_update,
+        .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
+        .help2  = "Movie 4K 23.98p; magnify in/out when asked. Log ML/LOGS/TALL4K.TXT.",
+    },
+    {
         .name   = "Taller 4K (test)",
+        .priv   = &t4_one,
         .select = t4_select,
         .update = t4_update,
         .help   = "Movie 4K 23.98p: first sensor-window test, +40 rows. Follow the on-screen prompts",
