@@ -854,10 +854,11 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     if (c_y0 < obt) ay = obt - c_y0;
     uint32_t ay2 = c_ch;
     if (tall4k_active() && c_cw == 4256 && c_ch == 2414 && c_y0 == 0)
-    {   /* v4.85 4K frame height 16:9: the +200 centred frame's 4112x2368 picture cropped to 4112x2313 (27 rows off
-         * the top, 28 off the bottom; same centre as Canon's 4K). Only the active area changes: all rows stay in
-         * the file, raw converters show 16:9. */
-        ay += 27; ay2 = c_ch - 28;
+    {   /* v4.85 4K frame height 16:9: the +200 centred frame's 4112x2368 picture cropped to 16:9 (same centre as
+         * Canon's 4K). Only the active area changes: all rows stay in the file, raw converters show 16:9.
+         * v4.87: 28 rows off each end -> 4112x2312 (1.7785). v4.85's 27/28 (2313 rows) put the active area's top
+         * on an odd row (73): the Bayer phase flipped and LibRaw rendered M16-2152 grey with green edges. */
+        ay += 28; ay2 = c_ch - 28;
     }
     ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = ay2 - ay;  /* jpeg crop, relative to the active area */
     ri[13] = ay; ri[14] = ax; ri[15] = ay2; ri[16] = c_cw;        /* active area: y1, x1, y2, x2 */
@@ -3896,7 +3897,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
-    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2313, 10-bit" : "4K tall 4256x2694, 10-bit");
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : "4K tall 4256x2694, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4032,9 +4033,9 @@ static struct menu_entry rr_menu[] = {
                 .name    = "4K frame height",
                 .priv    = &t4_pmode,
                 .max     = 2,
-                .choices = CHOICES("Normal", "16:9 4112x2313", "Tall 4256x2694"),
+                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694"),
                 .update  = tall4k_height_update,
-                .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2313; Tall = 3:2-ish.",
+                .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
                 .help2   = "Canon 4K 23.98/24p, Global Draw OFF, Lossless 10-bit. Screen shows the 16:9 centre only.",
             },
             {
