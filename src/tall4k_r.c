@@ -30,7 +30,7 @@
 #endif
 
 #define T4_LOG      "ML/LOGS/TALL4K.TXT"
-#define T4_BIN      "ML/LOGS/T4_%d.BIN"   /* v4.71: one file per height */
+#define T4_BIN      "ML/LOGS/T4_%d%s.BIN" /* v4.71: one file per height; v4.74: C = centred */
 #define T4_PATH     0x133CC
 #define T4_STATE    0xef24              /* ImageSequence: +0xc m_SensorMode (12 = 4K, 13 = magnify) */
 #define T4_SDRV     0xcfd4
@@ -59,6 +59,8 @@ static const struct { uint32_t a, v; } t4_eng[] = {
 static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +480, 4 +560 */
 static const int t4_steps[5] = { 40, 200, 400, 480, 560 };
 static int t4_drows = 40;
+static int t4_place;                    /* v4.74 menu: 0 bottom (start reg 0x68 unchanged), 1 centred */
+static int t4_d68, t4_d69;              /* change of 0x68 / 0x69 in 2-row units */
 #define T4_DROWS    ((uint32_t)t4_drows)
 #define T4_W        4256
 #define T4_H        2214
@@ -151,15 +153,16 @@ static int t4_reflex(int *narrowed, int *reflex14)
 
 /* wait for a magnify-in/-out cycle (m_SensorMode 13 then 12) while running the reflex; 0 = done, 1 = cancel, 2 = timeout */
 static uint32_t t4s_base; static volatile uint32_t *t4s_full, *t4s_lvt; static int t4s_i69f, t4s_i97f, t4s_i69t;
-static uint32_t t4s_o69f, t4s_o97f, t4s_o69t, t4s_orec_h; static uint32_t *t4s_rec_ram; static volatile uint16_t *t4s_geo, *t4s_rod;
+static uint32_t t4s_o69f, t4s_o97f, t4s_o69t, t4s_orec_h; static int t4s_i68f = -1, t4s_i68t = -1; static uint32_t t4s_o68f, t4s_o68t; static uint32_t *t4s_rec_ram; static volatile uint16_t *t4s_geo, *t4s_rod;
 static const uint8_t t4s_rod_slots[4] = { 2, 3, 4, 9 };
 static int t4s_slot;
 static void t4_apply_all(void)
 {
     t4s_rec_ram[1] = T4_H + T4_DROWS; romremap_flush(&t4s_rec_ram[1], 4);
-    t4_put(&t4s_full[t4s_i69f], t4s_o69f + T4_DROWS / 2);
+    t4_put(&t4s_full[t4s_i69f], t4s_o69f + t4_d69);
     t4_put(&t4s_full[t4s_i97f], t4s_o97f + T4_DROWS / 2);
-    t4_put(&t4s_lvt[t4s_i69t], t4s_o69t + T4_DROWS / 2);
+    t4_put(&t4s_lvt[t4s_i69t], t4s_o69t + t4_d69);
+    if (t4_d68) { t4_put(&t4s_full[t4s_i68f], t4s_o68f - t4_d68); t4_put(&t4s_lvt[t4s_i68t], t4s_o68t - t4_d68); }
     uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
     *gc = T4_H + T4_DROWS; romremap_flush(gc, 2);
     for (int k = 0; k < 4; k++)
@@ -175,6 +178,7 @@ static void t4_restore_all(void)
 {
     t4s_rec_ram[1] = t4s_orec_h; romremap_flush(&t4s_rec_ram[1], 4);
     t4_put(&t4s_full[t4s_i69f], t4s_o69f); t4_put(&t4s_full[t4s_i97f], t4s_o97f); t4_put(&t4s_lvt[t4s_i69t], t4s_o69t);
+    if (t4s_i68f >= 0) { t4_put(&t4s_full[t4s_i68f], t4s_o68f); t4_put(&t4s_lvt[t4s_i68t], t4s_o68t); }
     uint16_t *gc = (uint16_t *)((uint32_t)&t4s_geo[1] & ~0x40000000);
     *gc = T4_H; romremap_flush(gc, 2);
     for (int k = 0; k < 4; k++)
@@ -214,9 +218,10 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             t4_applied = 1; t4_pend_apply = 0;
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
-            t4_log("  magnify active: applied +%d rows; record %d, full 0x69 %x 0x97 %x, template 0x69 %x, ROD %d; "
-                   "cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_full[t4s_i69f],
-                   (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i69t], t4s_rod[t4s_slot], r1, c1, (int)v1);
+            t4_log("  magnify active: applied +%d rows; record %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
+                   "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_full[t4s_i68f],
+                   (int)t4s_full[t4s_i69f], (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i68t], (int)t4s_lvt[t4s_i69t],
+                   t4s_rod[t4s_slot], r1, c1, (int)v1);
             if (r1 || v1 != T4_H + T4_DROWS)
             {
                 t4_restore_all(); t4_applied = 0; t4_apply_fail = 1;
@@ -289,7 +294,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.73 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.74 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -331,6 +336,16 @@ static void t4_task(void *unused)
     t4_log("full[%d] = %x, full[%d] = %x, template[%d] = %x\n", i69f, (int)o69f, i97f, (int)o97f, i69t, (int)o69t);
     if ((o69f & 0x3fffff) != 0x6aa || (o97f & 0x3fffff) != 0x453 || (o69t & 0x3fffff) != 0x6aa)
     { snprintf(t4_result, sizeof(t4_result), "reg values unexpected"); goto out; }
+    /* v4.74: window start 0x68 (centred placement moves it up by half the extra rows) */
+    t4s_i68f = t4_find(full, T4_NFULL, 0x68); t4s_i68t = t4_find(lvt, T4_NLVT, 0x68);
+    if (t4s_i68f < 0 || t4s_i68t < 0) { snprintf(t4_result, sizeof(t4_result), "reg 0x68 not found"); goto out; }
+    t4s_o68f = full[t4s_i68f]; t4s_o68t = lvt[t4s_i68t];
+    t4_d68 = t4_place ? (int)T4_DROWS / 4 : 0;
+    t4_d69 = (int)T4_DROWS / 2 - t4_d68;
+    t4_log("placement %s: 0x68 full[%d] %x template[%d] %x -> -%d, 0x69 -> +%d (2-row units)\n",
+           t4_place ? "centred" : "bottom", t4s_i68f, (int)t4s_o68f, t4s_i68t, (int)t4s_o68t, t4_d68, t4_d69);
+    if ((t4s_o68f & 0x3fffff) != 0x26e || (t4s_o68t & 0x3fffff) != 0x26e || (T4_DROWS % 4) || 0x26e - t4_d68 < 0x27)
+    { snprintf(t4_result, sizeof(t4_result), "0x68 unexpected (%x): not touched", (int)t4s_o68f); goto out; }
     if (MEM(T4_REC) != T4_W || MEM(T4_REC + 4) != T4_H) { snprintf(t4_result, sizeof(t4_result), "MEM1 record unexpected"); goto out; }
     static volatile uint16_t *geo, *rod;
     geo = (volatile uint16_t *)(base + (T4_GEOM - T4_FROM));
@@ -402,7 +417,7 @@ static void t4_task(void *unused)
     t4s_rod = rod; t4s_slot = slot;
     t4_restore_fn = t4_restore_all;
     t4_log("plan: record h %d -> %d, 0x69 %x -> %x, 0x97 %x -> %x, ROD slot %d -> %d, %d engine values; applied in magnify\n",
-           T4_H, T4_H + T4_DROWS, (int)o69f, (int)(o69f + T4_DROWS / 2), (int)o97f, (int)(o97f + T4_DROWS / 2), slot,
+           T4_H, T4_H + T4_DROWS, (int)o69f, (int)(o69f + t4_d69), (int)o97f, (int)(o97f + T4_DROWS / 2), slot,
            1110 + T4_DROWS / 2, (int)T4_NENG);
     /* cpu1 onto the remap now (record still Canon's: cpu1 must read 2214); the probe after the apply needs 2214+N */
     {
@@ -501,7 +516,7 @@ static void t4_task(void *unused)
          * written in 16-row chunks (no big buffer) */
         int hh = T4_H + T4_DROWS, nsp = 2140 / 8, nct = hh - 2140, ok = 0;
         uint8_t *buf = fio_malloc(16 * T4_PITCH);
-        char fn[32]; snprintf(fn, sizeof(fn), T4_BIN, hh);
+        char fn[32]; snprintf(fn, sizeof(fn), T4_BIN, hh, t4_d68 ? "C" : "");
         FILE *f = buf ? FIO_CreateFile(fn) : 0;
         if (f)
         {
@@ -599,6 +614,7 @@ static void t4_select(void *priv, int delta)
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
     t4_tap = priv ? *(int *)priv : 1;
     t4_drows = t4_steps[(t4_sel >= 0 && t4_sel <= 4) ? t4_sel : 0];
+    t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
     NotifyBox(4000, "Taller 4K: close the ML menu to start");
@@ -620,6 +636,14 @@ static struct menu_entry t4_menu[] = {
         .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+480 (2694)", "+560 (2774)"),
         .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
         .help2   = "Resets to +40 at every power-on.",
+    },
+    {
+        .name    = "Taller 4K placement",
+        .priv    = &t4_place,
+        .max     = 1,
+        .choices = CHOICES("Bottom", "Centred"),
+        .help    = "Bottom: extra rows below Canon's 4K window. Centred: half above, half below (v4.74).",
+        .help2   = "Centred shifts Canon's live view picture slightly. Resets to Bottom at power-on.",
     },
     {
         .name   = "Taller 4K (test)",
