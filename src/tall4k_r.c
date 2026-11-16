@@ -229,7 +229,7 @@ static int t4_auto;                     /* v4.77 menu: 0 manual magnify, 1 ML re
 static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
 /* v4.79 persistent mode (Debug > Taller 4K mode, kept in magic.cfg): a watcher switches 4K 23.98p movie LV to the
  * taller frame by itself and back before anything that could rebuild 4K at another size or rate. */
-static CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694) */
+CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694) */
 static int t4_persist_run;              /* the running t4_task was started by the watcher */
 static int t4_pmode_run;                /* the mode value the running switch was started for */
 static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
@@ -391,28 +391,6 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
     return 2;
 }
 
-/* v4.84 read-only diagnostic: camera v4.82 showed the LV screen still shifted by ~rows/2 although the YUV crop table
- * at 0x022fee34 held y 298: the display path must use a copy made earlier. Log every RAM copy of the 4K crop
- * (3840, 2144) and of the valid area (3848, 2166) in 0x1000..0x2400000 (all mapped: TTBR0 core L1 0-32 MB,
- * TTBR1 supersection 0x02), with neighbours, once per power-on while the first hold is up. */
-static void t4_scan_copies(void)
-{
-    static int done;
-    if (done) return;
-    done = 1;
-    int n = 0;
-    uint32_t t0 = get_ms_clock();
-    for (uint32_t a = 0x1010; a < 0x2400000 - 0x20 && n < 48; a += 4)
-    {
-        uint32_t *w = (uint32_t *)a;
-        if (!((w[0] == 3840 && w[1] == 2144) || (w[0] == 3848 && w[1] == 2166))) continue;
-        t4_log("  copy %08x: %d %d %d %d [%d %d] %d %d %d %d\n", (int)a, (int)w[-4], (int)w[-3], (int)w[-2], (int)w[-1],
-               (int)w[0], (int)w[1], (int)w[2], (int)w[3], (int)w[4], (int)w[5]);
-        n++;
-    }
-    t4_log("copy scan: %d hits in %d ms\n", n, (int)(get_ms_clock() - t0));
-}
-
 static void t4_task(void *unused)
 {
     int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc = 0, rebuilt = 0, held = 0;
@@ -427,7 +405,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.84 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.85 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -736,7 +714,6 @@ revert:
                  * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
                 t4_holding = 1; t4_nocancel = 1; t4_gm0 = CURRENT_GUI_MODE; held = 1;
                 t4_log("hold: Canon GUI mode %d\n", t4_gm0);
-                t4_scan_copies();
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
@@ -962,83 +939,87 @@ void tall4k_tick(void)
     task_create("tall4k", 0x1d, 0x1000, t4_persist_task, 0);
 }
 
-static MENU_UPDATE_FUNC(t4_mode_update)
+extern int get_global_draw(void);
+MENU_UPDATE_FUNC(tall4k_height_update)
 {
-    MENU_SET_HELP("Canon heap free: %d KB (keep >= ~490 KB)", GetFreeMemForMalloc() / 1024);
-    if (t4_pmode && t4_holding && t4_persist_run) MENU_SET_RINFO("ON");
-    else if (t4_pmode && t4_suspend) MENU_SET_RINFO("paused");
-    if (t4_pmode && get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
-    else if (t4_pmode) MENU_SET_WARNING(MENU_WARN_INFO, "Movie 4K 23.98/24p. Record with Movie > RAW video (R), Lossless 10-bit.");
+    /* v4.85: Movie > RAW video (R) > 4K frame height (was Debug > Taller 4K mode, v4.79-v4.84) */
+    if (!t4_pmode) return;
+    if (t4_holding && t4_persist_run) MENU_SET_RINFO("ON");
+    else if (t4_suspend) MENU_SET_RINFO("paused");
+    else MENU_SET_RINFO("waiting");
+    if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
+    else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused after a failed switch: set Normal and back to retry.");
+    else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
 static int t4_one = 1, t4_zero = 0;
 static struct menu_entry t4_menu[] = {
     {
-        .name    = "Taller 4K mode",
-        .priv    = &t4_pmode,
-        .max     = 2,
-        .choices = CHOICES("OFF", "4256x2414 (16:9 in post)", "4256x2694"),
-        .update  = t4_mode_update,
-        .help    = "v4.79 test: switches 4K 23.98p movie LV to a taller raw frame by itself (centred, 10-bit).",
-        .help2   = "MENU / PLAY / Q go back to normal 4K first. Needs Global Draw OFF.",
-    },
-    {
-        .name    = "Taller 4K rows",
-        .priv    = &t4_sel,
-        .max     = 4,
-        .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+480 (2694)", "+560 (2774)"),
-        .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
-        .help2   = "Resets to +40 at every power-on.",
-    },
-    {
-        .name    = "Taller 4K after test",
-        .priv    = &t4_hold,
-        .max     = 1,
-        .choices = CHOICES("Revert", "Hold for recording"),
-        .help    = "Hold: keep the taller frame after the checks, record with Movie > RAW video (LL 10-bit),",
-        .help2   = "then stop recording and magnify x5 + exit to restore. Resets to Revert at power-on.",
-    },
-    {
-        .name    = "Auto magnify test",
-        .select  = t4_zt_select,
-        .help    = "v4.77: ML magnifies x5 and back by itself (no sensor changes). Movie 4K LV.",
-        .help2   = "Result on screen and in ML/LOGS/TALL4K.TXT.",
-    },
-    {
-        .name    = "Taller 4K magnify",
-        .priv    = &t4_auto,
-        .max     = 1,
-        .choices = CHOICES("Manual", "Auto"),
-        .help    = "Auto: the test magnifies in/out by itself (v4.77). Resets to Manual at power-on.",
-    },
-    {
-        .name    = "End taller 4K",
-        .select  = t4_end_select,
-        .help    = "While held: back to normal 4K (auto magnify). Don't use while recording.",
-    },
-    {
-        .name    = "Taller 4K placement",
-        .priv    = &t4_place,
-        .max     = 1,
-        .choices = CHOICES("Bottom", "Centred"),
-        .help    = "Bottom: extra rows below Canon's 4K window. Centred: half above, half below (v4.74).",
-        .help2   = "Centred shifts Canon's live view picture slightly. Resets to Bottom at power-on.",
-    },
-    {
-        .name   = "Taller 4K (test)",
-        .priv   = &t4_one,
-        .select = t4_select,
-        .update = t4_update,
-        .help   = "Movie 4K 23.98p: sensor-window test, rows from Taller 4K rows. Follow the prompts",
-        .help2  = "(magnify in/out). Reverts at the end; ML menu cancels. ML/LOGS/TALL4K.TXT, T4_<h>.BIN.",
-    },
-    {
-        .name   = "Taller 4K, no raw tap",
-        .priv   = &t4_zero,
-        .select = t4_select,
-        .update = t4_update,
-        .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
-        .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
+        .name     = "Taller 4K tests",
+        .select   = menu_open_submenu,
+        .help     = "Step-by-step taller 4K test tools (v4.61-v4.78). Everyday use: Movie > RAW video (R) >",
+        .help2    = "4K frame height. Don't run these while a frame height other than Normal is set.",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "Taller 4K rows",
+                .priv    = &t4_sel,
+                .max     = 4,
+                .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+480 (2694)", "+560 (2774)"),
+                .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
+                .help2   = "Resets to +40 at every power-on.",
+            },
+            {
+                .name    = "Taller 4K after test",
+                .priv    = &t4_hold,
+                .max     = 1,
+                .choices = CHOICES("Revert", "Hold for recording"),
+                .help    = "Hold: keep the taller frame after the checks, record with Movie > RAW video (LL 10-bit),",
+                .help2   = "then stop recording and magnify x5 + exit to restore. Resets to Revert at power-on.",
+            },
+            {
+                .name    = "Auto magnify test",
+                .select  = t4_zt_select,
+                .help    = "v4.77: ML magnifies x5 and back by itself (no sensor changes). Movie 4K LV.",
+                .help2   = "Result on screen and in ML/LOGS/TALL4K.TXT.",
+            },
+            {
+                .name    = "Taller 4K magnify",
+                .priv    = &t4_auto,
+                .max     = 1,
+                .choices = CHOICES("Manual", "Auto"),
+                .help    = "Auto: the test magnifies in/out by itself (v4.77). Resets to Manual at power-on.",
+            },
+            {
+                .name    = "End taller 4K",
+                .select  = t4_end_select,
+                .help    = "While held: back to normal 4K (auto magnify). Don't use while recording.",
+            },
+            {
+                .name    = "Taller 4K placement",
+                .priv    = &t4_place,
+                .max     = 1,
+                .choices = CHOICES("Bottom", "Centred"),
+                .help    = "Bottom: extra rows below Canon's 4K window. Centred: half above, half below (v4.74).",
+                .help2   = "Centred shifts Canon's live view picture slightly. Resets to Bottom at power-on.",
+            },
+            {
+                .name   = "Taller 4K (test)",
+                .priv   = &t4_one,
+                .select = t4_select,
+                .update = t4_update,
+                .help   = "Movie 4K 23.98p: sensor-window test, rows from Taller 4K rows. Follow the prompts",
+                .help2  = "(magnify in/out). Reverts at the end; ML menu cancels. ML/LOGS/TALL4K.TXT, T4_<h>.BIN.",
+            },
+            {
+                .name   = "Taller 4K, no raw tap",
+                .priv   = &t4_zero,
+                .select = t4_select,
+                .update = t4_update,
+                .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
+                .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
+            },
+            MENU_EOL,
+        },
     },
 };
 

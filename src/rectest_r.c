@@ -852,8 +852,15 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
     if (rt_m1_4k(m1_w, m1_h)) { obl = 144; obt = 46; }   /* v17.1: 4K movie MEM1, measured on v17 RT00 (black 2049 @14-bit) */
     if (c_x0 < obl) ax = obl - c_x0;
     if (c_y0 < obt) ay = obt - c_y0;
-    ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = c_ch - ay; /* jpeg crop, relative to the active area */
-    ri[13] = ay; ri[14] = ax; ri[15] = c_ch; ri[16] = c_cw;       /* active area: y1, x1, y2, x2 */
+    uint32_t ay2 = c_ch;
+    if (tall4k_active() && c_cw == 4256 && c_ch == 2414 && c_y0 == 0)
+    {   /* v4.85 4K frame height 16:9: the +200 centred frame's 4112x2368 picture cropped to 4112x2313 (27 rows off
+         * the top, 28 off the bottom; same centre as Canon's 4K). Only the active area changes: all rows stay in
+         * the file, raw converters show 16:9. */
+        ay += 27; ay2 = c_ch - 28;
+    }
+    ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = ay2 - ay;  /* jpeg crop, relative to the active area */
+    ri[13] = ay; ri[14] = ax; ri[15] = ay2; ri[16] = c_cw;        /* active area: y1, x1, y2, x2 */
     ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
     for (int i = 0; i < 9; i++) { ri[21 + 2 * i] = cm[i]; ri[22 + 2 * i] = 10000; }
     ri[39] = 1100;
@@ -2805,6 +2812,11 @@ static void rt_task(void *unused)
 
     if (rt_crop_sel < 0 || rt_crop_sel >= COUNT(rt_crop_wh)) rt_crop_sel = 0;
     int full = rt_crop_sel == RT_CROP_FULL || sp_active;    /* v20: silent pictures take the whole MEM1 frame */
+    if (tall4k_active() && !full)
+    {   /* v4.85: a taller 4K frame is always recorded whole (crops of it untested) */
+        rt_printf("taller 4K held: Resolution %d ignored, full frame\n", rt_crop_sel);
+        full = 1;
+    }
     uint32_t crop_w = rt_crop_wh[rt_crop_sel][0], crop_h = rt_crop_wh[rt_crop_sel][1];   /* full: set from MEM1 below */
     int dur_s = (rr_active || sp_active) ? 0 : rt_dur_s[rt_dur_sel];   /* 0 = until stopped (REC button) */
     for (rt_run_id = 0; rt_run_id < 99; rt_run_id++)
@@ -3875,6 +3887,8 @@ static uint32_t rr_rate10(int sel, int bpp, int fps30)
     return (uint32_t)(b * 10 * (fps30 ? 30000 : 24000) / 1001 / (1024 * 1024));
 }
 
+extern int t4_pmode;                     /* v4.85 tall4k_r.c: 4K frame height (CONFIG_INT t4.mode) */
+extern MENU_UPDATE_FUNC(tall4k_height_update);
 static MENU_UPDATE_FUNC(rr_main_update)
 {
     if (!rr_on) return;
@@ -3882,6 +3896,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2313, 10-bit" : "4K tall 4256x2694, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4012,6 +4027,15 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216", "3840x2160"),
                 .help    = "2560 and 2880 need Canon movie size 4K (1:1 pixels, narrower view). In FHD they shrink",
                 .help2   = "to 2304 wide. Full frame: FHD 2304x1290; 4K 4256x2214 and 3840x2160 need Compression: Lossless.",
+            },
+            {
+                .name    = "4K frame height",
+                .priv    = &t4_pmode,
+                .max     = 2,
+                .choices = CHOICES("Normal", "16:9 4112x2313", "Tall 4256x2694"),
+                .update  = tall4k_height_update,
+                .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2313; Tall = 3:2-ish.",
+                .help2   = "Canon 4K 23.98/24p, Global Draw OFF, Lossless 10-bit. Screen shows the 16:9 centre only.",
             },
             {
                 .name    = "Bit depth",
