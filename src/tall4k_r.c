@@ -56,8 +56,8 @@ static const struct { uint32_t a, v; } t4_eng[] = {
 #define T4_NENG (sizeof(t4_eng) / sizeof(t4_eng[0]))
 /* v4.71: extra rows selectable (sensor regs count 2-row units). Limit: 23.98p VD 1444 HD, ROD = 1110 + rows/2 must
  * stay <= RPS - 10 (1399) and VD - 45 (Canon's own tightest gap, 4K 29.97p) -> <= +578 rows. */
-static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +560 */
-static const int t4_steps[4] = { 40, 200, 400, 560 };
+static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +480, 4 +560 */
+static const int t4_steps[5] = { 40, 200, 400, 480, 560 };
 static int t4_drows = 40;
 #define T4_DROWS    ((uint32_t)t4_drows)
 #define T4_W        4256
@@ -289,7 +289,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.72 test at %d ms\n", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.73 test at %d ms\n", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -598,7 +598,7 @@ static void t4_select(void *priv, int delta)
 {
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
     t4_tap = priv ? *(int *)priv : 1;
-    t4_drows = t4_steps[t4_sel & 3];
+    t4_drows = t4_steps[(t4_sel >= 0 && t4_sel <= 4) ? t4_sel : 0];
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
     NotifyBox(4000, "Taller 4K: close the ML menu to start");
@@ -616,8 +616,8 @@ static struct menu_entry t4_menu[] = {
     {
         .name    = "Taller 4K rows",
         .priv    = &t4_sel,
-        .max     = 3,
-        .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+560 (2774)"),
+        .max     = 4,
+        .choices = CHOICES("+40 (2254)", "+200 (2414)", "+400 (2614)", "+480 (2694)", "+560 (2774)"),
         .help    = "Extra rows for the Taller 4K tests (v4.71). Above +40 needs Canon 4K 23.98p.",
         .help2   = "Resets to +40 at every power-on.",
     },
