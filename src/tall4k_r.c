@@ -95,7 +95,7 @@ static int t4_d68, t4_d69;              /* change of 0x68 / 0x69 in 2-row units 
 #define T4_H        2214
 #define T4_WSET     3040                /* 10-bit width field: (3040 * 14) >> 3 = 5320 = 4256 * 10 / 8 */
 #define T4_PITCH    5320
-static uint32_t t4_fit_w(void) { return (3840 * 2166 / (2166 + T4_DROWS)) & ~15u; }   /* v4.89 Fit preview width */
+static uint32_t t4_fit_w(void) { return (3840 * 2166 / (2166 + T4_DROWS)) & ~31u; }   /* v4.89 Fit preview width (v4.90: /32, half-size record gets /16) */
 static uint32_t t4_eng_new(uint32_t v) { return v < 0x10000 ? v + T4_DROWS : v + (T4_DROWS << 16); }
 
 static volatile int t4_running;
@@ -215,7 +215,7 @@ static void t4_apply_all(void)
             if (t4_preview) { t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166 + T4_DROWS; }
             else t4s_var[k][4] = 47 + 2 * t4_d68;
             romremap_flush(t4s_var[k], 44);
-            if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4s_vout[k][12] = t4_fit_w(); romremap_flush(t4s_vout[k], 68); }
+            if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4_fit_w(); t4s_vout[k][12] = t4_fit_w() / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
 }
 
@@ -244,7 +244,7 @@ static void t4_restore_all(void)
         {
             t4s_var[k][1] = T4_H; t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166;
             romremap_flush(t4s_var[k], 44);
-            if (t4s_vout[k]) { t4s_vout[k][2] = t4s_vout[k][12] = 3840; romremap_flush(t4s_vout[k], 68); }
+            if (t4s_vout[k]) { t4s_vout[k][2] = 3840; t4s_vout[k][12] = 3840 / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
 }
 
@@ -445,7 +445,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.89 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.90 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -550,7 +550,11 @@ static void t4_task(void *unused)
         t4s_var[k] = v;
         uint32_t *o = (uint32_t *)romremap_ram(t4_vo[k]);
         t4s_vout[k] = 0;
-        if (!o || o[0] != 4 || o[1] != 3 || o[2] != 3840 || o[3] != 2160 || o[9] != 3840 || o[12] != 3840 || o[13] != 2160)
+        /* v4.90: the two 4K output records differ: 0xE1225288 {.., 1, 1, 1, 1, 0x10001, 3840, 0, 0, 3840, 2160 ..},
+         * 0xE1225354 {.., 1, 2, 1, 2, 0x20002, 1920, 0, 0, 1920, 1080 ..} (half size): v4.89 expected the first layout
+         * for both and refused (mode paused). Check sizes / scale per record; Fit scales [12] by [5]. */
+        if (!o || o[0] != 4 || o[1] != 3 || o[2] != 3840 || o[3] != 2160 || (o[5] != 1 && o[5] != 2)
+            || o[9] * o[5] != 3840 || o[12] * o[5] != 3840 || o[13] * o[5] != 2160)
         {
             t4_log("output record %x: %s %d %d %d %d %d %d %d\n", (int)t4_vo[k], o ? "unexpected" : "not mapped", o ? (int)o[0] : 0,
                    o ? (int)o[1] : 0, o ? (int)o[2] : 0, o ? (int)o[3] : 0, o ? (int)o[9] : 0, o ? (int)o[12] : 0, o ? (int)o[13] : 0);
