@@ -3891,6 +3891,7 @@ static uint32_t rr_rate10(int sel, int bpp, int fps30)
 }
 
 extern int t4_pmode;                     /* v4.85 tall4k_r.c: 4K frame height (CONFIG_INT t4.mode) */
+extern int t4_preview;                   /* v4.91 tall4k_r.c: 4K preview (CONFIG_INT t4.prev) */
 extern MENU_UPDATE_FUNC(tall4k_height_update);
 static MENU_UPDATE_FUNC(rr_main_update)
 {
@@ -4038,7 +4039,15 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694"),
                 .update  = tall4k_height_update,
                 .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
-                .help2   = "Canon 4K 23.98/24p, Global Draw OFF, Lossless 10-bit. Screen shows the 16:9 centre only.",
+                .help2   = "Canon 4K 23.98/24p, Global Draw OFF, Lossless 10-bit. Screen: see 4K preview below.",
+            },
+            {
+                .name    = "4K preview",
+                .priv    = &t4_preview,
+                .max     = 1,
+                .choices = CHOICES("Centre", "Whole frame"),
+                .help    = "Screen with a taller 4K frame height. Centre: 16:9 centre at the right shape (top and",
+                .help2   = "bottom not shown). Whole frame: everything recorded, squeezed vertically. Saved.",
             },
             {
                 .name    = "Bit depth",
