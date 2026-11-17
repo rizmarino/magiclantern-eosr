@@ -111,6 +111,11 @@ static int t4_dcols;                    /* 0 = taller tests / mode; > 0 only fro
  * hardware through the TG list 0xD0406198/619C (= HD-1) and sensor 0x51 (= 0x2000 | (HD/2-1)); VD is derived from the
  * SensorDrive table at run time; AE keeps the line time in ns (RAM 0x022EDEF8 for mode 11). Slot 4 (23.98) only. */
 static int t4_dhd;                      /* 0 or 16 */
+/* v4.98: tapped wider frame: width WN, 10-bit line = WN * 10 / 8 bytes, Mem1Path width field such that
+ * (field * 14) >> 3 = line bytes (4256 -> 3040 / 5320, 4320 -> 3086 / 5400) */
+#define T4_WN       (T4_W + T4_DCOLS)
+#define T4_PITCHN   (T4_WN * 10 / 8)
+#define T4_WSETN    ((T4_PITCHN * 8 + 13) / 14)
 #define T4_DHD      ((uint32_t)t4_dhd)
 #define T4_TG98     0xE1C672ECu          /* FROM: value of reg 0xD0406198 (HD-1) */
 #define T4_TG9C     0xE1C672F4u          /* FROM: value of reg 0xD040619C (HD-1) */
@@ -212,22 +217,26 @@ static uint32_t t4_rowsum(int row)
 static int t4_reflex(int *narrowed, int *reflex14)
 {
     if (!t4_tap) return 0;
+    /* v4.98: the wider rebuild writes +18 = WN (4320): narrow to its own 10-bit field; normal 4K keeps 4256 -> 3040 */
     uint32_t w18 = MEM(T4_PATH + 0x18), f2 = MEM(T4_PATH + 0x6c);
-    if (w18 == T4_W && f2 == 0)                         /* 4K rebuild: re-narrow for 10-bit */
+    int is4k = w18 == T4_W || (T4_DCOLS && w18 == T4_WN);
+    uint32_t wset = w18 == T4_W ? T4_WSET : T4_WSETN;
+    int is10 = w18 == T4_WSET || (T4_DCOLS && w18 == T4_WSETN);
+    if (is4k && f2 == 0)                                /* 4K rebuild: re-narrow for 10-bit */
     {
-        uint32_t o = cli(); MEM(T4_PATH + 0x18) = T4_WSET; sei(o);
+        uint32_t o = cli(); MEM(T4_PATH + 0x18) = wset; sei(o);
         (*narrowed)++;
         return 1;
     }
-    if (w18 != T4_W && w18 != T4_WSET && f2 == 0)       /* other mode (magnify): no 10-bit width -> 14-bit */
+    if (!is4k && !is10 && f2 == 0)                      /* other mode (magnify): no 10-bit width -> 14-bit */
     {
         uint32_t o = cli(); MEM(T4_PATH + 0x6c) = 2; MEM(T4_PATH + 0x70) = 1; sei(o);
         (*reflex14)++;
         return 1;
     }
-    if (w18 == T4_W && f2 == 2)                         /* back in 4K at 14-bit (only 4K has w 4256): 10-bit */
+    if (is4k && f2 == 2)                                /* back in 4K at 14-bit: 10-bit */
     {
-        uint32_t o = cli(); MEM(T4_PATH + 0x18) = T4_WSET; MEM(T4_PATH + 0x6c) = 0; MEM(T4_PATH + 0x70) = 0; sei(o);
+        uint32_t o = cli(); MEM(T4_PATH + 0x18) = wset; MEM(T4_PATH + 0x6c) = 0; MEM(T4_PATH + 0x70) = 0; sei(o);
         (*narrowed)++;
         return 1;
     }
@@ -557,7 +566,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.97 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.98 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -731,7 +740,7 @@ static void t4_task(void *unused)
     /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
     t4_log("variant: %s; tap flags 0x1311c+4 %d, Mem1Path +40 %d, +50 %d\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap",
            (int)MEM(0x1311C + 4), (int)MEM(T4_PATH + 0x40), (int)MEM(T4_PATH + 0x50));
-    if ((T4_DCOLS || T4_DHD) && t4_tap) { snprintf(t4_result, sizeof(t4_result), "width test needs the no-tap variant (v4.93)"); goto out; }
+    if ((T4_DCOLS || T4_DHD) && t4_tap && T4_DCOLS != 64) { snprintf(t4_result, sizeof(t4_result), "tapped width test: +64 only (v4.98)"); goto out; }
     if (!t4_tap && (MEM(0x1311C + 4) || MEM(T4_PATH + 0x40)))
     {
         /* v4.67: camera v4.66 ran "no tap" with the tap on (RAW zebras/histogram keep lv_save_raw on in movie LV) */
@@ -872,12 +881,12 @@ static void t4_task(void *unused)
         /* v4.71: every 8th row of 0..2139 (whole-frame preview) + every row 2140..h-1 (old edge + new rows),
          * written in 16-row chunks (no big buffer) */
         int hh = T4_H + T4_DROWS, nsp = 2140 / 8, nct = hh - 2140, ok = 0;
-        uint8_t *buf = fio_malloc(16 * T4_PITCH);
-        char fn[32]; snprintf(fn, sizeof(fn), T4_BIN, hh, t4_d68 ? "C" : "");
+        uint8_t *buf = fio_malloc(16 * T4_PITCHN);
+        char fn[32]; snprintf(fn, sizeof(fn), T4_BIN, T4_DCOLS ? (int)T4_WN : hh, T4_DCOLS ? "W" : t4_d68 ? "C" : "");
         FILE *f = buf ? FIO_CreateFile(fn) : 0;
         if (f)
         {
-            uint32_t hdr[16] = { 0x4b344c54 /* "TL4K" */, T4_W, hh, 10, T4_PITCH, 0, 8, nsp, 2140, nct, 2 /* layout */ };
+            uint32_t hdr[16] = { 0x4b344c54 /* "TL4K" */, T4_WN, hh, 10, T4_PITCHN, 0, 8, nsp, 2140, nct, 2 /* layout */ };
             FIO_WriteFile(f, hdr, 64);
             int tot = nsp + nct;
             for (int i = 0; i < tot; i += 16)
@@ -886,9 +895,9 @@ static void t4_task(void *unused)
                 for (int k = 0; k < n; k++)
                 {
                     int j = i + k, row = j < nsp ? j * 8 : 2140 + (j - nsp);
-                    memcpy(buf + k * T4_PITCH, (void *)(T4_MEM1 + row * T4_PITCH), T4_PITCH);
+                    memcpy(buf + k * T4_PITCHN, (void *)(T4_MEM1 + row * T4_PITCHN), T4_PITCHN);
                 }
-                if (FIO_WriteFile(f, buf, n * T4_PITCH) != n * T4_PITCH) break;
+                if (FIO_WriteFile(f, buf, n * (int)T4_PITCHN) != n * (int)T4_PITCHN) break;
                 ok += n;
             }
             FIO_CloseFile(f);
@@ -896,10 +905,10 @@ static void t4_task(void *unused)
         }
         else t4_log("row dump: no buffer or file\n");
         if (buf) fio_free(buf);
-        snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", T4_W, (int)m1h2);
+        snprintf(t4_result, sizeof(t4_result), "MEM1 %dx%d at 10-bit: rows saved", (int)T4_WN, (int)m1h2);
     }
     else if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
-        snprintf(t4_result, sizeof(t4_result), "%dx%d on", T4_W, (int)m1h2);
+        snprintf(t4_result, sizeof(t4_result), "%dx%d on", (int)T4_WN, (int)m1h2);
     else if (!t4_tap && (T4_DCOLS || T4_DHD)) snprintf(t4_result, sizeof(t4_result), "OK: survived +%d cols, HD +%d", T4_DCOLS, T4_DHD);
     else if (!t4_tap) snprintf(t4_result, sizeof(t4_result), "no tap: survived the taller rebuild (+1c %d)", (int)MEM(T4_PATH + 0x1c));
     else snprintf(t4_result, sizeof(t4_result), "%s MEM1 h %d, pairs %d", stalled ? "STALL," : "", (int)m1h2, np);
@@ -1098,12 +1107,13 @@ static void t4_wselect(void *priv, int delta)
     int v = priv ? *(int *)priv : 2;
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
     if (t4_pmode) { NotifyBox(3000, "Set 4K frame height to Normal first"); return; }
-    t4_persist_run = 0; t4_dump = 0; t4_tap = 0;
+    t4_persist_run = 0; t4_dump = 0; t4_tap = 0; t4_hold = 0;   /* v4.98: never hold a test width */
     t4_drows = 0; t4_dcols = v == 1 ? 0 : 64; t4_dhd = 16;
+    if (v == 3) { t4_tap = 1; t4_dump = 1; }   /* v4.98: tapped +64, rows saved to ML/LOGS/T4_4320W.BIN */
     t4_d68 = 0; t4_d69 = 0;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
-    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : "Wider 4K +64: close the ML menu to start");
+    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : v == 3 ? "Wider 4K +64 (raw tap): close the ML menu" : "Wider 4K +64: close the ML menu to start");
 }
 static void t4_select(void *priv, int delta)
 {
@@ -1283,7 +1293,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
-static int t4_one = 1, t4_zero = 0, t4_two = 2;
+static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3;
 static struct menu_entry t4_menu[] = {
     {
         .name     = "Taller 4K tests",
@@ -1385,6 +1395,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v4.97: +64 columns (4320), longer line, + D0510 block (v4.93/v4.96 missed it).",
                 .help2  = "Auto magnify, ~5 s wider, then back. Global Draw OFF, Movie 4K 23.98p. ML/LOGS/TALL4K.TXT.",
+            },
+            {
+                .name   = "Wider 4K +64, raw tap",
+                .priv   = &t4_three,
+                .select = t4_wselect,
+                .update = t4_update,
+                .help   = "v4.98: +64 columns with the longer line, ML's raw tap at 10-bit; saves rows to",
+                .help2  = "ML/LOGS/T4_4320W.BIN (are the new columns real image?). Movie 4K 23.98p, Global Draw OFF.",
             },
             MENU_EOL,
         },
