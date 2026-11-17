@@ -28,8 +28,9 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crxtest_r.o   # v4.17 lossless 4K step 2
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/romremap_r.o   # v4.51 shared ROM remap (silent burst fps patch)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rackfocus_r.o  # v4.56 Focus > Rack focus (stored points, lens-distance loop)
-# v4.80: sensreg_r.o (Debug > Sensor regs log, v4.58-v4.60) left out for Canon heap; re-add for the wider-4K stage
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/tall4k_r.o     # v4.61 Debug > Taller 4K (test): first sensor-window write
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/sensreg_r.o    # v4.58 Debug > Sensor regs log (read-only); back in v4.88 for the wider-4K stage
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/tall4k_r.o     # v4.61 taller 4K: Movie > RAW video (R) > 4K frame height + Debug > Taller 4K tests
+# v4.88: test-only code in crxtest_r / silenttest_r / rectest_r / tall4k_r sits under #ifdef R_TESTS (not built)
 # v4.55: dualiso_r.o (Shoot > Dual ISO (test)) left out: no per-line ISO control found on the R (parked 2026-11-11);
 # the source stays for reference (skill references/dual-iso.md)
 # v3.16: audprobe_r.o (Debug > Audio probe) and memsurvey_r.o (Debug > Memory survey) left out: finished test

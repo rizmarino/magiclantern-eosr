@@ -335,15 +335,19 @@ static void st_dump_events(void)
 }
 
 /* ---- settings ---- */
+#if defined(R_TESTS) || defined(ST_HOST)
 static int st_watch_sel = 1;            /* 30 / 90 / 180 s */
 static const int st_watch_s[] = { 30, 90, 180 };
 static int st_mode_sel = 0;             /* 0 paced, 1 retry */
 static int st_nsel = 1;                 /* 5 / 10 / 20 / 200 shots (200: burst log buffer test) */
 static const int st_nshots[] = { 5, 10, 20, 200 };
+#endif
 static int st_dm_sel = 0;               /* Canon log; v1.5: default OFF (heavy DbgMgr logging is a suspect in 3 crashes) */
 
 static volatile int st_busy;
+#if defined(R_TESTS) || defined(ST_HOST)
 static int st_runs;
+#endif
 static char st_last[64] = "";
 
 static int st_menu_wait(void)
@@ -441,6 +445,7 @@ static void st_save(int run)
 }
 
 /* ---- prop watch ---- */
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void st_watch_task(void *unused)
 {
     int run = ++st_runs;
@@ -463,6 +468,7 @@ static void st_watch_task(void *unused)
     st_busy = 0;
 }
 
+#endif
 /* ---- shot test ---- */
 static uint32_t st_rel0, st_file0;
 
@@ -534,6 +540,7 @@ static int st_runaway_stop(int presses)
 
 struct st_shot { uint16_t press, hold; uint32_t t_press, t_acc; uint8_t step, after_probe; };
 
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void st_shot_task(void *unused)
 {
     int run = ++st_runs;
@@ -711,6 +718,7 @@ static void st_shot_task(void *unused)
  * v1.3-v1.5 kept ~150 KB in ML (Canon short of user_mem: full-buffer lock-ups / Err 70); v1.6/1.7 took ~148 KB from
  * Canon's AllocateMemory pool (crash while the buffer cleared). Values change by writing the RAM page directly:
  * no MMU work, no interrupts-off section after the first setup. Gone at power off, never written to flash. */
+#endif
 #if defined(CONFIG_MMU) && !defined(ST_HOST)
 #define ST_REMAP
 #endif
@@ -898,6 +906,7 @@ static void st_fps_boot_task(void *unused)
 #endif
 
 /* ---- burst log (v1.2): the user holds the shutter in High-speed continuous; ML never presses ---- */
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void st_burst_task(void *unused)
 {
     int run = ++st_runs;
@@ -1029,6 +1038,8 @@ static void st_burst_task(void *unused)
     st_busy = 0;
 }
 
+#endif
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void st_start(void (*task)(void *), const char *name)
 {
     if (st_busy) { NotifyBox(3000, "Silent test: previous run still busy (waiting for the card?)"); return; }
@@ -1039,11 +1050,14 @@ static void st_start(void (*task)(void *), const char *name)
     task_create(name, 0x1e, 0x2000, task, 0);
 }
 
+#endif
 #ifndef ST_HOST
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static MENU_SELECT_FUNC(st_watch_select) { st_start(st_watch_task, "st_watch"); }
 static MENU_SELECT_FUNC(st_shot_select)  { st_start(st_shot_task, "st_shots"); }
 static MENU_SELECT_FUNC(st_burst_select) { st_start(st_burst_task, "st_burst"); }
 
+#endif
 static MENU_SELECT_FUNC(st_fps_select)
 {
     if (st_busy) return;                /* not while a test runs */
@@ -1082,6 +1096,7 @@ static MENU_UPDATE_FUNC(st_burst_update)
     else MENU_SET_VALUE(st_fps_applied ? "%d.%d fps" : "Canon %d.%d", v / 100, (v / 10) % 10);
 }
 
+#if defined(R_TESTS) || defined(ST_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static MENU_UPDATE_FUNC(st_update)
 {
     if (st_busy)
@@ -1152,6 +1167,7 @@ static struct menu_entry st_menu[] = {
     },
 };
 
+#endif
 static struct menu_entry st_shoot_menu[] = {
     {
         .name   = "Silent burst",
@@ -1188,7 +1204,9 @@ static struct menu_entry st_shoot_menu[] = {
 static void st_init(void *unused)
 {
     menu_add("Shoot", st_shoot_menu, COUNT(st_shoot_menu));
+#ifdef R_TESTS
     menu_add("Debug", st_menu, COUNT(st_menu));
+#endif
 #ifdef ST_REMAP
     task_create("st_fps_boot", 0x1e, 0x1000, st_fps_boot_task, 0);
     task_create("st_fb", 0x1d, 0x800, st_fb_task, 0);

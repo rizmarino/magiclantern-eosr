@@ -48,7 +48,9 @@ static inline uint32_t cx_cpu(uint32_t a) { return (a & 0x3FFFFFFF) | CX_UNC; }
  * (CreateMemorySuite on each ring entry, e055c7ba), whose DMA reads them. v4.19 saves the chunks the same way: ML's
  * FIO_WriteFile passes addresses >= 0x40000000 through unchanged to Canon's _FIO_WriteFile. */
 
+#ifdef R_TESTS
 static char cx_last[64] = "not run";
+#endif
 static void cx_reinit(int bpp);
 static void cx_release_cfg(void);
 static volatile int cx_running;
@@ -89,6 +91,7 @@ static void cx_cb(void *ctx, uint32_t *handles)
     give_semaphore(cx_sem);
 }
 
+#ifdef R_TESTS   /* v4.88 cleanup: test tool, not built (define R_TESTS to rebuild it) */
 static uint32_t cx_sum(uint32_t base, uint32_t pitch, uint32_t h)
 {
     uint32_t s = 0;
@@ -226,6 +229,7 @@ out:
     cx_running = 0;
 }
 
+#endif /* R_TESTS */
 /* ======================= v4.20: Debug > "CRX stream test" (lossless 4K step 3) =======================
  * 1. memory: how much shoot memory ML's recorder could get (16 MB contiguous chunks, the recorder's own
  *    allocation, capped at 24 = 384 MB, freed at once) - before the first encode, after the encodes, and after
@@ -237,6 +241,7 @@ out:
  * Per-frame numbers go to ML/LOGS/CRXSTRM.TSV, the summary to ML/LOGS/CRXTEST.LOG. */
 
 #define CX_FREEALL ((int (*)(void))0xE066B593)
+#ifdef R_TESTS   /* v4.88 cleanup: test tool, not built (define R_TESTS to rebuild it) */
 #define CX_MAXF 600
 static struct cx_fr { uint8_t phase, bpp; uint16_t n; uint32_t enc_us, wr_us, bytes, copy_us, free_us, cyc_us; } *cx_f;   /* malloc'd per run */
 static int cx_nf;
@@ -290,6 +295,7 @@ static uint32_t cx_frame_bytes(uint32_t *hd, uint32_t *n_out)
     return t;
 }
 
+#endif /* R_TESTS */
 static int cx_wait(int ms) { return take_semaphore(cx_sem, ms); }
 
 /* v4.22: algsmgrEncInit (e02f4136) configures encoder id N only while mgr+0x124+4N is 0, then sets it to 1, and
@@ -362,6 +368,7 @@ static uint32_t *cx_enc1(uint32_t w, uint32_t h, uint32_t bpp, uint32_t addr, ui
     return cx_hq[c0 & 15];
 }
 
+#ifdef R_TESTS
 static void cx_stats(int phase, int bpp, uint32_t w, uint32_t h, int from, uint32_t wall_ms)
 {
     uint32_t n = cx_nf - from, mn = ~0u, mx = 0; uint64_t se = 0, sb = 0, sw = 0;
@@ -666,8 +673,10 @@ static MENU_UPDATE_FUNC(cx_stream_update)
 extern int r_m2m_open(void);
 extern int r_m2m_copy(uint32_t src, uint32_t src_pitch, uint32_t dst, uint32_t row_bytes, uint32_t rows, uint32_t *dma_us);
 extern void r_m2m_close(void);
+#endif /* R_TESTS */
 static int (*const HPCopy)(void *dst, void *src, uint32_t len) = (void *)0xE0328A33;   /* System::HPCopy.c */
 
+#ifdef R_TESTS
 #define AL4K(x) (((x) + 4095) & ~4095u)
 #define AL64(x) (((x) + 63) & ~63u)
 static struct memSuite *pl_suite[2];
@@ -954,6 +963,7 @@ static MENU_UPDATE_FUNC(pl_update)
     MENU_SET_WARNING(MENU_WARN_INFO, "4K movie mode, LV on, not recording. Writes ~250 MB under ML/.");
 }
 
+#endif /* R_TESTS */
 /* ======================= v4.25: lossless recorder API (rectest_r.c, Movie > RAW video > Compression) =============
  * Same rules the tests proved (STEP1.md steps 2-3b): encode a copy, never the live MEM1; re-init the encoder for the
  * clip's size/depth (flag cleared at begin); wait for each free before the next start; HPCopy the output out (the CPU
@@ -1070,6 +1080,7 @@ void crx_rec_end(void)
     cx_cfg_bpp = 0;
 }
 
+#ifdef R_TESTS   /* v4.88 cleanup: test tool, not built (define R_TESTS to rebuild it) */
 static MENU_SELECT_FUNC(cx_select)
 {
     if (cx_running) return;
@@ -1083,6 +1094,8 @@ static MENU_UPDATE_FUNC(cx_update)
     MENU_SET_WARNING(MENU_WARN_INFO, "4K movie mode, LV on, not recording. Restart the camera if it says TIMEOUT.");
 }
 
+#endif /* R_TESTS */
+#ifdef R_TESTS   /* v4.88 cleanup: test tool, not built (define R_TESTS to rebuild it) */
 static struct menu_entry cx_menu[] = {
     { .name = "CRX encode test", .select = cx_select, .update = cx_update, .icon_type = IT_ACTION },
     { .name = "CRX stream test", .select = cx_stream_select, .update = cx_stream_update, .icon_type = IT_ACTION },
@@ -1091,3 +1104,4 @@ static struct menu_entry cx_menu[] = {
 
 static void cx_init(void *unused) { menu_add("Debug", cx_menu, COUNT(cx_menu)); }
 INIT_FUNC("crx_test", cx_init);
+#endif /* R_TESTS */

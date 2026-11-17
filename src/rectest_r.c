@@ -3740,6 +3740,7 @@ static uint32_t pk_hash(const uint8_t *p, int n)
     return h;
 }
 
+#if defined(R_TESTS) || defined(RT_HOST)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void rt_pack_task(void *unused)
 {
     static const struct { uint8_t f2, f3, bpp; } combos[] = {   /* first = Canon's default */
@@ -3862,6 +3863,7 @@ static MENU_SELECT_FUNC(rt_pack_select)
     task_create("rt_pack", 0x1e, 0x2000, rt_pack_task, 0);
 }
 
+#endif
 static MENU_SELECT_FUNC(rt_select)
 {
     if (rt_busy) return;
@@ -4167,6 +4169,7 @@ static struct menu_entry sp_menu[] = {
     },
 };
 
+#ifdef R_TESTS
 static struct menu_entry rt_menu[] = {
     {
         .name   = "LV record test",
@@ -4226,6 +4229,33 @@ static struct menu_entry rt_menu[] = {
         },
     },
 };
+#else
+static struct menu_entry rt_menu[] = {
+    {
+        .name   = "RAW video diagnostics",
+        .select = menu_open_submenu,
+        .help   = "Extra logging for Movie > RAW video (R) clips (v4.88: the fixed-length test runs, BIN format",
+        .help2  = "and pack test are left out of the build; R_TESTS brings them back).",
+        .children = (struct menu_entry[]) {
+            {
+                .name    = "REC diagnostics",
+                .priv    = &rr_diag,
+                .max     = 1,
+                .help    = "ON: REC-button clips also write test files: ML/RTnn.IDX/.SYN, ML/RRKEYS.TXT, the full",
+                .help2   = "log and USB copies in DCIM. REC button switch: Movie > RAW video (R).",
+            },
+            {
+                .name    = "Sync",
+                .priv    = &rt_sync_sel,
+                .max     = 2,
+                .choices = CHOICES("auto", "IRQ", "timer"),
+                .help    = "Frame sync for clips. auto: frame-end IRQ if the survey shows it works, else HPTimer.",
+            },
+            MENU_EOL,
+        },
+    },
+};
+#endif
 
 /* ---- export for USB: over PTP the R shows only files in DCIM/100EOS_R with
  * image-like names (v13.2 probe: RTPB0002.JPG visible; .TXT files, MISC and the
@@ -4392,6 +4422,7 @@ static int rt_read_int(const char *name, int dflt)
     return any ? v : dflt;
 }
 
+#if defined(R_TESTS) || defined(RT_HOST)   /* v4.88 cleanup: unattended plan runs (ML/RTAUTO), not built */
 static void rt_write_int(const char *name, int v)
 {
     char t[16];
@@ -4462,6 +4493,8 @@ static void rt_auto_task(void *unused)
     NotifyBox(10000, "Record test auto: plan %d of %d DONE (%d runs)", pos + 1, np, n);
 }
 
+#endif
+
 static void rt_init(void *unused)
 {
     task_create("rr_status", 0x1f, 0x1000, rr_status_task, 0);
@@ -4470,7 +4503,9 @@ static void rt_init(void *unused)
     menu_add("Debug", rt_menu, COUNT(rt_menu));
     menu_add("Shoot", sp_menu, COUNT(sp_menu));     /* v20 */
     task_create("sp_watch", 0x1f, 0x1000, sp_watch_task, 0);
+#ifdef R_TESTS
     task_create("rt_auto", 0x1e, 0x2000, rt_auto_task, 0);
+#endif
 }
 
 INIT_FUNC("rectest", rt_init);

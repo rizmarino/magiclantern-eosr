@@ -74,7 +74,7 @@ static const struct { uint32_t a, v; } t4_eng[] = {
 static int t4_sel;                      /* menu: 0 +40, 1 +200, 2 +400, 3 +480, 4 +560 */
 static const int t4_steps[5] = { 40, 200, 400, 480, 560 };
 static int t4_drows = 40;
-static int t4_place;
+static int t4_place = 1;                /* v4.88: centred by default (the mode's placement) */
 static int t4_hold;                     /* v4.75 menu: 0 revert after the test, 1 hold the taller frame for recording */
 static volatile int t4_holding;         /* v4.75: taller 4K path up, owned by this test (rectest_r.c asks) */
 int tall4k_active(void) { return t4_holding; }                    /* v4.74 menu: 0 bottom (start reg 0x68 unchanged), 1 centred */
@@ -225,7 +225,7 @@ static void t4_restore_all(void)
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
-static int t4_auto;                     /* v4.77 menu: 0 manual magnify, 1 ML requests magnify in/out itself */
+static int t4_auto = 1;                 /* v4.77: 1 ML requests magnify in/out itself (v4.88: always; 0 = manual, R_TESTS menu) */
 static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
 /* v4.79 persistent mode (Debug > Taller 4K mode, kept in magic.cfg): a watcher switches 4K 23.98p movie LV to the
  * taller frame by itself and back before anything that could rebuild 4K at another size or rate. */
@@ -822,6 +822,7 @@ static MENU_UPDATE_FUNC(t4_update)
 /* v4.77: Debug > Auto magnify test: no patches; ML requests magnify x5 and back via PROP_LV_DISPSIZE (first runtime
  * use on the R) and logs Canon's mode / MEM1 every 50 ms around each request. */
 static volatile int t4_zt_running;
+#if defined(R_TESTS)   /* v4.88 cleanup: Debug test tool, not built in the camera build */
 static void t4_zt_watch(int ms, int want)
 {
     uint32_t t0 = get_ms_clock(), tl = 0; int last = -1, lastd = -1;
@@ -867,6 +868,7 @@ static MENU_SELECT_FUNC(t4_zt_select)
     task_create("t4zoom", 0x1d, 0x1000, t4_zt_task, 0);
     NotifyBox(4000, "Auto magnify test: close the ML menu to start");
 }
+#endif
 extern int rawrec_running(void);
 static MENU_SELECT_FUNC(t4_end_select)
 {
@@ -997,12 +999,15 @@ static struct menu_entry t4_menu[] = {
                 .help    = "Hold: keep the taller frame after the checks, record with Movie > RAW video (LL 10-bit),",
                 .help2   = "then stop recording and magnify x5 + exit to restore. Resets to Revert at power-on.",
             },
+#ifdef R_TESTS
             {
                 .name    = "Auto magnify test",
                 .select  = t4_zt_select,
                 .help    = "v4.77: ML magnifies x5 and back by itself (no sensor changes). Movie 4K LV.",
                 .help2   = "Result on screen and in ML/LOGS/TALL4K.TXT.",
             },
+#endif
+#ifdef R_TESTS
             {
                 .name    = "Taller 4K magnify",
                 .priv    = &t4_auto,
@@ -1010,6 +1015,7 @@ static struct menu_entry t4_menu[] = {
                 .choices = CHOICES("Manual", "Auto"),
                 .help    = "Auto: the test magnifies in/out by itself (v4.77). Resets to Manual at power-on.",
             },
+#endif
             {
                 .name    = "End taller 4K",
                 .select  = t4_end_select,
@@ -1021,7 +1027,7 @@ static struct menu_entry t4_menu[] = {
                 .max     = 1,
                 .choices = CHOICES("Bottom", "Centred"),
                 .help    = "Bottom: extra rows below Canon's 4K window. Centred: half above, half below (v4.74).",
-                .help2   = "Centred shifts Canon's live view picture slightly. Resets to Bottom at power-on.",
+                .help2   = "Centred = the 4K frame height mode's placement (default since v4.88).",
             },
             {
                 .name   = "Taller 4K (test)",
