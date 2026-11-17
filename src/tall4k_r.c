@@ -68,7 +68,9 @@ static uint32_t *t4s_var[2];
  * Fit = Squeeze + output width [2] and [12] narrowed to keep the aspect (3840 * 2166 / (2166 + rows), /16). */
 static const uint32_t t4_vo[2] = { 0xE1225288, 0xE1225354 };
 static uint32_t *t4s_vout[2];
-CONFIG_INT("t4.prev", t4_preview, 0);   /* v4.91 Movie > RAW video (R) > 4K preview: 0 Centre, 1 Whole frame (squeezed); 2 Fit = R_TESTS only (froze) */
+int t4_preview;                         /* v4.89 preview test, R_TESTS only (Debug > Taller 4K tests): 0 Centre, 1 Squeeze,
+                                         * 2 Fit. Camera: Squeeze only moved the 2166-row LV window up (valid-area h is
+                                         * ignored, v4.91 photos), Fit froze (v4.90). v4.92: always Centre otherwise. */
 static int t4_preview_run;              /* preview the held frame was applied with */
 
 #define T4_NYUV     4
@@ -445,7 +447,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.91 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.92 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -563,7 +565,7 @@ static void t4_task(void *unused)
         t4s_vout[k] = o;
     }
 #ifndef R_TESTS
-    if (t4_preview > 1) t4_preview = 1;    /* v4.91: Fit froze the camera (v4.90); not offered */
+    t4_preview = 0;                        /* v4.92: Squeeze / Fit didn't work (see t4_preview) */
 #endif
     t4_log("preview: %s (valid area y %d h %d, output w %d)\n", t4_preview == 2 ? "fit" : t4_preview ? "squeeze" : "centre",
            t4_preview ? 47 : 47 + 2 * t4_d68, t4_preview ? 2166 + (int)T4_DROWS : 2166, t4_preview == 2 ? (int)t4_fit_w() : 3840);
@@ -775,7 +777,7 @@ revert:
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
-                if (t4_persist_run) NotifyBox(4000, t4_preview ? "Taller 4K %dx%d (whole frame, squeezed)" : "Taller 4K %dx%d", T4_W, T4_H + T4_DROWS);
+                if (t4_persist_run) NotifyBox(4000, "Taller 4K %dx%d", T4_W, T4_H + T4_DROWS);
                 else NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
@@ -1078,7 +1080,7 @@ static struct menu_entry t4_menu[] = {
                 .priv    = &t4_preview,
                 .max     = 2,
                 .choices = CHOICES("Centre", "Squeeze", "Fit"),
-                .help    = "Screen: Centre = 16:9 centre of the taller frame. Squeeze = whole frame, squashed (v4.89 test).",
+                .help    = "Screen test: Squeeze = valid-area h (ignored: only moves the window up, v4.91).",
                 .help2   = "Fit FROZE the camera (v4.90). Also used by 4K frame height. Not saved.",
             },
 #endif
