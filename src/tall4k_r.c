@@ -507,7 +507,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.93 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.94 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -937,6 +937,78 @@ out:
     }
 }
 
+
+/* v4.94 read-only width census (camera v4.93: +64 cols froze ~50-100 ms after the wider rebuild): record every word in
+ * low RAM 0x1000..0x2400000 (mapped: TTBR0 core L1 0-32 MB, TTBR1 supersection 0x02) whose low or high 16 bits is a
+ * 4K width encoding, then magnify x5 (auto) and log the ones that changed: mode-dependent width consumers. Then
+ * magnify out. Writes nothing but the log (and Canon's own magnify). */
+static const uint16_t t4_cw[] = { 4256, 4255, 4254, 4252, 4250, 4248, 4112, 4104, 4100, 8508, 8510, 8512, 2128, 2127, 5320, 3040 };
+static int t4_cmatch(uint32_t v)
+{
+    uint16_t lo = v & 0xffff, hi = v >> 16;
+    for (unsigned k = 0; k < sizeof(t4_cw) / 2; k++) if (lo == t4_cw[k] || hi == t4_cw[k]) return 1;
+    return 0;
+}
+static volatile int t4_cs_running;
+static void t4_census_task(void *unused)
+{
+    for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
+    t4_log("=== width census (v4.94) at %d ms: lv %d, mode %d, MEM1 %dx%d +18 %d\n", (int)get_ms_clock(), lv,
+           (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
+    const int NMAX = 6000;
+    uint32_t *ad = malloc(NMAX * 8);
+    if (!lv || gui_menu_shown() || MEM(T4_STATE + 0xc) != 12 || lv_dispsize != 1 || !ad)
+    {
+        t4_log("not started (needs 4K movie LV x1, menu closed; mem %d)\n", ad != 0);
+        NotifyBox(5000, "Width census: needs 4K movie LV, menu closed");
+        if (ad) free(ad);
+        t4_cs_running = 0; return;
+    }
+    uint32_t *va = ad + NMAX;   /* second half: values */
+    int n = 0, over = 0;
+    uint32_t t0 = get_ms_clock();
+    for (uint32_t a = 0x1010; a < 0x2400000 - 0x10; a += 4)   /* neighbours a-8..a+8 stay inside the mapped range */
+    {
+        uint32_t v = MEM(a);
+        if (!t4_cmatch(v)) continue;
+        if ((a >= (uint32_t)ad && a < (uint32_t)(ad + 2 * NMAX))) continue;   /* our own table */
+        if (n < NMAX) { ad[n] = a; va[n] = v; n++; } else over++;
+    }
+    t4_log("census 4K: %d hits (%d over the cap) in %d ms\n", n, over, (int)(get_ms_clock() - t0));
+    NotifyBox(3000, "Width census: magnify...");
+    t4_zoom(5);
+    for (int k = 0; k < 100 && MEM(T4_STATE + 0xc) != 13; k++) msleep(20);
+    msleep(1500);
+    int m = (int)MEM(T4_STATE + 0xc), nch = 0;
+    t4_log("magnify: mode %d, MEM1 %dx%d +18 %d\n", m, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
+    for (int i = 0; i < n; i++)
+    {
+        uint32_t now = MEM(ad[i]);
+        if (now == va[i]) continue;
+        nch++;
+        uint32_t a = ad[i];
+        t4_log("  chg %08x: %x -> %x | %x %x [%x] %x %x\n", (int)a, (int)va[i], (int)now, (int)MEM(a - 8), (int)MEM(a - 4),
+               (int)now, (int)MEM(a + 4), (int)MEM(a + 8));
+    }
+    t4_log("census: %d of %d changed in magnify (mode %d)\n", nch, n, m);
+    t4_zoom(1);
+    for (int k = 0; k < 150 && !(MEM(T4_STATE + 0xc) == 12 && lv_dispsize == 1); k++) msleep(20);
+    msleep(1500);
+    int back = 0;
+    for (int i = 0; i < n; i++) if (MEM(ad[i]) != va[i]) back++;
+    t4_log("back in 4K: mode %d, %d of %d still differ from the first 4K scan\n", (int)MEM(T4_STATE + 0xc), back, n);
+    free(ad);
+    NotifyBox(6000, "Width census: done, %d of %d changed", nch, n);
+    t4_cs_running = 0;
+}
+static void t4_cselect(void *priv, int delta)
+{
+    if (t4_running || t4_cs_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
+    if (t4_pmode) { NotifyBox(3000, "Set 4K frame height to Normal first"); return; }
+    t4_cs_running = 1;
+    task_create("t4census", 0x1e, 0x1000, t4_census_task, 0);
+    NotifyBox(4000, "Width census: close the ML menu to start");
+}
 static void t4_wselect(void *priv, int delta)
 {
     /* v4.93: Debug > Taller 4K tests > Wider 4K, no raw tap: +64 columns, normal height, no tap (Global Draw OFF) */
@@ -1208,10 +1280,17 @@ static struct menu_entry t4_menu[] = {
                 .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
             },
             {
+                .name   = "Width census",
+                .select = t4_cselect,
+                .update = t4_update,
+                .help   = "v4.94 read-only: logs RAM words holding the 4K width that change when magnify comes on",
+                .help2  = "(auto magnify in/out). Movie 4K LV, menu closed. ML/LOGS/TALL4K.TXT.",
+            },
+            {
                 .name   = "Wider 4K, no raw tap",
                 .select = t4_wselect,
                 .update = t4_update,
-                .help   = "v4.93 first width test: +64 columns (4320), normal height, ML's raw tap off. Auto magnify",
+                .help   = "v4.93 first width test (FROZE 50-100 ms after the switch): +64 columns, no raw tap.",
                 .help2  = "in/out, ~5 s wider, then back. Global Draw OFF, Movie 4K 23.98p. ML/LOGS/TALL4K.TXT.",
             },
             MENU_EOL,
