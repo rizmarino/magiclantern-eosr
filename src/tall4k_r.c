@@ -60,6 +60,17 @@
  * 240 rows higher. Shifted like the YUV crop (y + rows/2, in_h = real height) through the ROM remap. */
 static const uint32_t t4_va[2] = { 0xE12250B8, 0xE12251C0 };
 static uint32_t *t4s_var[2];
+/* v4.89: per-mode table 0xE1224CC8 (20-byte entries {flag, 0, valid area*, out*, out*}) pairs each valid-area record
+ * with a 17-word output record; 4K: 0xE1225288 / 0xE1225354 {4, 3, 3840, 2160, 1, 1, 1, 1, 0x10001, 3840, 0, 0,
+ * 3840, 2160, 1, 1, 0} (hypothesis: the LV YUV / display picture the valid area is resized to).
+ * Debug > Taller 4K tests > Taller 4K preview (not saved): Centre = v4.84 (16:9 centre of the frame on screen);
+ * Squeeze = valid area covers the whole picture (h 2166 + rows, y 47): whole frame on screen, squeezed vertically;
+ * Fit = Squeeze + output width [2] and [12] narrowed to keep the aspect (3840 * 2166 / (2166 + rows), /16). */
+static const uint32_t t4_vo[2] = { 0xE1225288, 0xE1225354 };
+static uint32_t *t4s_vout[2];
+static int t4_preview;                  /* 0 Centre, 1 Squeeze, 2 Fit; not saved */
+static int t4_preview_run;              /* preview the held frame was applied with */
+
 #define T4_NYUV     4
 /* v4.68: 4K engine init values in the FROM blob ({reg, value} lists) that carry the frame height; v4.64-v4.67 left
  * them at 2214, incl. the 0xD0411xxx block (sensor input side?) at h+1 = 2215. Value address (ROM), Canon's value. */
@@ -84,6 +95,7 @@ static int t4_d68, t4_d69;              /* change of 0x68 / 0x69 in 2-row units 
 #define T4_H        2214
 #define T4_WSET     3040                /* 10-bit width field: (3040 * 14) >> 3 = 5320 = 4256 * 10 / 8 */
 #define T4_PITCH    5320
+static uint32_t t4_fit_w(void) { return (3840 * 2166 / (2166 + T4_DROWS)) & ~15u; }   /* v4.89 Fit preview width */
 static uint32_t t4_eng_new(uint32_t v) { return v < 0x10000 ? v + T4_DROWS : v + (T4_DROWS << 16); }
 
 static volatile int t4_running;
@@ -197,7 +209,14 @@ static void t4_apply_all(void)
         t4_put(&e[5], 58 + 2 * t4_d68);
     }
     for (int k = 0; k < 2; k++)
-        if (t4s_var[k]) { t4s_var[k][1] = T4_H + T4_DROWS; t4s_var[k][4] = 47 + 2 * t4_d68; romremap_flush(t4s_var[k], 20); }
+        if (t4s_var[k])
+        {
+            t4s_var[k][1] = T4_H + T4_DROWS;
+            if (t4_preview) { t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166 + T4_DROWS; }
+            else t4s_var[k][4] = 47 + 2 * t4_d68;
+            romremap_flush(t4s_var[k], 44);
+            if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4s_vout[k][12] = t4_fit_w(); romremap_flush(t4s_vout[k], 68); }
+        }
 }
 
 static void t4_restore_all(void)
@@ -221,7 +240,12 @@ static void t4_restore_all(void)
         t4_put(&e[5], 58);
     }
     for (int k = 0; k < 2; k++)
-        if (t4s_var[k]) { t4s_var[k][1] = T4_H; t4s_var[k][4] = 47; romremap_flush(t4s_var[k], 20); }
+        if (t4s_var[k])
+        {
+            t4s_var[k][1] = T4_H; t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166;
+            romremap_flush(t4s_var[k], 44);
+            if (t4s_vout[k]) { t4s_vout[k][2] = t4s_vout[k][12] = 3840; romremap_flush(t4s_vout[k], 68); }
+        }
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
@@ -276,7 +300,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         {
             /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
              * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
-            int ch = t4_pmode != t4_pmode_run;
+            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run;   /* v4.89: a preview change re-applies too */
             if (ch != mchg)
             {
                 mchg = ch;
@@ -343,9 +367,9 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             t4_applied = 1; t4_pend_apply = 0;
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
-            t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, AF area h %d y %d, full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
+            t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, AF area h %d y %d (area h %d, out w %d), full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
                    "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_rec_ram[1],
-                   (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)MEM(t4_va[0] + 4), (int)MEM(t4_va[0] + 16),
+                   (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)MEM(t4_va[0] + 4), (int)MEM(t4_va[0] + 16), (int)MEM(t4_va[0] + 24), (int)MEM(t4_vo[0] + 8),
                    (int)t4s_full[t4s_i68f],
                    (int)t4s_full[t4s_i69f], (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i68t], (int)t4s_lvt[t4s_i69t],
                    t4s_rod[t4s_slot], r1, c1, (int)v1);
@@ -421,7 +445,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.86 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.89 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -524,7 +548,18 @@ static void t4_task(void *unused)
             snprintf(t4_result, sizeof(t4_result), "AF area record unexpected: not touched"); goto out;
         }
         t4s_var[k] = v;
+        uint32_t *o = (uint32_t *)romremap_ram(t4_vo[k]);
+        t4s_vout[k] = 0;
+        if (!o || o[0] != 4 || o[1] != 3 || o[2] != 3840 || o[3] != 2160 || o[9] != 3840 || o[12] != 3840 || o[13] != 2160)
+        {
+            t4_log("output record %x: %s %d %d %d %d %d %d %d\n", (int)t4_vo[k], o ? "unexpected" : "not mapped", o ? (int)o[0] : 0,
+                   o ? (int)o[1] : 0, o ? (int)o[2] : 0, o ? (int)o[3] : 0, o ? (int)o[9] : 0, o ? (int)o[12] : 0, o ? (int)o[13] : 0);
+            snprintf(t4_result, sizeof(t4_result), "LV output record unexpected: not touched"); goto out;
+        }
+        t4s_vout[k] = o;
     }
+    t4_log("preview: %s (valid area y %d h %d, output w %d)\n", t4_preview == 2 ? "fit" : t4_preview ? "squeeze" : "centre",
+           t4_preview ? 47 : 47 + 2 * t4_d68, t4_preview ? 2166 + (int)T4_DROWS : 2166, t4_preview == 2 ? (int)t4_fit_w() : 3840);
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
     if (rc || !rec_ram) { snprintf(t4_result, sizeof(t4_result), "ROM remap failed (%d)", rc); goto out; }
 
@@ -956,6 +991,7 @@ void tall4k_tick(void)
     idle_since = 0;
     t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1;
     t4_pmode_run = t4_pmode;
+    t4_preview_run = t4_preview;
     t4_drows = t4_pmode == 2 ? 480 : 200;
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
@@ -1028,6 +1064,14 @@ static struct menu_entry t4_menu[] = {
                 .choices = CHOICES("Bottom", "Centred"),
                 .help    = "Bottom: extra rows below Canon's 4K window. Centred: half above, half below (v4.74).",
                 .help2   = "Centred = the 4K frame height mode's placement (default since v4.88).",
+            },
+            {
+                .name    = "Taller 4K preview",
+                .priv    = &t4_preview,
+                .max     = 2,
+                .choices = CHOICES("Centre", "Squeeze", "Fit"),
+                .help    = "Screen: Centre = 16:9 centre of the taller frame. Squeeze = whole frame, squashed (v4.89 test).",
+                .help2   = "Fit = whole frame, narrower picture (v4.89 test). Also used by 4K frame height. Not saved.",
             },
             {
                 .name   = "Taller 4K (test)",
