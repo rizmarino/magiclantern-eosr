@@ -123,6 +123,13 @@ static const struct { uint32_t a, v; int kind; } t4_weng[] = {
     { 0xE1C6A89C, 0x08A5109E, 1 }, { 0xE1C6AF70, 0x08A5109E, 1 }, { 0xE1D7E084, 0x08A5213C, 2 },
     { 0xE1D7E09C, 0x08A6213E, 2 }, { 0xE1C689A4, 0x00000213, 3 }, { 0xE1C689AC, 0x000000A7, 4 },
     { 0xE1C6AF88, 0x10980090, 5 },
+    /* v4.97 (desk W3, ROM-checked): DIGIC 0xD0510xxx block, per-mode lists sent at every LV start; Canon keeps them
+     * consistent with width and blank in every mode (4K / magnify / FHD): B30 = w/4+1, 800..80C = w/4+12,
+     * B34 = 2*blank+3, 820..82C = 2*blank+14. v4.93 and v4.96 left them at 4K's values -> no frame. */
+    { 0xE1C684B4, 0x00000429, 6 }, { 0xE1C67A64, 0x00000434, 6 }, { 0xE1C67A6C, 0x00000434, 6 },
+    { 0xE1C67A74, 0x00000434, 6 }, { 0xE1C67A7C, 0x00000434, 6 },
+    { 0xE1C684BC, 0x00000151, 7 }, { 0xE1C67A84, 0x0000015C, 7 }, { 0xE1C67A8C, 0x0000015C, 7 },
+    { 0xE1C67A94, 0x0000015C, 7 }, { 0xE1C67A9C, 0x0000015C, 7 },
 };
 #define T4_NWENG (sizeof(t4_weng) / sizeof(t4_weng[0]))
 static uint32_t t4_wdelta(uint32_t a)
@@ -136,6 +143,8 @@ static uint32_t t4_wdelta(uint32_t a)
                 case 3: return T4_DCOLS / 8;
                 case 4: return (uint32_t)((int)T4_DHD / 2 - (int)(T4_DCOLS / 8));   /* blank (v4.96: + HD/2 growth) */
                 case 5: return T4_DCOLS << 16;
+                case 6: return T4_DCOLS / 4;                                                   /* w/4 + c */
+                case 7: return (uint32_t)(2 * ((int)T4_DHD / 2 - (int)(T4_DCOLS / 8)));       /* 2 * blank + c */
             }
     return 0;
 }
@@ -463,6 +472,13 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             t4_applied = 1; t4_pend_apply = 0;
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
+            if (T4_DCOLS || T4_DHD)
+                t4_log("  D0510: B30 %d B34 %d 800 %d 820 %d; D0411158 %x D0411188 %x; 0x60 %x 0x51 %x; TG %x\n",
+                       (int)MEM(t4s_base + (0xE1C684B4 - T4_FROM)), (int)MEM(t4s_base + (0xE1C684BC - T4_FROM)),
+                       (int)MEM(t4s_base + (0xE1C67A64 - T4_FROM)), (int)MEM(t4s_base + (0xE1C67A84 - T4_FROM)),
+                       (int)MEM(t4s_base + (0xE1C689A4 - T4_FROM)), (int)MEM(t4s_base + (0xE1C689AC - T4_FROM)),
+                       (int)t4s_full[t4s_i60f], (int)(t4s_i51f >= 0 ? t4s_full[t4s_i51f] : 0),
+                       (int)MEM(t4s_base + (T4_TG98 - T4_FROM)));
             t4_log("  magnify active: applied +%d rows; record %d (RAM %d), YUV crop h %d y %d, AF area h %d y %d (area h %d, out w %d), full 0x68 %x 0x69 %x 0x97 %x, template 0x68 %x 0x69 %x, "
                    "ROD %d; cpu1 probe rc %x cpu %d h %d\n", T4_DROWS, (int)MEM(T4_REC + 4), (int)t4s_rec_ram[1],
                    (int)MEM(T4_YUV + 4), (int)MEM(T4_YUV + 20), (int)MEM(t4_va[0] + 4), (int)MEM(t4_va[0] + 16), (int)MEM(t4_va[0] + 24), (int)MEM(t4_vo[0] + 8),
@@ -541,7 +557,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.96 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.97 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -633,7 +649,8 @@ static void t4_task(void *unused)
             for (unsigned k = 0; k < T4_NWENG; k++)
             {
                 uint32_t ram = MEM(base + (t4_weng[k].a - T4_FROM)), reg = MEM(base + (t4_weng[k].a - 4 - T4_FROM));
-                if (ram != t4_weng[k].v || (reg >> 20) != 0xD04) { ebad++; t4_log("  width value %x: RAM %x reg %x (want %x)\n", (int)t4_weng[k].a, (int)ram, (int)reg, (int)t4_weng[k].v); }
+                uint32_t want_reg = t4_weng[k].kind >= 6 ? 0xD05 : 0xD04;
+                if (ram != t4_weng[k].v || (reg >> 20) != want_reg) { ebad++; t4_log("  width value %x: RAM %x reg %x (want %x)\n", (int)t4_weng[k].a, (int)ram, (int)reg, (int)t4_weng[k].v); }
             }
             t4s_i74f = t4_find(full, T4_NFULL, 0x74); t4s_i75f = t4_find(full, T4_NFULL, 0x75); t4s_i60f = t4_find(full, T4_NFULL, 0x60);
             t4s_i74t = t4_find(lvt, T4_NLVT, 0x74); t4s_i75t = t4_find(lvt, T4_NLVT, 0x75);
@@ -1358,7 +1375,7 @@ static struct menu_entry t4_menu[] = {
                 .priv   = &t4_one,
                 .select = t4_wselect,
                 .update = t4_update,
-                .help   = "v4.96 A/B: line time 28.88 -> 29.2 us, frame length 1428 lines (23.98p kept), normal width.",
+                .help   = "v4.97 A/B: line 28.88 -> 29.2 us, 1428 lines (23.98p kept), normal width, + D0510 block.",
                 .help2  = "Auto magnify, ~5 s, then back. Global Draw OFF, Movie 4K 23.98p. ML/LOGS/TALL4K.TXT.",
             },
             {
@@ -1366,7 +1383,7 @@ static struct menu_entry t4_menu[] = {
                 .priv   = &t4_two,
                 .select = t4_wselect,
                 .update = t4_update,
-                .help   = "v4.96: +64 columns (4320) with the longer line (v4.93 shortened the line gap and froze).",
+                .help   = "v4.97: +64 columns (4320), longer line, + D0510 block (v4.93/v4.96 missed it).",
                 .help2  = "Auto magnify, ~5 s wider, then back. Global Draw OFF, Movie 4K 23.98p. ML/LOGS/TALL4K.TXT.",
             },
             MENU_EOL,
