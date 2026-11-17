@@ -566,7 +566,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.98 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.99 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -696,7 +696,7 @@ static void t4_task(void *unused)
             }
             t4_log("width +%d cols: MEM1 w %d, 0x74/0x75 %x/%x -> %x/%x, 0x60 %x -> %x (blank 167 -> %d), %d width values\n",
                    T4_DCOLS, T4_W + T4_DCOLS, 0x72a, 0x1d0b, (int)t4_hpos(378 - T4_DCOLS / 8), (int)t4_hpos(1403 + T4_DCOLS / 8),
-                   0x10154, 0x10000 | (2 * (167 - T4_DCOLS / 8) + 6), 167 - T4_DCOLS / 8, (int)T4_NWENG);
+                   0x10154, 0x10000 | (2 * (167 + T4_DHD / 2 - T4_DCOLS / 8) + 6), 167 + T4_DHD / 2 - T4_DCOLS / 8, (int)T4_NWENG);
         }
         t4_log("engine init values + %d YUV crop entries: %d checked, %d unexpected\n", T4_NYUV, (int)T4_NENG, ebad);
         if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
@@ -740,7 +740,7 @@ static void t4_task(void *unused)
     /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
     t4_log("variant: %s; tap flags 0x1311c+4 %d, Mem1Path +40 %d, +50 %d\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap",
            (int)MEM(0x1311C + 4), (int)MEM(T4_PATH + 0x40), (int)MEM(T4_PATH + 0x50));
-    if ((T4_DCOLS || T4_DHD) && t4_tap && T4_DCOLS != 64) { snprintf(t4_result, sizeof(t4_result), "tapped width test: +64 only (v4.98)"); goto out; }
+    if ((T4_DCOLS || T4_DHD) && t4_tap && T4_DCOLS != 64 && T4_DCOLS != 56) { snprintf(t4_result, sizeof(t4_result), "tapped width test: +56 / +64 only"); goto out; }
     if (!t4_tap && (MEM(0x1311C + 4) || MEM(T4_PATH + 0x40)))
     {
         /* v4.67: camera v4.66 ran "no tap" with the tap on (RAW zebras/histogram keep lv_save_raw on in movie LV) */
@@ -1108,12 +1108,12 @@ static void t4_wselect(void *priv, int delta)
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
     if (t4_pmode) { NotifyBox(3000, "Set 4K frame height to Normal first"); return; }
     t4_persist_run = 0; t4_dump = 0; t4_tap = 0; t4_hold = 0;   /* v4.98: never hold a test width */
-    t4_drows = 0; t4_dcols = v == 1 ? 0 : 64; t4_dhd = 16;
-    if (v == 3) { t4_tap = 1; t4_dump = 1; }   /* v4.98: tapped +64, rows saved to ML/LOGS/T4_4320W.BIN */
+    t4_drows = 0; t4_dcols = v == 1 ? 0 : v == 4 ? 56 : 64; t4_dhd = 16;
+    if (v == 3 || v == 4) { t4_tap = 1; t4_dump = 1; }   /* v4.98: tapped +64 -> T4_4320W.BIN; v4.99: +56 -> T4_4312W.BIN */
     t4_d68 = 0; t4_d69 = 0;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
-    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : v == 3 ? "Wider 4K +64 (raw tap): close the ML menu" : "Wider 4K +64: close the ML menu to start");
+    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : v == 3 ? "Wider 4K +64 (raw tap): close the ML menu" : v == 4 ? "Wider 4K +56 (raw tap): close the ML menu" : "Wider 4K +64: close the ML menu to start");
 }
 static void t4_select(void *priv, int delta)
 {
@@ -1293,7 +1293,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
-static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3;
+static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3, t4_four = 4;
 static struct menu_entry t4_menu[] = {
     {
         .name     = "Taller 4K tests",
@@ -1403,6 +1403,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v4.98: +64 columns with the longer line, ML's raw tap at 10-bit; saves rows to",
                 .help2  = "ML/LOGS/T4_4320W.BIN (are the new columns real image?). Movie 4K 23.98p, Global Draw OFF.",
+            },
+            {
+                .name   = "Wider 4K +56, raw tap",
+                .priv   = &t4_four,
+                .select = t4_wselect,
+                .update = t4_update,
+                .help   = "v4.99: +56 columns (4312): 10-bit line 5390 B = 385 whole 14-bit blocks (4320 isn't:",
+                .help2  = "v4.98 pixels came out shuffled). Saves ML/LOGS/T4_4312W.BIN. Movie 4K 23.98p, Global Draw OFF.",
             },
             MENU_EOL,
         },
