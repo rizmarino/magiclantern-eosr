@@ -99,6 +99,37 @@ static int t4_d68, t4_d69;              /* change of 0x68 / 0x69 in 2-row units 
 #define T4_PITCH    5320
 static uint32_t t4_fit_w(void) { return (3840 * 2166 / (2166 + T4_DROWS)) & ~31u; }   /* v4.89 Fit preview width (v4.90: /32, half-size record gets /16) */
 static uint32_t t4_eng_new(uint32_t v) { return v < 0x10000 ? v + T4_DROWS : v + (T4_DROWS << 16); }
+/* v4.93 wider 4K test (desk stage W1, notes/wider-desk.md, ROM values re-checked): extra columns W (multiple of 8),
+ * centred. Sensor 0x74/0x75 = image window start/end, pos = (v >> 8) * 48 + (v & 0xff), 4 px units (4K 378..1403);
+ * line time fixed (HD 28.88 us): HD/2 = w/8 + blank + 23, so the blank (0xD0411188 = 167, sensor 0x60 = 0x10000 |
+ * (2 * blank + 6)) shrinks by W/8. Width-carrying engine values below; MEM1 record w and readout record w. */
+static int t4_dcols;                    /* 0 = taller tests / mode; > 0 only from Debug > Wider 4K, no raw tap */
+#define T4_DCOLS    ((uint32_t)t4_dcols)
+static uint32_t t4_hpos(int pos) { return ((uint32_t)(pos / 48) << 8) | (uint32_t)(pos % 48); }
+/* kind: 1 low half + W, 2 low half + 2W, 3 value + W/8, 4 value - W/8, 5 high half + W */
+static const struct { uint32_t a, v; int kind; } t4_weng[] = {
+    { 0xE1C680BC, 0x08A7109C, 1 }, { 0xE1C680CC, 0x08A7109C, 1 }, { 0xE1C6A1C0, 0x08A5109E, 1 },
+    { 0xE1C6A89C, 0x08A5109E, 1 }, { 0xE1C6AF70, 0x08A5109E, 1 }, { 0xE1D7E084, 0x08A5213C, 2 },
+    { 0xE1D7E09C, 0x08A6213E, 2 }, { 0xE1C689A4, 0x00000213, 3 }, { 0xE1C689AC, 0x000000A7, 4 },
+    { 0xE1C6AF88, 0x10980090, 5 },
+};
+#define T4_NWENG (sizeof(t4_weng) / sizeof(t4_weng[0]))
+static uint32_t t4_wdelta(uint32_t a)
+{
+    for (unsigned k = 0; k < T4_NWENG; k++)
+        if (t4_weng[k].a == a)
+            switch (t4_weng[k].kind)
+            {
+                case 1: return T4_DCOLS;
+                case 2: return 2 * T4_DCOLS;
+                case 3: return T4_DCOLS / 8;
+                case 4: return (uint32_t)-(int)(T4_DCOLS / 8);
+                case 5: return T4_DCOLS << 16;
+            }
+    return 0;
+}
+static int t4s_i74f = -1, t4s_i75f = -1, t4s_i60f = -1, t4s_i74t = -1, t4s_i75t = -1;
+static uint32_t t4s_o74f, t4s_o75f, t4s_o60f, t4s_o74t, t4s_o75t;
 
 static volatile int t4_running;
 static int t4_tap = 1;           /* v4.66: 0 = no raw tap (no lv_save_raw, no 10-bit, no reflex): A/B for the hang */
@@ -203,7 +234,25 @@ static void t4_apply_all(void)
         if (t4s_rod_slots[k] == t4s_slot || T4_DROWS <= 40) { *rc2 = 1110 + T4_DROWS / 2; romremap_flush(rc2, 2); }
     }
     for (unsigned k = 0; k < T4_NENG; k++)
-        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v));
+        t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng_new(t4_eng[k].v) + t4_wdelta(t4_eng[k].a));
+    if (T4_DCOLS)
+    {
+        /* v4.93: width-only engine values (the shared ones got their delta above), records, sensor window + blank */
+        for (unsigned k = 0; k < T4_NWENG; k++)
+        {
+            int shared = 0;
+            for (unsigned j = 0; j < T4_NENG; j++) if (t4_eng[j].a == t4_weng[k].a) shared = 1;
+            if (!shared) t4_put((volatile uint32_t *)(t4s_base + (t4_weng[k].a - T4_FROM)), t4_weng[k].v + t4_wdelta(t4_weng[k].a));
+        }
+        t4s_rec_ram[0] = T4_W + T4_DCOLS; romremap_flush(&t4s_rec_ram[0], 4);
+        uint16_t *gw = (uint16_t *)((uint32_t)&t4s_geo[0] & ~0x40000000);
+        *gw = T4_W + T4_DCOLS; romremap_flush(gw, 2);
+        t4_put(&t4s_full[t4s_i74f], (t4s_o74f & ~0x3fffff) | t4_hpos(378 - T4_DCOLS / 8));
+        t4_put(&t4s_full[t4s_i75f], (t4s_o75f & ~0x3fffff) | t4_hpos(1403 + T4_DCOLS / 8));
+        t4_put(&t4s_lvt[t4s_i74t], (t4s_o74t & ~0x3fffff) | t4_hpos(378 - T4_DCOLS / 8));
+        t4_put(&t4s_lvt[t4s_i75t], (t4s_o75t & ~0x3fffff) | t4_hpos(1403 + T4_DCOLS / 8));
+        t4_put(&t4s_full[t4s_i60f], (t4s_o60f & ~0x3fffff) | (0x10000 | (2 * (167 - T4_DCOLS / 8) + 6)));
+    }
     for (int k = 0; k < T4_NYUV; k++)          /* v4.82: Canon's display crop follows the centred window */
     {
         volatile uint32_t *e = (volatile uint32_t *)(T4_YUV + k * 0x20);
@@ -235,6 +284,17 @@ static void t4_restore_all(void)
     }
     for (unsigned k = 0; k < T4_NENG; k++)
         t4_put((volatile uint32_t *)(t4s_base + (t4_eng[k].a - T4_FROM)), t4_eng[k].v);
+    if (T4_DCOLS)
+    {
+        for (unsigned k = 0; k < T4_NWENG; k++)
+            t4_put((volatile uint32_t *)(t4s_base + (t4_weng[k].a - T4_FROM)), t4_weng[k].v);
+        t4s_rec_ram[0] = T4_W; romremap_flush(&t4s_rec_ram[0], 4);
+        uint16_t *gw = (uint16_t *)((uint32_t)&t4s_geo[0] & ~0x40000000);
+        *gw = T4_W; romremap_flush(gw, 2);
+        t4_put(&t4s_full[t4s_i74f], t4s_o74f); t4_put(&t4s_full[t4s_i75f], t4s_o75f);
+        t4_put(&t4s_lvt[t4s_i74t], t4s_o74t); t4_put(&t4s_lvt[t4s_i75t], t4s_o75t);
+        t4_put(&t4s_full[t4s_i60f], t4s_o60f);
+    }
     for (int k = 0; k < T4_NYUV; k++)
     {
         volatile uint32_t *e = (volatile uint32_t *)(T4_YUV + k * 0x20);
@@ -447,7 +507,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.92 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.93 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -533,6 +593,31 @@ static void t4_task(void *unused)
             { ebad++; t4_log("  YUV crop entry %d: %d %d %d %d %d %d (want 4256 2214 3840 2144 276 58)\n", k, (int)e[0],
                              (int)e[1], (int)e[2], (int)e[3], (int)e[4], (int)e[5]); }
         }
+        if (T4_DCOLS)
+        {
+            /* v4.93 width test: every value it writes must be Canon's (ROM) value, behind a 0xD04 engine register */
+            for (unsigned k = 0; k < T4_NWENG; k++)
+            {
+                uint32_t ram = MEM(base + (t4_weng[k].a - T4_FROM)), reg = MEM(base + (t4_weng[k].a - 4 - T4_FROM));
+                if (ram != t4_weng[k].v || (reg >> 20) != 0xD04) { ebad++; t4_log("  width value %x: RAM %x reg %x (want %x)\n", (int)t4_weng[k].a, (int)ram, (int)reg, (int)t4_weng[k].v); }
+            }
+            t4s_i74f = t4_find(full, T4_NFULL, 0x74); t4s_i75f = t4_find(full, T4_NFULL, 0x75); t4s_i60f = t4_find(full, T4_NFULL, 0x60);
+            t4s_i74t = t4_find(lvt, T4_NLVT, 0x74); t4s_i75t = t4_find(lvt, T4_NLVT, 0x75);
+            if (t4s_i74f < 0 || t4s_i75f < 0 || t4s_i60f < 0 || t4s_i74t < 0 || t4s_i75t < 0) { ebad++; t4_log("  width regs not found\n"); }
+            else
+            {
+                t4s_o74f = full[t4s_i74f]; t4s_o75f = full[t4s_i75f]; t4s_o60f = full[t4s_i60f];
+                t4s_o74t = lvt[t4s_i74t]; t4s_o75t = lvt[t4s_i75t];
+                if ((t4s_o74f & 0x3fffff) != 0x72a || (t4s_o75f & 0x3fffff) != 0x1d0b || (t4s_o60f & 0x3fffff) != 0x10154
+                    || (t4s_o74t & 0x3fffff) != 0x72a || (t4s_o75t & 0x3fffff) != 0x1d0b)
+                { ebad++; t4_log("  width regs unexpected: 74 %x 75 %x 60 %x / 74 %x 75 %x\n", (int)t4s_o74f, (int)t4s_o75f, (int)t4s_o60f, (int)t4s_o74t, (int)t4s_o75t); }
+            }
+            int sl = (int)MEM(T4_SDRV + 0x70);
+            if ((T4_DCOLS % 8) || T4_DCOLS > 448 || (sl != 4 && sl != 9)) { ebad++; t4_log("  width +%d needs a multiple of 8 <= 448 and 23.98/24p (slot %d)\n", T4_DCOLS, sl); }
+            t4_log("width +%d cols: MEM1 w %d, 0x74/0x75 %x/%x -> %x/%x, 0x60 %x -> %x (blank 167 -> %d), %d width values\n",
+                   T4_DCOLS, T4_W + T4_DCOLS, 0x72a, 0x1d0b, (int)t4_hpos(378 - T4_DCOLS / 8), (int)t4_hpos(1403 + T4_DCOLS / 8),
+                   0x10154, 0x10000 | (2 * (167 - T4_DCOLS / 8) + 6), 167 - T4_DCOLS / 8, (int)T4_NWENG);
+        }
         t4_log("engine init values + %d YUV crop entries: %d checked, %d unexpected\n", T4_NYUV, (int)T4_NENG, ebad);
         if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
     }
@@ -575,6 +660,7 @@ static void t4_task(void *unused)
     /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
     t4_log("variant: %s; tap flags 0x1311c+4 %d, Mem1Path +40 %d, +50 %d\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap",
            (int)MEM(0x1311C + 4), (int)MEM(T4_PATH + 0x40), (int)MEM(T4_PATH + 0x50));
+    if (T4_DCOLS && t4_tap) { snprintf(t4_result, sizeof(t4_result), "width test needs the no-tap variant (v4.93)"); goto out; }
     if (!t4_tap && (MEM(0x1311C + 4) || MEM(T4_PATH + 0x40)))
     {
         /* v4.67: camera v4.66 ran "no tap" with the tap on (RAW zebras/histogram keep lv_save_raw on in movie LV) */
@@ -639,6 +725,13 @@ static void t4_task(void *unused)
     uint32_t m1w = MEM(T4_PATH + 0x10), m1h = MEM(T4_PATH + 0x14);
     volatile uint32_t *l7 = t4_live_lv7();
     int i68 = l7 ? t4_find(l7, 43, 0x68) : -1, i69 = l7 ? t4_find(l7, 43, 0x69) : -1;
+    if (l7)
+    {
+        int i74 = t4_find(l7, 43, 0x74), i75 = t4_find(l7, 43, 0x75);
+        t4_log("after rebuild: live lv7 0x74 %x 0x75 %x; Mem1Path +10 %d +14 %d +18 %d +1c %d; record w %d (RAM %d)\n",
+               i74 >= 0 ? (int)l7[i74] : -1, i75 >= 0 ? (int)l7[i75] : -1, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
+               (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_REC), (int)t4s_rec_ram[0]);
+    }
     t4_log("after rebuild: MEM1 %dx%d (+18 %d, +1c %d), f2 %d, unit %x, live lv7 0x68 %x 0x69 %x\n", (int)m1w, (int)m1h,
            (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c), (int)MEM(T4_UNIT),
            i68 >= 0 ? (int)l7[i68] : -1, i69 >= 0 ? (int)l7[i69] : -1);
@@ -736,6 +829,7 @@ static void t4_task(void *unused)
     }
     else if (t4_tap && !stalled && m1h2 == T4_H + T4_DROWS && MEM(T4_PATH + 0x6c) == 0)
         snprintf(t4_result, sizeof(t4_result), "%dx%d on", T4_W, (int)m1h2);
+    else if (!t4_tap && T4_DCOLS) snprintf(t4_result, sizeof(t4_result), "no tap: survived +%d cols (+10 %d +18 %d)", T4_DCOLS, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x18));
     else if (!t4_tap) snprintf(t4_result, sizeof(t4_result), "no tap: survived the taller rebuild (+1c %d)", (int)MEM(T4_PATH + 0x1c));
     else snprintf(t4_result, sizeof(t4_result), "%s MEM1 h %d, pairs %d", stalled ? "STALL," : "", (int)m1h2, np);
     if (blocks_on)
@@ -843,6 +937,18 @@ out:
     }
 }
 
+static void t4_wselect(void *priv, int delta)
+{
+    /* v4.93: Debug > Taller 4K tests > Wider 4K, no raw tap: +64 columns, normal height, no tap (Global Draw OFF) */
+    if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
+    if (t4_pmode) { NotifyBox(3000, "Set 4K frame height to Normal first"); return; }
+    t4_persist_run = 0; t4_dump = 0; t4_tap = 0;
+    t4_drows = 0; t4_dcols = 64;
+    t4_d68 = 0; t4_d69 = 0;
+    t4_running = 1;
+    task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
+    NotifyBox(4000, "Wider 4K +64: close the ML menu to start");
+}
 static void t4_select(void *priv, int delta)
 {
     if (t4_running) { NotifyBox(2000, "Taller 4K test already running"); return; }
@@ -850,6 +956,7 @@ static void t4_select(void *priv, int delta)
     t4_persist_run = 0; t4_dump = 1;
     t4_tap = priv ? *(int *)priv : 1;
     t4_drows = t4_steps[(t4_sel >= 0 && t4_sel <= 4) ? t4_sel : 0];
+    t4_dcols = 0;
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
@@ -998,7 +1105,7 @@ void tall4k_tick(void)
     if (!idle_since) { idle_since = get_ms_clock(); return; }
     if (get_ms_clock() - idle_since < 2000) return;
     idle_since = 0;
-    t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1;
+    t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1; t4_dcols = 0;
     t4_pmode_run = t4_pmode;
     t4_preview_run = t4_preview;
     t4_drows = t4_pmode == 2 ? 480 : 200;
@@ -1099,6 +1206,13 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "A/B for the v4.65 hang: same +40-row test without ML's raw tap (MEM1 unused).",
                 .help2  = "Needs Overlay > Global Draw OFF (RAW zebras keep the tap on). Movie 4K 23.98p.",
+            },
+            {
+                .name   = "Wider 4K, no raw tap",
+                .select = t4_wselect,
+                .update = t4_update,
+                .help   = "v4.93 first width test: +64 columns (4320), normal height, ML's raw tap off. Auto magnify",
+                .help2  = "in/out, ~5 s wider, then back. Global Draw OFF, Movie 4K 23.98p. ML/LOGS/TALL4K.TXT.",
             },
             MENU_EOL,
         },
