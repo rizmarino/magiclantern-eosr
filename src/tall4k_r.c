@@ -507,7 +507,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v4.94 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v4.95 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -953,7 +953,7 @@ static volatile int t4_cs_running;
 static void t4_census_task(void *unused)
 {
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
-    t4_log("=== width census (v4.94) at %d ms: lv %d, mode %d, MEM1 %dx%d +18 %d\n", (int)get_ms_clock(), lv,
+    t4_log("=== width census (v4.95) at %d ms: lv %d, mode %d, MEM1 %dx%d +18 %d\n", (int)get_ms_clock(), lv,
            (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
     const int NMAX = 6000;
     uint32_t *ad = malloc(NMAX * 8);
@@ -969,15 +969,26 @@ static void t4_census_task(void *unused)
     uint32_t t0 = get_ms_clock();
     for (uint32_t a = 0x1010; a < 0x2400000 - 0x10; a += 4)   /* neighbours a-8..a+8 stay inside the mapped range */
     {
+        if ((a & 0x3ffff) == 0x10) msleep(2);   /* v4.95: yield every 256 KB (v4.94: 3.5 s busy scan, magnify never came) */
         uint32_t v = MEM(a);
         if (!t4_cmatch(v)) continue;
         if ((a >= (uint32_t)ad && a < (uint32_t)(ad + 2 * NMAX))) continue;   /* our own table */
         if (n < NMAX) { ad[n] = a; va[n] = v; n++; } else over++;
     }
     t4_log("census 4K: %d hits (%d over the cap) in %d ms\n", n, over, (int)(get_ms_clock() - t0));
-    NotifyBox(3000, "Width census: magnify...");
-    t4_zoom(5);
-    for (int k = 0; k < 100 && MEM(T4_STATE + 0xc) != 13; k++) msleep(20);
+    msleep(1000);
+    for (int tr = 0; tr < 3 && MEM(T4_STATE + 0xc) != 13; tr++)
+    {
+        t4_zoom(5);   /* v4.95: retried (v4.94: the one request was ignored, mode stayed 12) */
+        for (int k = 0; k < 150 && MEM(T4_STATE + 0xc) != 13; k++) msleep(20);
+        t4_log("magnify request %d: mode %d, lv_dispsize %d\n", tr + 1, (int)MEM(T4_STATE + 0xc), lv_dispsize);
+    }
+    if (MEM(T4_STATE + 0xc) != 13)
+    {
+        t4_log("census: magnify not reached, no comparison\n");
+        NotifyBox(6000, "Width census: magnify didn't come on (no result)");
+        free(ad); t4_cs_running = 0; return;
+    }
     msleep(1500);
     int m = (int)MEM(T4_STATE + 0xc), nch = 0;
     t4_log("magnify: mode %d, MEM1 %dx%d +18 %d\n", m, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14), (int)MEM(T4_PATH + 0x18));
@@ -998,7 +1009,7 @@ static void t4_census_task(void *unused)
     for (int i = 0; i < n; i++) if (MEM(ad[i]) != va[i]) back++;
     t4_log("back in 4K: mode %d, %d of %d still differ from the first 4K scan\n", (int)MEM(T4_STATE + 0xc), back, n);
     free(ad);
-    NotifyBox(6000, "Width census: done, %d of %d changed", nch, n);
+    NotifyBox(8000, "Census: %d changed", nch);
     t4_cs_running = 0;
 }
 static void t4_cselect(void *priv, int delta)
