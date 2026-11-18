@@ -748,7 +748,7 @@ static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes, uint32_t db)   
 extern int tall4k_active(void);          /* v4.75 tall4k_r.c: taller 4K frame held (10-bit ML order, tap owned there) */
 extern int tall4k_width(void);           /* v5.03 tall4k_r.c: held frame width (4256, or 4480 when Wide is held) */
 extern int tall4k_wfield(void);          /* v5.03: its 10-bit width field (3040 / 3200) */
-static int rt_m1_4k(uint32_t w, uint32_t h) { return (w == 4256 || (w == 4480 && h == 2214)) && h >= 2214 && h <= 3098; }   /* v4.75: 4K incl. taller; v5.03 wide */
+static int rt_m1_4k(uint32_t w, uint32_t h) { return (w == 4256 || (w == 4480 && (h == 2214 || h == 2478))) && h >= 2214 && h <= 3098; }   /* v4.75: 4K incl. taller; v5.03 wide */
 
 static int rt_pack_apply(int bpp, int ml_order)
 {
@@ -868,6 +868,7 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
          * M18-1958: R/G phase swapped in 4464-4469, 4472-4473, 4476-4479), like normal 4K's 8 receiver pad columns
          * at the end of the line. Active area 144..4463 = 4320x2168. */
         ax2 = 4464;
+        if (c_ch == 2478 && c_y0 == 0) ay += 2;   /* v5.05 Wide 16:9: rows 48..2477 = 2430 -> 4320x2430 (16:9, even top row) */
     }
     ri[9] = 0; ri[10] = 0; ri[11] = ax2 - ax; ri[12] = ay2 - ay;  /* jpeg crop, relative to the active area */
     ri[13] = ay; ri[14] = ax; ri[15] = ay2; ri[16] = ax2;         /* active area: y1, x1, y2, x2 */
@@ -3908,7 +3909,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
-    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4320x2168, 10-bit" : "4K tall 4256x2694, 10-bit");
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4320x2168, 10-bit" : t4_pmode == 4 ? "4K wide 16:9 4320x2430, 10-bit" : "4K tall 4256x2694, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4043,11 +4044,11 @@ static struct menu_entry rr_menu[] = {
             {
                 .name    = "4K frame height",
                 .priv    = &t4_pmode,
-                .max     = 3,
-                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694", "Wide 4480x2214"),
+                .max     = 4,
+                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694", "Wide 4320x2168", "Wide 16:9 4320x2430"),
                 .update  = tall4k_height_update,
                 .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
-                .help2   = "Wide (23.98p only): 4480x2214 recorded, 4320x2168 picture. Global Draw OFF, LL 10-bit.",
+                .help2   = "Wide (23.98p only): 4480x2214 / 4480x2478 recorded -> 4320x2168 / 4320x2430. Global Draw OFF, LL 10-bit.",
             },
             {
                 .name    = "Bit depth",
