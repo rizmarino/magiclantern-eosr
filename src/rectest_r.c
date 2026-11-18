@@ -746,7 +746,9 @@ static int rt_copy_selftest(uint32_t xoff, uint32_t chunk_bytes, uint32_t db)   
 }
 
 extern int tall4k_active(void);          /* v4.75 tall4k_r.c: taller 4K frame held (10-bit ML order, tap owned there) */
-static int rt_m1_4k(uint32_t w, uint32_t h) { return w == 4256 && h >= 2214 && h <= 3098; }   /* v4.75: 4K incl. taller */
+extern int tall4k_width(void);           /* v5.03 tall4k_r.c: held frame width (4256, or 4480 when Wide is held) */
+extern int tall4k_wfield(void);          /* v5.03: its 10-bit width field (3040 / 3200) */
+static int rt_m1_4k(uint32_t w, uint32_t h) { return (w == 4256 || (w == 4480 && h == 2214)) && h >= 2214 && h <= 3098; }   /* v4.75: 4K incl. taller; v5.03 wide */
 
 static int rt_pack_apply(int bpp, int ml_order)
 {
@@ -756,7 +758,7 @@ static int rt_pack_apply(int bpp, int ml_order)
          * height; flip the bit order only (same bytes per line), and put it back the same way. */
         for (int i = 0; i < 5; i++) pk_orig[i] = MEM(RT_PATH + 0x64 + 4 * i);
         pk_w0 = MEM(RT_PATH + 0x18);
-        if (bpp != 10 || pk_orig[2] != 0 || pk_w0 != 3040)
+        if (bpp != 10 || pk_orig[2] != 0 || pk_w0 != (uint32_t)tall4k_wfield())
         { rt_printf("taller 4K held: needs 10-bit (bpp %d, f2 %d, width field %d)\n", bpp, pk_orig[2], pk_w0); return -1; }
         uint32_t old = cli();
         MEM(RT_PATH + 0x64 + 12) = ml_order ? 0 : 1;
@@ -2883,13 +2885,13 @@ static void rt_task(void *unused)
     lv_raw = 1;
     msleep(500);
     m1_w = MEM(RT_PATH + 0x10); m1_h = MEM(RT_PATH + 0x14);
-    if (tall4k_active() && m1_w == 3040 && MEM(RT_PATH + 0x18) == 3040 && MEM(RT_PATH + 0x64 + 8) == 0)
+    if (tall4k_active() && m1_w == (uint32_t)tall4k_wfield() && MEM(RT_PATH + 0x18) == m1_w && MEM(RT_PATH + 0x64 + 8) == 0)
     {
         /* v4.76: with the taller frame held at 10-bit, +0x10 holds the narrowed width field (3040 = 5320 bytes/line
          * at 10-bit), not pixels: v4.75 took 3040 as the width (pitch 3800), the sync survey saw no frame edge and
          * every frame was dropped. The frame is 4256 px. */
-        rt_printf("taller 4K held: width field %d -> frame width 4256 px\n", m1_w);
-        m1_w = 4256;
+        rt_printf("taller 4K held: width field %d -> frame width %d px\n", m1_w, tall4k_width());
+        m1_w = tall4k_width();                                   /* v5.03: 4480 when Wide is held */
     }
     /* v17: Mem1Path layout fields, logged before any pack change (4K-mode survey: rt_pack_apply only runs
      * with mode < 0x14 and width source == width, as tested in FHD) */
@@ -3899,7 +3901,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
-    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : "4K tall 4256x2694, 10-bit");
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4336x2168, 10-bit" : "4K tall 4256x2694, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4034,11 +4036,11 @@ static struct menu_entry rr_menu[] = {
             {
                 .name    = "4K frame height",
                 .priv    = &t4_pmode,
-                .max     = 2,
-                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694"),
+                .max     = 3,
+                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694", "Wide 4480x2214"),
                 .update  = tall4k_height_update,
                 .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
-                .help2   = "Canon 4K 23.98/24p, Global Draw OFF, Lossless 10-bit. Screen shows the 16:9 centre only.",
+                .help2   = "Wide (v5.03, 23.98p only): 4480x2214 recorded, 4336x2168 picture. Global Draw OFF, LL 10-bit.",
             },
             {
                 .name    = "Bit depth",

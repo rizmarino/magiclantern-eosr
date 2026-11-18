@@ -133,6 +133,9 @@ static int t4_runits = -1;             /* v5.02: right part in 4-px units; -1 = 
 #define T4_WN       (T4_W + T4_DCOLS)
 #define T4_PITCHN   (T4_WN * 10 / 8)
 #define T4_WSETN    ((T4_PITCHN * 8 + 13) / 14)
+/* v5.03: recorder hooks (rectest_r.c): held frame width in px and the 10-bit width field Mem1Path +0x10/+0x18 shows */
+int tall4k_width(void) { return t4_holding ? (int)T4_WN : T4_W; }
+int tall4k_wfield(void) { return t4_holding ? (int)T4_WSETN : (int)T4_WSET; }
 #define T4_DHD      ((uint32_t)t4_dhd)
 #define T4_TG98     0xE1C672ECu          /* FROM: value of reg 0xD0406198 (HD-1) */
 #define T4_TG9C     0xE1C672F4u          /* FROM: value of reg 0xD040619C (HD-1) */
@@ -390,7 +393,7 @@ static int t4_auto = 1;                 /* v4.77: 1 ML requests magnify in/out i
 static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while holding */
 /* v4.79 persistent mode (Debug > Taller 4K mode, kept in magic.cfg): a watcher switches 4K 23.98p movie LV to the
  * taller frame by itself and back before anything that could rebuild 4K at another size or rate. */
-CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694) */
+CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694), 3 wide 4480x2214 (v5.03) */
 static int t4_persist_run;              /* the running t4_task was started by the watcher */
 static int t4_pmode_run;                /* the mode value the running switch was started for */
 static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
@@ -589,7 +592,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.02 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.03 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -982,10 +985,10 @@ revert:
                  * bit order for its encoder and leaves the tap on (tall4k_active). Ends with magnify, no time limit. */
                 t4_holding = 1; t4_nocancel = 1; t4_gm0 = CURRENT_GUI_MODE; held = 1;
                 t4_log("hold: Canon GUI mode %d\n", t4_gm0);
-                t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", T4_W, T4_H + T4_DROWS);
+                t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", (int)T4_WN, T4_H + T4_DROWS);
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
-                if (t4_persist_run) NotifyBox(4000, "Taller 4K %dx%d", T4_W, T4_H + T4_DROWS);
+                if (t4_persist_run) NotifyBox(4000, T4_DCOLS ? "Wide 4K %dx%d" : "Taller 4K %dx%d", (int)T4_WN, T4_H + T4_DROWS);
                 else NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
@@ -1298,7 +1301,7 @@ void tall4k_tick(void)
     if (!t4_pmode || t4_suspend || t4_zt_running) { idle_since = 0; return; }
     if (get_ms_clock() - t_end < 1000) { idle_since = 0; t4_soon = !t4_holding; return; }
     int slot = (int)MEM(T4_SDRV + 0x70);
-    int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && slot != 9) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
+    int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && (slot != 9 || t4_pmode == 3)) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
               : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 0;
     if (why)
     {
@@ -1315,7 +1318,12 @@ void tall4k_tick(void)
     t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1; t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_runits = -1; t4_r76 = -1;
     t4_pmode_run = t4_pmode;
     t4_preview_run = t4_preview;
-    t4_drows = t4_pmode == 2 ? 480 : 200;
+    t4_drows = t4_pmode == 3 ? 0 : t4_pmode == 2 ? 480 : 200;
+    if (t4_pmode == 3)
+    {   /* v5.03: 4K frame height "Wide 4480x2214" = the camera-verified v5.02 set (desk W4c): sensor window 351..1430
+         * (+216 px), MEM1 / receiver 4480, line HD 1500, VD 1390 (23.98p), blank 167, sensor 0x76 0 (whole row) */
+        t4_dcols = 224; t4_dhd = 56; t4_lunits = 27; t4_runits = 27; t4_r76 = 0;
+    }
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_persist_task, 0);
@@ -1331,6 +1339,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else MENU_SET_RINFO("waiting");
     if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
     else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused after a failed switch: set Normal and back to retry.");
+    else if (t4_pmode == 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen shows coloured bands while wide; the recording is fine.");
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
