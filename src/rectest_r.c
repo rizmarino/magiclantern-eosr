@@ -862,8 +862,15 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
          * on an odd row (73): the Bayer phase flipped and LibRaw rendered M16-2152 grey with green edges. */
         ay += 28; ay2 = c_ch - 28;
     }
-    ri[9] = 0; ri[10] = 0; ri[11] = c_cw - ax; ri[12] = ay2 - ay;  /* jpeg crop, relative to the active area */
-    ri[13] = ay; ri[14] = ax; ri[15] = ay2; ri[16] = c_cw;        /* active area: y1, x1, y2, x2 */
+    uint32_t ax2 = c_cw;
+    if (tall4k_active() && c_cw == 4480 && c_x0 == 0)
+    {   /* v5.04 4K frame height Wide: the last 16 columns (4464..4479) come out with the Bayer order shuffled (camera
+         * M18-1958: R/G phase swapped in 4464-4469, 4472-4473, 4476-4479), like normal 4K's 8 receiver pad columns
+         * at the end of the line. Active area 144..4463 = 4320x2168. */
+        ax2 = 4464;
+    }
+    ri[9] = 0; ri[10] = 0; ri[11] = ax2 - ax; ri[12] = ay2 - ay;  /* jpeg crop, relative to the active area */
+    ri[13] = ay; ri[14] = ax; ri[15] = ay2; ri[16] = ax2;         /* active area: y1, x1, y2, x2 */
     ri[19] = 0x02010100; ri[20] = 21;                            /* RGGB, D65 */
     for (int i = 0; i < 9; i++) { ri[21 + 2 * i] = cm[i]; ri[22 + 2 * i] = 10000; }
     ri[39] = 1100;
@@ -3901,7 +3908,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
-    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4336x2168, 10-bit" : "4K tall 4256x2694, 10-bit");
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4320x2168, 10-bit" : "4K tall 4256x2694, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4040,7 +4047,7 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694", "Wide 4480x2214"),
                 .update  = tall4k_height_update,
                 .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
-                .help2   = "Wide (v5.03, 23.98p only): 4480x2214 recorded, 4336x2168 picture. Global Draw OFF, LL 10-bit.",
+                .help2   = "Wide (23.98p only): 4480x2214 recorded, 4320x2168 picture. Global Draw OFF, LL 10-bit.",
             },
             {
                 .name    = "Bit depth",
