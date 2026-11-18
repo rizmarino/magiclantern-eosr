@@ -120,7 +120,14 @@ static int t4_lunits = -1;
 static int t4_r76 = -1;
 static int t4s_i76f = -1, t4s_i76t = -1; static uint32_t t4s_o76f, t4s_o76t;
 #define T4_LU       ((uint32_t)(t4_lunits >= 0 ? t4_lunits : (int)(T4_DCOLS / 8)))
-#define T4_RU       ((uint32_t)(T4_DCOLS / 4 - T4_LU))
+static int t4_runits = -1;             /* v5.02: right part in 4-px units; -1 = the rest of DCOLS */
+#define T4_RU       ((uint32_t)(t4_runits >= 0 ? t4_runits : (int)(T4_DCOLS / 4 - T4_LU)))
+/* v5.02: sensor columns actually added (window), vs T4_DCOLS = MEM1 / receiver width (+8 pad cols as in 4K) */
+#define T4_WINC     (4 * (T4_LU + T4_RU))
+/* v5.02: frame timing per line-time step (frame ticks = VD * HD + FA28 / 3 = 1001/24000 s; RPS = VD - 35) */
+#define T4_VD       (T4_DHD == 56 ? 1390 : 1428)
+#define T4_RPS      (T4_VD - 35)
+#define T4_FA28     (T4_DHD == 56 ? 1250 : 1610)
 /* v4.98: tapped wider frame: width WN, 10-bit line = WN * 10 / 8 bytes, Mem1Path width field such that
  * (field * 14) >> 3 = line bytes (4256 -> 3040 / 5320, 4320 -> 3086 / 5400) */
 #define T4_WN       (T4_W + T4_DCOLS)
@@ -157,7 +164,7 @@ static uint32_t t4_wdelta(uint32_t a)
                 case 2: return 2 * T4_DCOLS;
                 case 3: return T4_DCOLS / 8;
                 case 4: return (uint32_t)((int)T4_DHD / 2 - (int)(T4_DCOLS / 8));   /* blank (v4.96: + HD/2 growth) */
-                case 5: return T4_DCOLS << 16;
+                case 5: return T4_WINC << 16;                                                  /* v5.02: window width (W4) */
                 case 6: return T4_DCOLS / 4;                                                   /* w/4 + c */
                 case 7: return (uint32_t)(2 * ((int)T4_DHD / 2 - (int)(T4_DCOLS / 8)));       /* 2 * blank + c */
             }
@@ -309,7 +316,7 @@ static void t4_apply_all(void)
         t4_put((volatile uint32_t *)(t4s_base + (T4_TG98 - T4_FROM)), 0x5a3 + T4_DHD);
         t4_put((volatile uint32_t *)(t4s_base + (T4_TG9C - T4_FROM)), 0x5a3 + T4_DHD);
         t4_put(&t4s_full[t4s_i51f], (t4s_o51f & ~0x3fffff) | (0x2000 | ((1444 + T4_DHD) / 2 - 1)));
-        t4_sdw(0x820, 1444 + T4_DHD); t4_sdw(0, 1428); t4_sdw(0x618, 1393); t4_sdw(0xa28, 1610);
+        t4_sdw(0x820, 1444 + T4_DHD); t4_sdw(0, T4_VD); t4_sdw(0x618, T4_RPS); t4_sdw(0xa28, T4_FA28);
         t4_put((volatile uint32_t *)T4_AELINE, 20 * (1444 + T4_DHD));
     }
     for (int k = 0; k < T4_NYUV; k++)          /* v4.82: Canon's display crop follows the centred window */
@@ -582,7 +589,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.01 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.02 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -697,6 +704,8 @@ static void t4_task(void *unused)
                 else t4_log("0x76 plan: full[%d] / template[%d] 0xff -> %x\n", t4s_i76f, t4s_i76t, t4_r76);
             }
             int sl = (int)MEM(T4_SDRV + 0x70);
+            if (T4_DCOLS && t4_lunits >= 0 && (((378 - T4_LU) % 3) || T4_WINC > T4_DCOLS))
+            { ebad++; t4_log("  window start %d..%d not on a 12-px group (or wider than +%d)\n", 378 - T4_LU, 1403 + T4_RU, T4_DCOLS); }
             if ((T4_DCOLS % 8) || T4_DCOLS > 448 || (sl != 4 && sl != 9)) { ebad++; t4_log("  width +%d needs a multiple of 8 <= 448 and 23.98/24p (slot %d)\n", T4_DCOLS, sl); }
             if (T4_DHD)
             {
@@ -711,11 +720,11 @@ static void t4_task(void *unused)
                        (int)MEM(T4_AELINE));
                 if (sl != 4 || t[0] != 1444 || t[0x208] != 1110 || t[0x30c] != 1409 || t[0x410] != 1444 || t[0x514] != 842
                     || r98 != 0xD0406198 || r9c != 0xD040619C || tg98 != 0x5a3 || tg9c != 0x5a3 || t4s_i51f < 0
-                    || (t4s_o51f & 0x3fffff) != 0x22d1 || MEM(T4_AELINE) != 28880 || T4_DHD != 16
+                    || (t4s_o51f & 0x3fffff) != 0x22d1 || MEM(T4_AELINE) != 28880 || (T4_DHD != 16 && T4_DHD != 56)
                     || 167 + T4_DHD / 2 < 167 + T4_DCOLS / 8)
                 { ebad++; t4_log("  timing values unexpected (or not 23.98p): not touched\n"); }
-                else t4_log("timing plan: HD 1444 -> %d (TG %x, 0x51 %x), VD 1428, RPS 1393, FA28 1610, AE %d ns, blank %d\n",
-                            1444 + T4_DHD, 0x5a3 + T4_DHD, 0x2000 | ((1444 + T4_DHD) / 2 - 1), 20 * (1444 + T4_DHD),
+                else t4_log("timing plan: HD 1444 -> %d (TG %x, 0x51 %x), VD %d, RPS %d, FA28 %d, AE %d ns, blank %d\n",
+                            1444 + T4_DHD, 0x5a3 + T4_DHD, 0x2000 | ((1444 + T4_DHD) / 2 - 1), T4_VD, T4_RPS, T4_FA28, 20 * (1444 + T4_DHD),
                             167 + T4_DHD / 2 - T4_DCOLS / 8);
             }
             t4_log("width +%d cols: MEM1 w %d, 0x74/0x75 %x/%x -> %x/%x, 0x60 %x -> %x (blank 167 -> %d), %d width values\n",
@@ -764,7 +773,7 @@ static void t4_task(void *unused)
     /* 2. raw tap + 10-bit (v4.66: skipped in the no-tap variant; MEM1 is then never written) */
     t4_log("variant: %s; tap flags 0x1311c+4 %d, Mem1Path +40 %d, +50 %d\n", t4_tap ? "raw tap + 10-bit" : "NO raw tap",
            (int)MEM(0x1311C + 4), (int)MEM(T4_PATH + 0x40), (int)MEM(T4_PATH + 0x50));
-    if ((T4_DCOLS || T4_DHD) && t4_tap && T4_DCOLS != 0 && T4_DCOLS != 64 && T4_DCOLS != 56) { snprintf(t4_result, sizeof(t4_result), "tapped width test: +56 / +64 only"); goto out; }
+    if ((T4_DCOLS || T4_DHD) && t4_tap && T4_DCOLS != 0 && T4_DCOLS != 64 && T4_DCOLS != 56 && T4_DCOLS != 224) { snprintf(t4_result, sizeof(t4_result), "tapped width test: +56 / +64 only"); goto out; }
     if (!t4_tap && (MEM(0x1311C + 4) || MEM(T4_PATH + 0x40)))
     {
         /* v4.67: camera v4.66 ran "no tap" with the tap on (RAW zebras/histogram keep lv_save_raw on in movie LV) */
@@ -1137,12 +1146,15 @@ static void t4_wselect(void *priv, int delta)
     if (v == 7) t4_dcols = 0;                            /* v5.01 W4a: longer line, normal width, 0x76 = 0xaa (left half) */
     if (v == 8) t4_dcols = 56;                           /* v5.01 W4b: v5.00 aligned +56 + 0x76 = 0x00 (full width) */
     t4_lunits = (v == 6 || v == 8) ? 6 : -1;             /* v5.00: +56 with the start on a 12-px boundary (372 * 4) */
+    t4_runits = -1;
     t4_r76 = v == 7 ? 0xaa : v == 8 ? 0x00 : -1;
+    if (v == 9)                                          /* v5.02 W4c: window 351..1430 (+216), MEM1 4480, HD 1500, 0x76 0 */
+    { t4_dcols = 224; t4_dhd = 56; t4_lunits = 27; t4_runits = 27; t4_r76 = 0; }
     if (v >= 3) { t4_tap = 1; t4_dump = 1; }   /* v4.98: tapped +64 -> T4_4320W.BIN; v4.99: +56 -> T4_4312W.BIN */
     t4_d68 = 0; t4_d69 = 0;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
-    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : v == 3 ? "Wider 4K +64 (raw tap): close the ML menu" : v == 4 ? "Wider 4K +56 (raw tap): close the ML menu" : v == 5 ? "Longer line (raw tap): close the ML menu" : v == 6 ? "Wider +56, 12-px start (raw tap): close the ML menu" : v == 7 ? "Sensor 0x76 left half (raw tap): close the ML menu" : v == 8 ? "Wider +56, 0x76 full (raw tap): close the ML menu" : "Wider 4K +64: close the ML menu to start");
+    NotifyBox(4000, v == 1 ? "Longer line: close the ML menu to start" : v == 3 ? "Wider 4K +64 (raw tap): close the ML menu" : v == 4 ? "Wider 4K +56 (raw tap): close the ML menu" : v == 5 ? "Longer line (raw tap): close the ML menu" : v == 6 ? "Wider +56, 12-px start (raw tap): close the ML menu" : v == 7 ? "Sensor 0x76 left half (raw tap): close the ML menu" : v == 8 ? "Wider +56, 0x76 full (raw tap): close the ML menu" : v == 9 ? "Wider 4K 4480 (raw tap): close the ML menu" : "Wider 4K +64: close the ML menu to start");
 }
 static void t4_select(void *priv, int delta)
 {
@@ -1151,7 +1163,7 @@ static void t4_select(void *priv, int delta)
     t4_persist_run = 0; t4_dump = 1;
     t4_tap = priv ? *(int *)priv : 1;
     t4_drows = t4_steps[(t4_sel >= 0 && t4_sel <= 4) ? t4_sel : 0];
-    t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_r76 = -1;
+    t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_runits = -1; t4_r76 = -1;
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_task, 0);
@@ -1300,7 +1312,7 @@ void tall4k_tick(void)
     if (!idle_since) { idle_since = get_ms_clock(); return; }
     if (get_ms_clock() - idle_since < 2000) return;
     idle_since = 0;
-    t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1; t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_r76 = -1;
+    t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1; t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_runits = -1; t4_r76 = -1;
     t4_pmode_run = t4_pmode;
     t4_preview_run = t4_preview;
     t4_drows = t4_pmode == 2 ? 480 : 200;
@@ -1322,7 +1334,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
-static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3, t4_four = 4, t4_five = 5, t4_six = 6, t4_seven = 7, t4_eight = 8;
+static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3, t4_four = 4, t4_five = 5, t4_six = 6, t4_seven = 7, t4_eight = 8, t4_nine = 9;
 static struct menu_entry t4_menu[] = {
     {
         .name     = "Taller 4K tests",
@@ -1472,6 +1484,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v5.01: aligned +56 (as v5.00) with sensor 0x76 = 0x00 (full-width code, as FHD).",
                 .help2  = "Expect ~4160 image cols. Saves ML/LOGS/T4_4312R.BIN. 4K 23.98p, Global Draw OFF.",
+            },
+            {
+                .name   = "Wider 4K 4480, raw tap",
+                .priv   = &t4_nine,
+                .select = t4_wselect,
+                .update = t4_update,
+                .help   = "v5.02: window +216 (sensor 351..1430), MEM1 4480, line 30.0 us / 1390 lines (23.98p),",
+                .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
             },
             MENU_EOL,
         },
