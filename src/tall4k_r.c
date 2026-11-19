@@ -60,6 +60,11 @@
  * 240 rows higher. Shifted like the YUV crop (y + rows/2, in_h = real height) through the ROM remap. */
 static const uint32_t t4_va[2] = { 0xE12250B8, 0xE12251C0 };
 static uint32_t *t4s_var[2];
+/* v5.06 (desk D1, wider-desk.md): the LV path's line width is valid-area word 0 (in_w): MvRawProPath_SetPath writes the
+ * record into the LTKIDS crop block (0xD041E088.. = (in_h-1) << 16 | (in_w/2 - 1)). Wide left it at 4256 for a 4480 line:
+ * each LV row started 224 px late -> sheared, Bayer-flipped horizontal bands. 0 off, 1 in_w only, 2 in_w + window x
+ * moved by the extra left columns (frames like normal 4K). */
+CONFIG_INT("t4.wlv", t4_wlv, 2);
 /* v4.89: per-mode table 0xE1224CC8 (20-byte entries {flag, 0, valid area*, out*, out*}) pairs each valid-area record
  * with a 17-word output record; 4K: 0xE1225288 / 0xE1225354 {4, 3, 3840, 2160, 1, 1, 1, 1, 0x10001, 3840, 0, 0,
  * 3840, 2160, 1, 1, 0} (hypothesis: the LV YUV / display picture the valid area is resized to).
@@ -334,6 +339,11 @@ static void t4_apply_all(void)
             t4s_var[k][1] = T4_H + T4_DROWS;
             if (t4_preview) { t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166 + T4_DROWS; }
             else t4s_var[k][4] = 47 + 2 * t4_d68;
+            if (T4_DCOLS && t4_wlv)
+            {
+                t4s_var[k][0] = T4_WN;
+                if (t4_wlv == 2) t4s_var[k][3] = 272 + 4 * T4_LU;
+            }
             romremap_flush(t4s_var[k], 44);
             if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4_fit_w(); t4s_vout[k][12] = t4_fit_w() / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
@@ -382,7 +392,7 @@ static void t4_restore_all(void)
     for (int k = 0; k < 2; k++)
         if (t4s_var[k])
         {
-            t4s_var[k][1] = T4_H; t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166;
+            t4s_var[k][0] = T4_W; t4s_var[k][1] = T4_H; t4s_var[k][3] = 272; t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166;
             romremap_flush(t4s_var[k], 44);
             if (t4s_vout[k]) { t4s_vout[k][2] = 3840; t4s_vout[k][12] = 3840 / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
@@ -395,7 +405,8 @@ static volatile int t4_end_req;         /* v4.77: menu "End taller 4K" while hol
  * taller frame by itself and back before anything that could rebuild 4K at another size or rate. */
 CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in post), 2 +480 (4256x2694), 3 wide 4480x2214 (v5.03), 4 wide +264 rows 4480x2478 (v5.05) */
 static int t4_persist_run;              /* the running t4_task was started by the watcher */
-static int t4_pmode_run;                /* the mode value the running switch was started for */
+static int t4_pmode_run;
+static int t4_wlv_run;                  /* v5.06 */                /* the mode value the running switch was started for */
 static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
 static volatile int t4_key_pend;        /* key held back until normal 4K is back, then re-sent */
 static volatile int t4_soon;            /* v4.86: the watcher is counting down to a switch (REC held back) */
@@ -440,7 +451,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         {
             /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
              * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
-            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run;   /* v4.89: a preview change re-applies too */
+            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run;   /* v4.89: a preview change re-applies too */
             if (ch != mchg)
             {
                 mchg = ch;
@@ -592,7 +603,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.05 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.06 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -770,6 +781,8 @@ static void t4_task(void *unused)
 #ifndef R_TESTS
     t4_preview = 0;                        /* v4.92: Squeeze / Fit didn't work (see t4_preview) */
 #endif
+    if (T4_DCOLS) t4_log("wide screen fix %d: valid area in_w %d -> %d, x 272 -> %d\n", t4_wlv, T4_W, t4_wlv ? (int)T4_WN : T4_W,
+                         t4_wlv == 2 ? 272 + 4 * (int)T4_LU : 272);
     t4_log("preview: %s (valid area y %d h %d, output w %d)\n", t4_preview == 2 ? "fit" : t4_preview ? "squeeze" : "centre",
            t4_preview ? 47 : 47 + 2 * t4_d68, t4_preview ? 2166 + (int)T4_DROWS : 2166, t4_preview == 2 ? (int)t4_fit_w() : 3840);
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
@@ -1320,6 +1333,7 @@ void tall4k_tick(void)
     t4_persist_run = 1; t4_dump = 0; t4_tap = 1; t4_hold = 1; t4_auto = 1; t4_place = 1; t4_dcols = 0; t4_dhd = 0; t4_lunits = -1; t4_runits = -1; t4_r76 = -1;
     t4_pmode_run = t4_pmode;
     t4_preview_run = t4_preview;
+    t4_wlv_run = t4_wlv;
     t4_drows = t4_pmode == 4 ? 264 : t4_pmode == 3 ? 0 : t4_pmode == 2 ? 480 : 200;   /* v5.05: 4 = wide 16:9 */
     if (t4_pmode >= 3)
     {   /* v5.03: 4K frame height "Wide 4480x2214" = the camera-verified v5.02 set (desk W4c): sensor window 351..1430
@@ -1503,6 +1517,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v5.02: window +216 (sensor 351..1430), MEM1 4480, line 30.0 us / 1390 lines (23.98p),",
                 .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
+            },
+            {
+                .name    = "Wide screen fix",
+                .priv    = &t4_wlv,
+                .max     = 2,
+                .choices = CHOICES("OFF", "Line width", "Width + centre"),
+                .help    = "v5.06: live view in the Wide heights. Line width = LV reads 4480-px lines (no bands);",
+                .help2   = "Width + centre = also frames like normal 4K. Applied at the next switch to Wide.",
             },
             MENU_EOL,
         },
