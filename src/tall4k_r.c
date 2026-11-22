@@ -466,6 +466,25 @@ static void t4_zoom(int z)
     if (t4_persist_run && z != 1) t4_marker(1);     /* v4.79: a switch starts (apply or end) */
     prop_request_change(PROP_LV_DISPSIZE, v, 8);
 }
+/* v5.11: why Canon didn't magnify. LVGMT's gate FUN_e04b1096 (decompiled 2026-11-22) refuses or defers a zoom request
+ * while: continuous shooting, recording, FE lock, flicker detection, LVGMT state 5 (mode change), the AF state object
+ * not idle (FUN_e02ee258() != 0, log "Magnify Save (AfSeq)") or a DTS flag +0x520 == 0 ("Magnify Save (AutoK)").
+ * Camera v5.09 / v5.10: the property went to 5 but m_SensorMode stayed 12 for 22 s, five switches in a row. Both
+ * getters are read-only (a state-object read; a table pointer). */
+extern int is_continuous_af(void);
+static char t4_nomag[56];
+static void t4_nomag_why(void)
+{
+    int afseq = ((int (*)(void))0xE02EE259)();
+    uint32_t d = ((uint32_t (*)(void))0xE04FFF9B)();
+    int dok = !(d & 3) && ((d >= 0x1000 && d < 0x40000000) || (d >= 0x40001000 && d < 0x7f000000) || (d >= 0xE0000000 && d < 0xE2000000));
+    int autok = dok ? (int)MEM(d + 0x520) : -1;
+    int servo = is_continuous_af();
+    t4_log("  no magnify: Canon AF state busy %d, AutoK flag %d (table %x), Movie Servo AF %d, dispsize prop %d, GUI mode %d\n",
+           afseq, autok, (int)d, servo, (int)t4_dz[0], (int)CURRENT_GUI_MODE);
+    snprintf(t4_nomag, sizeof(t4_nomag), "%s", afseq ? (servo ? "no zoom: Movie Servo AF is on" : "no zoom: Canon AF is busy")
+             : autok == 0 ? "no zoom: Canon blocks it (AutoK)" : "no zoom: Canon ignored the request");
+}
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
     int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0, mchg = 0;
@@ -522,6 +541,14 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         int autonow = ending || (t4_auto && !t4_holding);
         if (autonow && !seen13 && (!rq5 || (rq5 == 1 && get_ms_clock() - trq > 3000)) && !gui_menu_shown())
         { rq5++; trq = get_ms_clock(); t4_zoom(5); }
+        if (autonow && !seen13 && rq5 >= 2 && get_ms_clock() - trq > 2500 && !t4_holding && t4_pend_apply)
+        {
+            /* v5.11: two requests, ~5.5 s, no magnify: give up with Canon's reason instead of waiting 30 s (v5.09 /
+             * v5.10: the user powered off mid-wait, which left the crash marker). Nothing was applied yet. */
+            t4_nomag_why();
+            if (t4_dz[0] != 1) { uint32_t v[2] = { 1, t4_dz[1] }; prop_request_change(PROP_LV_DISPSIZE, v, 8); t4_log("  dispsize back to 1 requested\n"); }
+            return 2;
+        }
         if (autonow && seen13 && !rq1 && MEM(T4_STATE + 0xc) == 13 && !t4_pend_apply && !t4_pend_all && !t4_pend_lv
             && get_ms_clock() - t13 > 700)
         { rq1 = 1; t4_zoom(1); }
@@ -646,7 +673,7 @@ static void t4_task(void *unused)
     rec_ram = 0;
     t4_result[0] = 0;
     if (!t4_persist_run) t4_pk_run = 0;     /* v5.10: the zoom proof only rides on the 4K frame height mode */
-    t4_log("=== taller 4K v5.10 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.11 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -891,7 +918,7 @@ static void t4_task(void *unused)
         if (r1 || v1 != T4_H)
         { snprintf(t4_result, sizeof(t4_result), "cpu1 switch failed (rc %x cpu %d h %d)", r1, c1, (int)v1); goto out; }
     }
-    t4_applied = 0; t4_apply_fail = 0; t4_pend_apply = 1;
+    t4_applied = 0; t4_apply_fail = 0; t4_pend_apply = 1; t4_nomag[0] = 0;
     t4_trace_ms = t4_tap ? 2000 : 4000;
     if (t4_auto) NotifyBox(5000, "Taller 4K +%d: switching (auto magnify)...", T4_DROWS);
     else NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
@@ -903,7 +930,7 @@ static void t4_task(void *unused)
            narrowed, reflex14);
     t4_pend_apply = 0;
     patched = t4_applied;
-    if (rc) { snprintf(t4_result, sizeof(t4_result), "%s before the rebuild", rc == 1 ? "cancelled" : "no magnify seen"); goto revert; }
+    if (rc) { snprintf(t4_result, sizeof(t4_result), "%s", rc == 1 ? "cancelled before the rebuild" : t4_nomag[0] ? t4_nomag : "no magnify seen"); goto revert; }
     if (!patched) { snprintf(t4_result, sizeof(t4_result), "%s", t4_apply_fail ? "cpu1 check failed: not applied" : "magnify too short: not applied"); goto revert; }
     rebuilt = 1;
 
@@ -1485,7 +1512,8 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else if (t4_suspend) MENU_SET_RINFO("paused");
     else MENU_SET_RINFO("waiting");
     if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
-    else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused after a failed switch: set Normal and back to retry.");
+    else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused (%s): set Normal and back to retry.", t4_result[0] ? t4_result : "failed switch");
+    else if (is_continuous_af()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Movie Servo AF is on: Canon may refuse the zoom the switch needs. Set Disable.");
     else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen = middle 3840 of the 4320 px recorded (Frame guide).");
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
