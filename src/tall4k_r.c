@@ -482,8 +482,12 @@ static void t4_nomag_why(void)
     int servo = is_continuous_af();
     t4_log("  no magnify: Canon AF state busy %d, AutoK flag %d (table %x), Movie Servo AF %d, dispsize prop %d, GUI mode %d\n",
            afseq, autok, (int)d, servo, (int)t4_dz[0], (int)CURRENT_GUI_MODE);
-    snprintf(t4_nomag, sizeof(t4_nomag), "%s", afseq ? (servo ? "no zoom: Movie Servo AF is on" : "no zoom: Canon AF is busy")
-             : autok == 0 ? "no zoom: Canon blocks it (AutoK)" : "no zoom: Canon ignored the request");
+    /* v5.12: camera v5.11 (2 runs): AF idle, AutoK 1, servo off, and the phone photo shows neither Canon's AF frame nor
+     * its magnify icon (both present in the working runs' photos): suspect AF method Face+Tracking. Values unverified
+     * on the R, logged to learn them. Short texts: the v5.11 message ran off the screen and wrapped over itself. */
+    t4_log("  no magnify: af_mode %x, lv_af_system %x\n", (int)af_mode, (int)lv_af_system);
+    snprintf(t4_nomag, sizeof(t4_nomag), "%s", afseq ? (servo ? "Movie Servo AF is on" : "Canon AF is busy")
+             : autok == 0 ? "Canon blocks zoom (AutoK)" : "Canon refused zoom");
 }
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
@@ -673,7 +677,7 @@ static void t4_task(void *unused)
     rec_ram = 0;
     t4_result[0] = 0;
     if (!t4_persist_run) t4_pk_run = 0;     /* v5.10: the zoom proof only rides on the 4K frame height mode */
-    t4_log("=== taller 4K v5.11 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.12 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -1145,7 +1149,7 @@ out:
         }
         else if (!held && rc != 1) t4_suspend = 1;   /* refused or came up wrong: no automatic retries until the mode changes */
         if (t4_key_pend) t4_log("key %x ended the taller frame\n", t4_key_pend);
-        if (t4_suspend) NotifyBox(8000, "Taller 4K mode paused: %s (see ML/LOGS/TALL4K.TXT)", t4_result);
+        if (t4_suspend) NotifyBox(8000, "4K height paused: %s", t4_result);   /* v5.12: <= ~40 chars fit the R's screen */
     }
     else NotifyBox(8000, "Taller 4K: %s", t4_result);
     t4_running = 0;
@@ -1512,6 +1516,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else if (t4_suspend) MENU_SET_RINFO("paused");
     else MENU_SET_RINFO("waiting");
     if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
+    else if (t4_suspend && t4_nomag[0]) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused: %s. AF method 1-point AF? Then Normal and back.", t4_nomag);
     else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused (%s): set Normal and back to retry.", t4_result[0] ? t4_result : "failed switch");
     else if (is_continuous_af()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Movie Servo AF is on: Canon may refuse the zoom the switch needs. Set Disable.");
     else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen = middle 3840 of the 4320 px recorded (Frame guide).");
