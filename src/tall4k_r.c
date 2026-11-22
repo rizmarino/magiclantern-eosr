@@ -77,6 +77,30 @@ int t4_preview;                         /* v4.89 preview test, R_TESTS only (Deb
                                          * 2 Fit. Camera: Squeeze only moved the 2166-row LV window up (valid-area h is
                                          * ignored, v4.91 photos), Fit froze (v4.90). v4.92: always Centre otherwise. */
 static int t4_preview_run;              /* preview the held frame was applied with */
+/* v5.10 (desk D2 / D3, wider-desk.md): the screen picture is NOT made from the output record above. MvDevelop develops
+ * a fixed 3848x2166 from the raw in MEMNAVI 0x10012 (own record 0xE1239C58), and the only resizer on the way to the
+ * screen is Opti in MvPostDevelop: per-mode entries 0xE11D411C + e * 0x124, +0x90 -> {k_h, k_v} record, input span =
+ * out * (1024 - k) / 1024, read on every frame-parameter update (FUN_e06d0224). So Squeeze wrote 2166 + rows into the
+ * 14,585,844-byte raw buffer (12-bit: ~687 KB past its end per frame at +480) and the developer showed the top 2166
+ * rows: v5.10 forces Centre in every build.
+ * Screen zoom proof (Debug > Taller 4K tests, not saved): the 4K record 0xE11D3DFC {0, 0} -> {103, 103}, word for word
+ * Canon's digital-IS level 1 entry (entry 1 differs from entry 0 only in that pointer). No size or buffer changes.
+ * Predicted: screen 1.112x closer about the centre (3454x1943 of the 3840x2160 view), recording unchanged. Proves or
+ * disproves that Opti runs on the 4K standby path and obeys a remapped record, before any whole-frame attempt. */
+#define T4_PK       0xE11D3DFCu         /* MvPostDevelop k record of entry 0 (4K), followed by {103, 103}, {308, 308} */
+#define T4_PKPTR    0xE11D41ACu         /* entry 0 +0x90 -> T4_PK */
+#define T4_PDSTATE  0x18D18u            /* MvPostDevelop state: +6 u16 EZoom step, +0x78 entry*, +0x80 / +0x84 per-frame zoom */
+#define T4_MDSTATE  0x246E4u            /* MvDevelop state: +0x24 entry* (4K 0xE123957C) */
+int t4_pk;                              /* menu: 0 OFF, 1 k = 103 */
+static int t4_pk_run;
+static uint32_t *t4s_pk;
+static void t4_log(const char *fmt, ...);
+static void t4_pk_log(const char *when)
+{
+    t4_log("zoom proof %s: k ROM view %d %d, PostDev entry %x step %d zoom %d %d, MvDev entry %x\n", when, (int)MEM(T4_PK),
+           (int)MEM(T4_PK + 4), (int)MEM(T4_PDSTATE + 0x78), (int)*(volatile uint16_t *)(T4_PDSTATE + 6),
+           (int)MEM(T4_PDSTATE + 0x80), (int)MEM(T4_PDSTATE + 0x84), (int)MEM(T4_MDSTATE + 0x24));
+}
 
 #define T4_NYUV     4
 /* v4.68: 4K engine init values in the FROM blob ({reg, value} lists) that carry the frame height; v4.64-v4.67 left
@@ -348,6 +372,7 @@ static void t4_apply_all(void)
             romremap_flush(t4s_var[k], 44);
             if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4_fit_w(); t4s_vout[k][12] = t4_fit_w() / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
+    if (t4_pk_run && t4s_pk) { t4s_pk[0] = 103; t4s_pk[1] = 103; romremap_flush(t4s_pk, 8); }   /* v5.10 screen zoom proof */
 }
 
 static void t4_restore_all(void)
@@ -397,6 +422,7 @@ static void t4_restore_all(void)
             romremap_flush(t4s_var[k], 44);
             if (t4s_vout[k]) { t4s_vout[k][2] = 3840; t4s_vout[k][12] = 3840 / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
+    if (t4s_pk) { t4s_pk[0] = 0; t4s_pk[1] = 0; romremap_flush(t4s_pk, 8); }
 }
 
 static int t4_nocancel;                 /* v4.75: hold: the ML menu must not end the wait */
@@ -453,7 +479,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         {
             /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
              * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
-            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run;   /* v4.89: a preview change re-applies too */
+            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run || t4_pk != t4_pk_run;   /* v4.89: a preview change re-applies too; v5.10: zoom proof */
             if (ch != mchg)
             {
                 mchg = ch;
@@ -538,6 +564,15 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                    (int)t4s_full[t4s_i68f],
                    (int)t4s_full[t4s_i69f], (int)t4s_full[t4s_i97f], (int)t4s_lvt[t4s_i68t], (int)t4s_lvt[t4s_i69t],
                    t4s_rod[t4s_slot], r1, c1, (int)v1);
+            if (t4_pk_run && t4s_pk)
+            {
+                /* v5.10: does cpu1 see the patched k word too? (which core runs FUN_e06d0224 is unknown) */
+                int c2 = -1, calls2 = 0; uint32_t v2 = 0;
+                int r2 = romremap_cpu1(T4_PK, &c2, &v2, &calls2);
+                t4_log("  zoom proof applied: k RAM %d %d, ROM view cpu0 %d, cpu1 %d (rc %x cpu %d)\n", (int)t4s_pk[0], (int)t4s_pk[1],
+                       (int)MEM(T4_PK), (int)v2, r2, c2);
+                t4_pk_log("in magnify");
+            }
             if (r1 || v1 != T4_H + T4_DROWS)
             {
                 t4_restore_all(); t4_applied = 0; t4_apply_fail = 1;
@@ -610,7 +645,8 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.08 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    if (!t4_persist_run) t4_pk_run = 0;     /* v5.10: the zoom proof only rides on the 4K frame height mode */
+    t4_log("=== taller 4K v5.10 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -785,9 +821,21 @@ static void t4_task(void *unused)
         }
         t4s_vout[k] = o;
     }
-#ifndef R_TESTS
-    t4_preview = 0;                        /* v4.92: Squeeze / Fit didn't work (see t4_preview) */
-#endif
+    t4_preview = 0;                        /* v5.10: in every build. Squeeze overran Canon's raw buffer (desk D2), Fit froze */
+    t4s_pk = (uint32_t *)romremap_ram(T4_PK);
+    if (t4_pk_run)
+    {
+        /* v5.10 screen zoom proof: the record must be Canon's {0, 0} followed by the digital-IS records, and entry 0
+         * must point at it. The state words are logged, not checked: a wrong entry only means no visible effect. */
+        if (!t4s_pk || t4s_pk[0] || t4s_pk[1] || t4s_pk[2] != 103 || t4s_pk[3] != 103 || t4s_pk[4] != 308 || MEM(T4_PKPTR) != T4_PK)
+        {
+            t4_log("zoom proof: k record %s %d %d %d %d, entry 0 ptr %x\n", t4s_pk ? "unexpected" : "not mapped", t4s_pk ? (int)t4s_pk[0] : 0,
+                   t4s_pk ? (int)t4s_pk[1] : 0, t4s_pk ? (int)t4s_pk[2] : 0, t4s_pk ? (int)t4s_pk[3] : 0, (int)MEM(T4_PKPTR));
+            snprintf(t4_result, sizeof(t4_result), "zoom proof: k record unexpected"); goto out;
+        }
+        t4_pk_log("plan");
+        if (MEM(T4_PDSTATE + 0x78) != 0xE11D411C) t4_log("zoom proof: PostDev entry is not 4K entry 0 (digital IS on? 10-bit?): expect no effect\n");
+    }
     if (T4_DCOLS) t4_log("wide screen fix %d: valid area in_w %d -> %d, x 272 -> %d\n", t4_wlv, T4_W, t4_wlv ? (int)T4_WN : T4_W,
                          t4_wlv == 2 ? 272 + 4 * (int)T4_LU : t4_wlv == 3 ? (int)((272 + 4 * T4_LU + 15) & ~15u) : 272);
     t4_log("preview: %s (valid area y %d h %d, output w %d)\n", t4_preview == 2 ? "fit" : t4_preview ? "squeeze" : "centre",
@@ -871,6 +919,7 @@ static void t4_task(void *unused)
                i74 >= 0 ? (int)l7[i74] : -1, i75 >= 0 ? (int)l7[i75] : -1, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
                (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_REC), (int)t4s_rec_ram[0]);
     }
+    if (t4_pk_run) t4_pk_log("after rebuild");
     t4_log("after rebuild: MEM1 %dx%d (+18 %d, +1c %d), f2 %d, unit %x, live lv7 0x68 %x 0x69 %x\n", (int)m1w, (int)m1h,
            (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c), (int)MEM(T4_UNIT),
            i68 >= 0 ? (int)l7[i68] : -1, i69 >= 0 ? (int)l7[i69] : -1);
@@ -1348,6 +1397,7 @@ void tall4k_tick(void)
     t4_pmode_run = t4_pmode;
     t4_preview_run = t4_preview;
     t4_wlv_run = t4_wlv;
+    t4_pk_run = t4_pk;
     t4_drows = t4_pmode == 4 ? 264 : t4_pmode == 3 ? 0 : t4_pmode == 2 ? 480 : 200;   /* v5.05: 4 = wide 16:9 */
     if (t4_pmode >= 3)
     {   /* v5.03: 4K frame height "Wide 4480x2214" = the camera-verified v5.02 set (desk W4c): sensor window 351..1430
@@ -1393,9 +1443,11 @@ void tall4k_guide_tick(void)
     int pw = T4_DCOLS ? 4320 : 4112, ph = 2168 + (int)T4_DROWS;
     if (t4_persist_run && t4_pmode_run == 1) ph = 2312;
     if (t4_persist_run && t4_pmode_run == 4) ph = 2430;
-    int sx = (pw - 3840) / 2, sy = t4_place ? (ph - 2160) / 2 : 0;
+    int sw = 3840, sh = 2160;
+    int sx = (pw - sw) / 2, sy = t4_place ? (ph - sh) / 2 : 0;
     if (T4_DCOLS && t4_wlv_run == 1) sx -= 4 * (int)T4_LU;     /* Wide screen fix "Line width": view 108 px left */
-    int l = MAX(sx, 0), r = MAX(pw - 3840 - sx, 0), t = MAX(sy, 0), b = MAX(ph - 2160 - sy, 0);
+    if (t4_pk_run) { sx += (sw - 3454) / 2; sy += (sh - 1943) / 2; sw = 3454; sh = 1943; }   /* v5.10 zoom proof: PREDICTED span, 3840 x 921 / 1024 */
+    int l = MAX(sx, 0), r = MAX(pw - sw - sx, 0), t = MAX(sy, 0), b = MAX(ph - sh - sy, 0);
     get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
     int w = T4G_W, h = (T4G_W * ph / pw + 1) & ~1;
     int x = (t4_guide == 2 || t4_guide == 4) ? os.x_max - w - 8 : os.x0 + 8;
@@ -1498,8 +1550,8 @@ static struct menu_entry t4_menu[] = {
                 .priv    = &t4_preview,
                 .max     = 2,
                 .choices = CHOICES("Centre", "Squeeze", "Fit"),
-                .help    = "Screen test: Squeeze = valid-area h (ignored: only moves the window up, v4.91).",
-                .help2   = "Fit FROZE the camera (v4.90). Also used by 4K frame height. Not saved.",
+                .help    = "DISABLED since v5.10 (always Centre): Squeeze wrote past Canon's raw buffer (desk D2),",
+                .help2   = "Fit froze the camera (v4.90).",
             },
 #endif
             {
@@ -1596,6 +1648,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v5.02: window +216 (sensor 351..1430), MEM1 4480, line 30.0 us / 1390 lines (23.98p),",
                 .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
+            },
+            {
+                .name    = "Screen zoom proof",
+                .priv    = &t4_pk,
+                .max     = 1,
+                .choices = CHOICES("OFF", "1.11x (k 103)"),
+                .help    = "v5.10 test: Canon's digital-IS level 1 zoom value in the 4K post-develop table (2 words).",
+                .help2   = "With a 4K frame height on: screen 1.11x closer, recording unchanged. Re-applies at menu close. Not saved.",
             },
             {
                 .name    = "Wide screen fix",
