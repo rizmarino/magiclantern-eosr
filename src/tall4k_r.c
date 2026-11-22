@@ -759,7 +759,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.14 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.15 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 

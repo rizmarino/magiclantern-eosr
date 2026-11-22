@@ -148,13 +148,22 @@ void romremap_flush(void *ram, size_t n)
  * address so cpu0 can tell whether cpu1 sees the remapped page. Returns 0 if cpu1 switched; results in cpu, val. */
 extern int _request_RPC(void (*f)(void *), void *o);
 extern int clear_RPC_request(void);
-static volatile int rr1_done, rr1_cpu, rr1_calls;
-static volatile uint32_t rr1_val, rr1_probe_addr;
+/* v5.15: request / answer are matched by a sequence number. v5.14 probed three addresses back to back and 4 of 6
+ * checks read 0 with rc 0: a late extra call of the previous request (Canon's RPC may call f again before the clear
+ * lands) ran between the caller's "done = 0" and "val = 0", set done, and the new request returned the reset value
+ * at once without cpu1 ever reading it. Now the callee answers the sequence number it read on entry, the caller
+ * publishes the address before the number (barriers: the two cores do not see plain stores in order), and only an
+ * answer carrying the caller's own number counts. */
+static volatile int rr1_cpu, rr1_calls;
+static volatile uint32_t rr1_val, rr1_probe_addr, rr1_seq, rr1_ans;
 static volatile int rmp_on1;
 static void rr1_func(void *unused)
 {
     rr1_calls++;
-    if (!rr1_done)
+    __sync_synchronize();
+    uint32_t s = rr1_seq;
+    __sync_synchronize();
+    if (rr1_ans != s)
     {
         int cpu = get_cpu_id();
         rr1_cpu = cpu;
@@ -165,8 +174,11 @@ static void rr1_func(void *unused)
             sei(old);
             rmp_on1 = 1;
         }
-        rr1_val = rr1_probe_addr ? *(volatile uint32_t *)rr1_probe_addr : 0;
-        rr1_done = 1;
+        uint32_t a = rr1_probe_addr;
+        rr1_val = a ? *(volatile uint32_t *)a : 0;
+        __sync_synchronize();
+        rr1_ans = s;
+        __sync_synchronize();
     }
     clear_RPC_request();
 }
@@ -175,11 +187,19 @@ int romremap_cpu1(uint32_t probe_addr, int *cpu, uint32_t *val, int *calls)
 {
     if (!rmp_on) return -1;
     if (get_cpu_id() != 0) return -2;
-    rr1_done = 0; rr1_cpu = -1; rr1_val = 0; rr1_calls = 0; rr1_probe_addr = probe_addr;
+    rr1_cpu = -1; rr1_calls = 0;
+    rr1_probe_addr = probe_addr;
+    __sync_synchronize();
+    uint32_t s = rr1_seq + 1;
+    if (s == rr1_ans) s++;                  /* never start equal to a stale answer */
+    rr1_seq = s;
+    __sync_synchronize();
     int st = _request_RPC(rr1_func, 0);
-    for (int i = 0; i < 100 && !rr1_done; i++) msleep(10);
+    for (int i = 0; i < 100 && rr1_ans != s; i++) msleep(10);
+    __sync_synchronize();
+    int done = rr1_ans == s;
     *cpu = rr1_cpu; *val = rr1_val; *calls = rr1_calls;
-    if (!rr1_done) return 0x100 | (st & 0xff);
+    if (!done) return 0x100 | (st & 0xff);
     return rmp_on1 ? 0 : -3;
 }
 int romremap_on_cpu1(void) { return rmp_on1; }
