@@ -3903,6 +3903,8 @@ static uint32_t rr_rate10(int sel, int bpp, int fps30)
 extern int t4_pmode;                     /* v4.85 tall4k_r.c: 4K frame height (CONFIG_INT t4.mode) */
 extern int t4_guide;                     /* v5.09 tall4k_r.c: frame guide position (CONFIG_INT t4.guide) */
 extern MENU_UPDATE_FUNC(tall4k_height_update);
+extern int t4_view;                      /* v5.14 tall4k_r.c: screen view (CONFIG_INT t4.view) */
+extern MENU_UPDATE_FUNC(tall4k_view_update);
 static MENU_UPDATE_FUNC(rr_main_update)
 {
     if (!rr_on) return;
@@ -4060,6 +4062,15 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("OFF", "Bottom left", "Bottom right", "Top left", "Top right"),
                 .help    = "4K frame height other than Normal: the screen shows only the middle 3840x2160 of the picture.",
                 .help2   = "Map: yellow = recorded picture, white = screen. +N = pixels recorded beyond each screen edge.",
+            },
+            {
+                .name    = "Screen view",
+                .priv    = &t4_view,
+                .max     = 1,
+                .choices = CHOICES("Centre 1:1", "Whole frame"),
+                .update  = tall4k_view_update,
+                .help    = "4K frame height 16:9 / Tall / Wide 16:9, 23.98p. Whole frame: 4096x2304 of the picture, scaled to the screen.",
+                .help2   = "16:9: all of it. Wide 16:9: 95 pct. Tall: full width, 87 pct of height. AF box up to 7 pct off. Applies at menu close.",
             },
             {
                 .name    = "Bit depth",
