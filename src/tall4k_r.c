@@ -1359,6 +1359,71 @@ void tall4k_tick(void)
     task_create("tall4k", 0x1d, 0x1000, t4_persist_task, 0);
 }
 
+/* v5.09: frame guide. Canon's live view always shows a fixed 3840x2160 window of the frame at 1:1 (valid-area cut
+ * 3848x2166; its height word is ignored, lv-survey v4.91, and Canon's path has no scaling field, wider-desk D1), so in
+ * the taller / wide heights the recording reaches past the screen edges. A small map in a corner of the image: yellow =
+ * recorded picture (MLV active area), white = what the screen shows, with the picture size and the pixels recorded
+ * beyond the screen per side. Draw-only on ML's layer; no Canon state is touched. Ticked every 250 ms from rectest's
+ * rr_mark task (no task of its own: DryOS task limit). Redrawn when its corner pixel is gone (menu, NotifyBox, clear)
+ * and every 4 s while idle; while recording only the pixel check runs. */
+#include "bmp.h"
+#include "vram.h"
+CONFIG_INT("t4.guide", t4_guide, 1);    /* 0 OFF, 1 bottom left, 2 bottom right, 3 top left, 4 top right */
+#define T4G_W 144
+static int t4g_margin(int v, int dim, int len)
+{
+    int m = (v * len + dim / 2) / dim;
+    if (v > 8 && m < 4) m = 4;          /* something is outside: keep a visible gap inside the 2-px border */
+    return m < 2 ? 2 : m;
+}
+void tall4k_guide_tick(void)
+{
+    static int drawn, gx, gy, gw, gh, tick;
+    static uint32_t sig;
+    tick++;
+    if (gui_menu_shown()) { drawn = 0; return; }   /* the ML menu owns the screen and clears it when it closes */
+    int want = t4_guide && t4_holding && lv && lv_dispsize == 1 && DISPLAY_IS_ON && bmp_vram();
+    if (!want)
+    {
+        if (drawn) bmp_fill(COLOR_EMPTY, gx, gy, gw, gh);
+        drawn = 0;
+        return;
+    }
+    /* recorded picture = MLV active area (rectest_r.c); screen = Canon's 3840x2160, centred like the mode places it */
+    int pw = T4_DCOLS ? 4320 : 4112, ph = 2168 + (int)T4_DROWS;
+    if (t4_persist_run && t4_pmode_run == 1) ph = 2312;
+    if (t4_persist_run && t4_pmode_run == 4) ph = 2430;
+    int sx = (pw - 3840) / 2, sy = t4_place ? (ph - 2160) / 2 : 0;
+    if (T4_DCOLS && t4_wlv_run == 1) sx -= 4 * (int)T4_LU;     /* Wide screen fix "Line width": view 108 px left */
+    int l = MAX(sx, 0), r = MAX(pw - 3840 - sx, 0), t = MAX(sy, 0), b = MAX(ph - 2160 - sy, 0);
+    get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
+    int w = T4G_W, h = (T4G_W * ph / pw + 1) & ~1;
+    int x = (t4_guide == 2 || t4_guide == 4) ? os.x_max - w - 8 : os.x0 + 8;
+    int y = t4_guide >= 3 ? os.y0 + 8 : os.y_max - h - 8;
+    if (x < 0 || y < 0 || x + w > 720 || y + h > 480) return;
+    uint32_t s = (uint32_t)pw + (uint32_t)ph * 5000u + (uint32_t)(l * 7 + t * 13 + x * 31 + y * 101) * 25000000u;
+    if (drawn && s == sig && bmp_getpixel(x, y) == COLOR_YELLOW && (rawrec_running() || tick % 16)) return;
+    if (drawn && s != sig) bmp_fill(COLOR_EMPTY, gx, gy, gw, gh);
+    bmp_fill(COLOR_BLACK, x, y, w, h);
+    bmp_draw_rect(COLOR_YELLOW, x, y, w, h);
+    bmp_draw_rect(COLOR_YELLOW, x + 1, y + 1, w - 2, h - 2);
+    int ix = x + t4g_margin(l, pw, w), ix1 = x + w - t4g_margin(r, pw, w);
+    int iy = y + t4g_margin(t, ph, h), iy1 = y + h - t4g_margin(b, ph, h);
+    bmp_draw_rect(COLOR_WHITE, ix, iy, ix1 - ix, iy1 - iy);
+    char ln[3][28];
+    snprintf(ln[0], sizeof(ln[0]), "%dx%d", pw, ph);
+    if (l == r) snprintf(ln[1], sizeof(ln[1]), "L/R +%d", l); else snprintf(ln[1], sizeof(ln[1]), "L+%d R+%d", l, r);
+    if (t == b) snprintf(ln[2], sizeof(ln[2]), "T/B +%d", t); else snprintf(ln[2], sizeof(ln[2]), "T+%d B+%d", t, b);
+    const int f = FONT(FONT_MONO_20, COLOR_WHITE, COLOR_BLACK), fh = fontspec_height(f);
+    for (int k = 0; k < 3; k++)
+    {
+        int tw = bmp_string_width(f, ln[k]);
+        if (tw > ix1 - ix - 4 || 3 * fh > iy1 - iy - 4) continue;     /* never draw over the frames */
+        bmp_printf(f, (ix + ix1 - tw) / 2, (iy + iy1 - 3 * fh) / 2 + k * fh, "%s", ln[k]);
+    }
+    gx = x; gy = y; gw = w; gh = h; sig = s; drawn = 1;
+}
+
 extern int get_global_draw(void);
 MENU_UPDATE_FUNC(tall4k_height_update)
 {
@@ -1369,7 +1434,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else MENU_SET_RINFO("waiting");
     if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
     else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused after a failed switch: set Normal and back to retry.");
-    else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen shows coloured bands while wide; the recording is fine.");
+    else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen = middle 3840 of the 4320 px recorded (Frame guide).");
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 

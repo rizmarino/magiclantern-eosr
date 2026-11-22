@@ -3901,6 +3901,7 @@ static uint32_t rr_rate10(int sel, int bpp, int fps30)
 }
 
 extern int t4_pmode;                     /* v4.85 tall4k_r.c: 4K frame height (CONFIG_INT t4.mode) */
+extern int t4_guide;                     /* v5.09 tall4k_r.c: frame guide position (CONFIG_INT t4.guide) */
 extern MENU_UPDATE_FUNC(tall4k_height_update);
 static MENU_UPDATE_FUNC(rr_main_update)
 {
@@ -3990,6 +3991,7 @@ static void rr_mark_draw(int color, int x, int y, int w, int h)
     bmp_draw_rect(color, x + 1, y + 1, w - 2, h - 2);
 }
 
+extern void tall4k_guide_tick(void);
 static void rr_mark_task(void *unused)
 {
     int drawn = 0, dx = 0, dy = 0, dw = 0, dh = 0, tick = 0;
@@ -3997,6 +3999,7 @@ static void rr_mark_task(void *unused)
     {
         msleep(250);
         tick++;
+        tall4k_guide_tick();            /* v5.09: frame guide of the taller / wide heights (no task of its own) */
         int want = rr_mark && rr_on && lv && lv_movie_select == LVMS_ENABLE_MOVIE && get_global_draw()
                    && !gui_menu_shown() && DISPLAY_IS_ON;
         int x = 0, y = 0, w = 0, h = 0;
@@ -4049,6 +4052,14 @@ static struct menu_entry rr_menu[] = {
                 .update  = tall4k_height_update,
                 .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
                 .help2   = "Wide (23.98p only): 4480x2214 / 4480x2478 recorded -> 4320x2168 / 4320x2430. Global Draw OFF, LL 10-bit.",
+            },
+            {
+                .name    = "Frame guide",
+                .priv    = &t4_guide,
+                .max     = 4,
+                .choices = CHOICES("OFF", "Bottom left", "Bottom right", "Top left", "Top right"),
+                .help    = "4K frame height other than Normal: the screen shows only the middle 3840x2160 of the picture.",
+                .help2   = "Map: yellow = recorded picture, white = screen. +N = pixels recorded beyond each screen edge.",
             },
             {
                 .name    = "Bit depth",
