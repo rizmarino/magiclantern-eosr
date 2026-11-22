@@ -412,7 +412,8 @@ static int t4_dump = 1;                 /* row dump after the switch (test entri
 static volatile int t4_key_pend;        /* key held back until normal 4K is back, then re-sent */
 static volatile int t4_soon;            /* v4.86: the watcher is counting down to a switch (REC held back) */
 static int t4_gm0;                      /* Canon GUI mode when the hold started (v4.79: idle value unverified) */
-static volatile int t4_suspend;         /* watcher: stop auto switching until the mode is changed (after a failure) */
+static volatile int t4_suspend;
+static int t4_c1retry;                  /* v5.08: one automatic retry after a cpu1 check failure */         /* watcher: stop auto switching until the mode is changed (after a failure) */
 #define T4_PND "ML/SETTINGS/TALL4K.PND"  /* crash marker: exists only while a switch is in progress */
 static void t4_marker(int on)
 {
@@ -517,8 +518,13 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             if (MEM(T4_STATE + 0xc) != 13) { t4_log("  magnify left within 200 ms: not applied\n"); t4_pend_apply = 0; continue; }
             t4_apply_all();
             t4_applied = 1; t4_pend_apply = 0;
+            uint32_t h0 = t4s_rec_ram[1], hrom0 = MEM(T4_REC + 4);   /* v5.08: record right after the apply */
             int c1 = -1, calls = 0; uint32_t v1 = 0;
             int r1 = romremap_cpu1(T4_REC + 4, &c1, &v1, &calls);
+            /* v5.08: the probe result gets its own line (the long line below is cut at 200 chars, so the v5.06/v5.07
+             * refusals had no rc / cpu / h in the log) */
+            t4_log("  cpu1 probe: rc %x cpu %d calls %d h %d (want %d); record after apply RAM %d / ROM view %d, now RAM %d / ROM %d\n",
+                   r1, c1, calls, (int)v1, T4_H + T4_DROWS, (int)h0, (int)hrom0, (int)t4s_rec_ram[1], (int)MEM(T4_REC + 4));
             if (T4_DCOLS || T4_DHD)
                 t4_log("  D0510: B30 %d B34 %d 800 %d 820 %d; D0411158 %x D0411188 %x; 0x60 %x 0x51 %x; TG %x\n",
                        (int)MEM(t4s_base + (0xE1C684B4 - T4_FROM)), (int)MEM(t4s_base + (0xE1C684BC - T4_FROM)),
@@ -604,7 +610,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.07 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.08 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -1054,7 +1060,14 @@ out:
     if (t4_persist_run)
     {
         t4_marker(0);
-        if (!held && rc != 1) t4_suspend = 1;   /* refused or came up wrong: no automatic retries until the mode changes */
+        if (held) t4_c1retry = 0;
+        if (!held && rc != 1 && t4_apply_fail && !t4_c1retry)
+        {   /* v5.08: an occasional "cpu1 check failed" (2 of 8 Wide switches in v5.06, values already restored, still
+             * in magnify): retry once automatically instead of pausing the mode */
+            t4_c1retry = 1;
+            t4_log("cpu1 check failed: retrying once\n");
+        }
+        else if (!held && rc != 1) t4_suspend = 1;   /* refused or came up wrong: no automatic retries until the mode changes */
         if (t4_key_pend) t4_log("key %x ended the taller frame\n", t4_key_pend);
         if (t4_suspend) NotifyBox(8000, "Taller 4K mode paused: %s (see ML/LOGS/TALL4K.TXT)", t4_result);
     }
@@ -1311,7 +1324,7 @@ void tall4k_tick(void)
         }
         last_mode = t4_pmode;
     }
-    if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; idle_since = 0; }
+    if (t4_pmode != last_mode) { last_mode = t4_pmode; t4_suspend = 0; t4_c1retry = 0; idle_since = 0; }
     t4_soon = 0;
     if (t4_running) { t_end = get_ms_clock(); idle_since = 0; return; }
     if (!t4_pmode || t4_suspend || t4_zt_running) { idle_since = 0; return; }
