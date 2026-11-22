@@ -91,7 +91,7 @@ static int t4_preview_run;              /* preview the held frame was applied wi
 #define T4_PKPTR    0xE11D41ACu         /* entry 0 +0x90 -> T4_PK */
 #define T4_PDSTATE  0x18D18u            /* MvPostDevelop state: +6 u16 EZoom step, +0x78 entry*, +0x80 / +0x84 per-frame zoom */
 #define T4_MDSTATE  0x246E4u            /* MvDevelop state: +0x24 entry* (4K 0xE123957C) */
-int t4_pk;                              /* menu: 0 OFF, 1 k = 103 */
+int t4_pk;                              /* menu: 0 OFF, 1 k = 103; v5.13: 2 S1a, 3 S1b, 4 S2, 5 S3 (below) */
 static int t4_pk_run;
 static uint32_t *t4s_pk;
 static void t4_log(const char *fmt, ...);
@@ -100,6 +100,68 @@ static void t4_pk_log(const char *when)
     t4_log("zoom proof %s: k ROM view %d %d, PostDev entry %x step %d zoom %d %d, MvDev entry %x\n", when, (int)MEM(T4_PK),
            (int)MEM(T4_PK + 4), (int)MEM(T4_PDSTATE + 0x78), (int)*(volatile uint16_t *)(T4_PDSTATE + 6),
            (int)MEM(T4_PDSTATE + 0x80), (int)MEM(T4_PDSTATE + 0x84), (int)MEM(T4_MDSTATE + 0x24));
+}
+/* v5.13 (desk D4, wider-desk.md): staged whole-frame view tests. The zoom proof passed on camera (v5.12: the screen
+ * showed 3434 of the 4320 recorded px = 1.118x at k 103, predicted 1.112x), so Opti follows remapped table words on the
+ * 4K standby path. Values 2..5 of the same menu entry, each a superset of the one before:
+ *   2 S1a  k 308 / 308 only (Canon's digital-IS level 2 values): centre 2685x1510 of the view, 1.43x. Control.
+ *   3 S1b  S1a + Opti input rectangle on at the current size (+0x54 = 1, +0x60 = 3839 / 2159) and origin +0x86 / +0x88
+ *          = 384 / 216: same size, shifted 384 px right / 216 rows down. Tests the rectangle and origin words.
+ *   4 S2   every size word of set A, k 0: cut 4104x2310 at 148 / 75 (raw 14,220,360 B of the 14,585,844 B buffer),
+ *          Viton window 132 / 75, develop 2 x 2048 by 2 x 1152, sub-output 5 / 8, PostDev input 4096x2304 with origin
+ *          128 / 72: the same 1:1 view as without the test (within 4 px). Tests every size consumer.
+ *   5 S3   S2 + k -68 (PostDev and the MvDevelop prefilter): 4095x2303 of the picture on screen (99.6 % of 4112).
+ * S2 / S3 only with 4K frame height 16:9 at 23.98p, Canon's 10-bit output off (RAM 0xD530 == 0: at 14-bit raw /
+ * 20 bit YUV both buffers would overrun) and the plain 4K entries in use (PostDev entry 0, MvDev entry 1: no digital
+ * IS). Everything is written while magnify is active (it runs PostDev entry 15 / MvDev entry 3 with their own records)
+ * and restored the same way. Hardware-only unknowns (D4.9): the rectangle / RectSkip registers, a 4096-px Opti input
+ * line, k < 0 with two divisions, develop line memories at 2120 px, Curry 5 / 8: a freeze is possible in S1b, S2, S3.
+ * Table: ROM address, Canon's value, value in S1b / S2 / S3. Order PostDev entry 0, develop record 0xE1239C58, MvDev
+ * entry 1; written in this order, restored in reverse (after the cut size, which goes back first). */
+#define T4_PDE0     0xE11D411Cu         /* MvPostDevelop entry 0 (4K) */
+#define T4_MDE1     0xE123957Cu         /* MvDevelop entry 1 (4K), record 0xE1239C58 */
+#define T4_RPSTATE  0x13198u            /* MvRawProPath state: +0x3C / +0x40 cut size, +0x48 raw depth code (1 / 2 / 3 = 10 / 12 / 14 bit) */
+#define T4_DSSIZE   0x26740u            /* DevelopStandard state: develop size w, h */
+#define T4_10BIT    0xD530u             /* != 0: Canon's 10-bit output variant (14-bit raw, 20 bit / px YUV) */
+static const struct { uint32_t a, old, s1b, s2, s3; } t4_wf[] = {
+    { 0xE11D4170, 0,          1,          1,          1          },   /* +0x54 input rectangle from +0x5C / +0x60 */
+    { 0xE11D417C, 0,          0x086F0EFF, 0x08FF0FFF, 0x08FF0FFF },   /* +0x60 rectangle x1 | y1 << 16 = input size - 1 */
+    { 0xE11D41A0, 0x00000402, 0x01800402, 0x00800402, 0x00800402 },   /* +0x84 RectSkip 2 / 4 (kept) | origin x << 16 */
+    { 0xE11D41A4, 0,          216,        72,         72         },   /* +0x88 origin y */
+    { 0xE11D41CC, 3839,       3839,       4095,       4095       },   /* +0xB0 input w - 1 */
+    { 0xE11D41D0, 2159,       2159,       2303,       2303       },   /* +0xB4 input h - 1 */
+    { 0xE11D4234, 3840,       3840,       4096,       4096       },   /* +0x118 chaser samples, left division */
+    { 0xE11D423C, 3840,       3840,       4096,       4096       },   /* +0x120 chaser samples, right division */
+    { 0xE1239CB0, 1920,       1920,       2048,       2048       },   /* develop X divisions Xs, Xb */
+    { 0xE1239CB8, 1920,       1920,       2048,       2048       },
+    { 0xE1239CC0, 1080,       1080,       1152,       1152       },   /* develop Y divisions Ys, Yb */
+    { 0xE1239CC8, 1080,       1080,       1152,       1152       },
+    { 0xE1239CEC, 3840,       3840,       4096,       4096       },   /* develop size w, h */
+    { 0xE1239CF0, 2160,       2160,       2304,       2304       },
+    { 0xE1239588, 0,          0,          0,          0xFFFFFFBC },   /* MvDevelop k_h, k_v: prefilter set only */
+    { 0xE123958C, 0,          0,          0,          0xFFFFFFBC },
+    { 0xE12395B0, 2,          2,          5,          5          },   /* sub-output M / N: 4096 x 5 / 8 / 4 = 640 */
+    { 0xE12395B4, 3,          3,          8,          8          },
+    { 0xE12395B8, 2,          2,          5,          5          },
+    { 0xE12395BC, 3,          3,          8,          8          },
+};
+#define T4_NWF ((int)(sizeof(t4_wf) / sizeof(t4_wf[0])))
+static uint32_t *t4s_wf[sizeof(t4_wf) / sizeof(t4_wf[0])];
+static int t4_wf_pdsize_ok;             /* plan: PostDev state +0xB0 / +0xB4 held 3839 / 2159 (address check for the verdict) */
+static const char *const t4_wf_name[6] = { "", "1.11x", "S1a", "S1b", "S2", "S3" };
+static int t4_pk_k(void) { return t4_pk_run == 1 ? 103 : (t4_pk_run == 2 || t4_pk_run == 3) ? 308 : t4_pk_run == 5 ? -68 : 0; }
+static uint32_t t4_wf_new(int i) { return t4_pk_run == 3 ? t4_wf[i].s1b : t4_pk_run == 4 ? t4_wf[i].s2 : t4_pk_run == 5 ? t4_wf[i].s3 : t4_wf[i].old; }
+static uint32_t t4_wf_want(uint32_t a)
+{
+    for (int i = 0; i < T4_NWF; i++) if (t4_wf[i].a == a) return t4_wf_new(i);
+    return 0;
+}
+static void t4_wf_log(const char *when)
+{
+    t4_log("WF %s: PD entry %x in %d %d, MD entry %x, dev %d %d, cut %d %d depth %d, 10b %d\n", when,
+           (int)MEM(T4_PDSTATE + 0x78), (int)MEM(T4_PDSTATE + 0xB0), (int)MEM(T4_PDSTATE + 0xB4), (int)MEM(T4_MDSTATE + 0x24),
+           (int)MEM(T4_DSSIZE), (int)MEM(T4_DSSIZE + 4), (int)MEM(T4_RPSTATE + 0x3C), (int)MEM(T4_RPSTATE + 0x40),
+           (int)MEM(T4_RPSTATE + 0x48), (int)MEM(T4_10BIT));
 }
 
 #define T4_NYUV     4
@@ -372,11 +434,27 @@ static void t4_apply_all(void)
             romremap_flush(t4s_var[k], 44);
             if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4_fit_w(); t4s_vout[k][12] = t4_fit_w() / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
-    if (t4_pk_run && t4s_pk) { t4s_pk[0] = 103; t4s_pk[1] = 103; romremap_flush(t4s_pk, 8); }   /* v5.10 screen zoom proof */
+    if (t4_pk_run && t4s_pk) { t4s_pk[0] = t4s_pk[1] = (uint32_t)t4_pk_k(); romremap_flush(t4s_pk, 8); }   /* v5.10 screen zoom proof; v5.13 per stage */
+    if (t4_pk_run >= 3)
+    {
+        /* v5.13 staged whole-frame tests: PostDev entry 0, develop record, MvDev entry 1 ... */
+        for (int i = 0; i < T4_NWF; i++)
+            if (t4s_wf[i] && t4_wf_new(i) != t4_wf[i].old) { *t4s_wf[i] = t4_wf_new(i); romremap_flush(t4s_wf[i], 4); }
+        if (t4_pk_run >= 4 && t4s_var[0] && t4s_vout[0])
+        {   /* ... then the Viton window and, last, the cut (it enlarges what reaches the raw buffer). Record 0 only:
+             * the twin records belong to flag3 = 1 (FHD from 4K crop), which this test refuses. */
+            t4s_vout[0][0] = 132; t4s_vout[0][1] = 75; romremap_flush(t4s_vout[0], 68);
+            t4s_var[0][3] = 148; t4s_var[0][4] = 75;
+            t4s_var[0][5] = t4s_var[0][9] = 4104; t4s_var[0][6] = t4s_var[0][10] = 2310;
+            romremap_flush(t4s_var[0], 44);
+        }
+    }
 }
 
 static void t4_restore_all(void)
 {
+    /* v5.13: the cut size first (it sizes the raw buffer write) */
+    if (t4s_var[0]) { t4s_var[0][5] = t4s_var[0][9] = 3848; t4s_var[0][6] = t4s_var[0][10] = 2166; romremap_flush(t4s_var[0], 44); }
     t4s_rec_ram[1] = t4s_orec_h; romremap_flush(&t4s_rec_ram[1], 4);
     t4_put(&t4s_full[t4s_i69f], t4s_o69f); t4_put(&t4s_full[t4s_i97f], t4s_o97f); t4_put(&t4s_lvt[t4s_i69t], t4s_o69t);
     if (t4s_i68f >= 0) { t4_put(&t4s_full[t4s_i68f], t4s_o68f); t4_put(&t4s_lvt[t4s_i68t], t4s_o68t); }
@@ -418,10 +496,13 @@ static void t4_restore_all(void)
     for (int k = 0; k < 2; k++)
         if (t4s_var[k])
         {
-            t4s_var[k][0] = T4_W; t4s_var[k][1] = T4_H; t4s_var[k][3] = 272; t4s_var[k][4] = 47; t4s_var[k][6] = t4s_var[k][10] = 2166;
+            t4s_var[k][0] = T4_W; t4s_var[k][1] = T4_H; t4s_var[k][3] = 272; t4s_var[k][4] = 47;
+            t4s_var[k][5] = t4s_var[k][9] = 3848; t4s_var[k][6] = t4s_var[k][10] = 2166;
             romremap_flush(t4s_var[k], 44);
-            if (t4s_vout[k]) { t4s_vout[k][2] = 3840; t4s_vout[k][12] = 3840 / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
+            if (t4s_vout[k]) { t4s_vout[k][0] = 4; t4s_vout[k][1] = 3; t4s_vout[k][2] = 3840; t4s_vout[k][12] = 3840 / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
         }
+    for (int i = T4_NWF - 1; i >= 0; i--)      /* v5.13: MvDev entry, develop record, PostDev entry back to Canon's */
+        if (t4s_wf[i]) { *t4s_wf[i] = t4_wf[i].old; romremap_flush(t4s_wf[i], 4); }
     if (t4s_pk) { t4s_pk[0] = 0; t4s_pk[1] = 0; romremap_flush(t4s_pk, 8); }
 }
 
@@ -604,7 +685,22 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                        (int)MEM(T4_PK), (int)v2, r2, c2);
                 t4_pk_log("in magnify");
             }
-            if (r1 || v1 != T4_H + T4_DROWS)
+            int wfc1 = 0;
+            if (t4_pk_run >= 3)
+            {
+                /* v5.13: the two new pages as cpu1 sees them (origin word, develop width) */
+                int c3 = -1, n3 = 0; uint32_t v3 = 0, v4 = 0;
+                int r3 = romremap_cpu1(0xE11D41A0, &c3, &v3, &n3), r4 = 0;
+                if (t4_pk_run >= 4) r4 = romremap_cpu1(0xE1239CEC, &c3, &v4, &n3);
+                wfc1 = r3 || r4 || v3 != t4_wf_want(0xE11D41A0) || MEM(0xE11D41A0) != v3
+                       || (t4_pk_run >= 4 && (v4 != t4_wf_want(0xE1239CEC) || MEM(0xE1239CEC) != v4));
+                t4_log("  WF applied %s: origin word cpu0 %x cpu1 %x (rc %x), develop w cpu0 %d cpu1 %d (rc %x): %s\n", t4_wf_name[t4_pk_run],
+                       (int)MEM(0xE11D41A0), (int)v3, r3, (int)MEM(0xE1239CEC), (int)v4, r4, wfc1 ? "MISMATCH" : "ok");
+                t4_log("  WF valid area x %d y %d cut %d %d win28 %d %d, Viton window %d %d\n", (int)MEM(t4_va[0] + 12), (int)MEM(t4_va[0] + 16),
+                       (int)MEM(t4_va[0] + 20), (int)MEM(t4_va[0] + 24), (int)MEM(t4_va[0] + 36), (int)MEM(t4_va[0] + 40), (int)MEM(t4_vo[0]), (int)MEM(t4_vo[0] + 4));
+                t4_wf_log("in magnify");
+            }
+            if (r1 || v1 != T4_H + T4_DROWS || wfc1)
             {
                 t4_restore_all(); t4_applied = 0; t4_apply_fail = 1;
                 t4_log("  cpu1 does not see the record: restored (still in magnify)\n");
@@ -645,6 +741,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
                            (int)MEM(T4_STATE + 0xc), (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
                            (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c),
                            (int)MEM(T4_UNIT), (int)nchg, t4_tap);
+                    if (t4_pk_run >= 4) t4_wf_log("trace");    /* v5.13: a hang then shows which sizes the rebuild took */
                 }
                 msleep(5);
             }
@@ -664,7 +761,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 
 static void t4_task(void *unused)
 {
-    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc = 0, rebuilt = 0, held = 0;
+    int raw = 0, packed = 0, patched = 0, narrowed = 0, reflex14 = 0, rc = 0, rebuilt = 0, held = 0, wf_bad = 0;
     static uint32_t base; uint32_t orig_pack[5] = {0}, w0 = 0;
     base = 0;
     static volatile uint32_t *full, *lvt;
@@ -677,7 +774,7 @@ static void t4_task(void *unused)
     rec_ram = 0;
     t4_result[0] = 0;
     if (!t4_persist_run) t4_pk_run = 0;     /* v5.10: the zoom proof only rides on the 4K frame height mode */
-    t4_log("=== taller 4K v5.12 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.13 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -854,6 +951,7 @@ static void t4_task(void *unused)
     }
     t4_preview = 0;                        /* v5.10: in every build. Squeeze overran Canon's raw buffer (desk D2), Fit froze */
     t4s_pk = (uint32_t *)romremap_ram(T4_PK);
+    for (int i = 0; i < T4_NWF; i++) t4s_wf[i] = rc ? 0 : (uint32_t *)romremap_ram(t4_wf[i].a);
     if (t4_pk_run)
     {
         /* v5.10 screen zoom proof: the record must be Canon's {0, 0} followed by the digital-IS records, and entry 0
@@ -866,6 +964,39 @@ static void t4_task(void *unused)
         }
         t4_pk_log("plan");
         if (MEM(T4_PDSTATE + 0x78) != 0xE11D411C) t4_log("zoom proof: PostDev entry is not 4K entry 0 (digital IS on? 10-bit?): expect no effect\n");
+    }
+    if (t4_pk_run >= 2)
+    {
+        /* v5.13 staged whole-frame tests: every table word must hold Canon's value and the plain 4K entries must be
+         * the ones in use. On-screen reasons stay short (after "4K height paused: " about 22 characters fit). */
+        int wbad = 0;
+        for (int i = 0; i < T4_NWF; i++)
+            if (!t4s_wf[i] || *t4s_wf[i] != t4_wf[i].old)
+            {
+                wbad++;
+                t4_log("WF word %x: %s %x (want %x)\n", (int)t4_wf[i].a, t4s_wf[i] ? "is" : "not mapped", t4s_wf[i] ? (int)*t4s_wf[i] : 0, (int)t4_wf[i].old);
+            }
+        t4_wf_log("plan");
+        t4_wf_pdsize_ok = MEM(T4_PDSTATE + 0xB0) == 3839 && MEM(T4_PDSTATE + 0xB4) == 2159;
+        t4_log("WF plan: %s, k %d, %d table words checked, %d unexpected, fps slot %d\n", t4_wf_name[t4_pk_run], t4_pk_k(), T4_NWF, wbad, slot);
+        if (wbad) { snprintf(t4_result, sizeof(t4_result), "WF: table differs"); goto out; }
+        if (MEM(T4_PDSTATE + 0x78) != T4_PDE0 || MEM(T4_MDSTATE + 0x24) != T4_MDE1)
+        { snprintf(t4_result, sizeof(t4_result), "WF: not plain 4K"); goto out; }
+        if (t4_pk_run >= 4)
+        {
+            if (!t4_persist_run || t4_pmode_run != 1 || T4_DCOLS || T4_DROWS != 200)
+            { snprintf(t4_result, sizeof(t4_result), "WF: 16:9 height only"); goto out; }
+            if (slot != 4) { snprintf(t4_result, sizeof(t4_result), "WF: 23.98p only"); goto out; }
+            if (MEM(T4_10BIT)) { snprintf(t4_result, sizeof(t4_result), "WF: Canon 10-bit on"); goto out; }
+            /* raw depth: decided by 0xD530 (FUN_e00d0cce). The RawPro state word is a second look, trusted only when
+             * the cut size beside it reads Canon's 3848x2166 (its address is from the desk, not yet seen on camera) */
+            int cut_ok = MEM(T4_RPSTATE + 0x3C) == 3848 && MEM(T4_RPSTATE + 0x40) == 2166;
+            if (cut_ok && MEM(T4_RPSTATE + 0x48) == 3) { snprintf(t4_result, sizeof(t4_result), "WF: raw is 14-bit"); goto out; }
+            if (t4s_var[0][7] || t4s_var[0][8] || t4s_var[0][9] != 3848 || t4s_var[0][10] != 2166)
+            { snprintf(t4_result, sizeof(t4_result), "WF: Win28 differs"); goto out; }
+            t4_log("WF: cut state %s; raw 4104x2310 at 12 bit = 14220360 B of 14585844, YUV 18874368 B of 22282240\n",
+                   cut_ok ? "verified" : "address NOT verified (depth word unchecked)");
+        }
     }
     if (T4_DCOLS) t4_log("wide screen fix %d: valid area in_w %d -> %d, x 272 -> %d\n", t4_wlv, T4_W, t4_wlv ? (int)T4_WN : T4_W,
                          t4_wlv == 2 ? 272 + 4 * (int)T4_LU : t4_wlv == 3 ? (int)((272 + 4 * T4_LU + 15) & ~15u) : 272);
@@ -951,6 +1082,13 @@ static void t4_task(void *unused)
                (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_REC), (int)t4s_rec_ram[0]);
     }
     if (t4_pk_run) t4_pk_log("after rebuild");
+    if (t4_pk_run >= 2)
+    {
+        t4_wf_log("after rebuild");
+        wf_bad = MEM(T4_PDSTATE + 0x78) != T4_PDE0 || MEM(T4_MDSTATE + 0x24) != T4_MDE1
+                 || (t4_pk_run >= 4 && t4_wf_pdsize_ok && (MEM(T4_PDSTATE + 0xB0) != 4095 || MEM(T4_PDSTATE + 0xB4) != 2303));
+        t4_log("WF verdict %s: %s\n", t4_wf_name[t4_pk_run], wf_bad ? "state MISMATCH" : "state as planned");
+    }
     t4_log("after rebuild: MEM1 %dx%d (+18 %d, +1c %d), f2 %d, unit %x, live lv7 0x68 %x 0x69 %x\n", (int)m1w, (int)m1h,
            (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_PATH + 0x6c), (int)MEM(T4_UNIT),
            i68 >= 0 ? (int)l7[i68] : -1, i69 >= 0 ? (int)l7[i69] : -1);
@@ -1090,7 +1228,10 @@ revert:
                 t4_log("HOLD: taller 4K %dx%d stays on for recording; magnify x5 + exit ends it\n", (int)T4_WN, T4_H + T4_DROWS);
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
-                if (t4_persist_run) NotifyBox(4000, T4_DCOLS ? "Wide 4K %dx%d" : "Taller 4K %dx%d", (int)T4_WN, T4_H + T4_DROWS);
+                if (t4_persist_run && t4_pk_run >= 2)      /* v5.13: name the test stage (<= ~40 chars) */
+                    NotifyBox(6000, T4_DCOLS ? "Wide 4K %dx%d, view %s%s" : "Taller 4K %dx%d, view %s%s", (int)T4_WN, T4_H + T4_DROWS,
+                              t4_wf_name[t4_pk_run], wf_bad ? " BAD" : "");
+                else if (t4_persist_run) NotifyBox(4000, T4_DCOLS ? "Wide 4K %dx%d" : "Taller 4K %dx%d", (int)T4_WN, T4_H + T4_DROWS);
                 else NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
@@ -1477,14 +1618,22 @@ void tall4k_guide_tick(void)
     int sw = 3840, sh = 2160;
     int sx = (pw - sw) / 2, sy = t4_place ? (ph - sh) / 2 : 0;
     if (T4_DCOLS && t4_wlv_run == 1) sx -= 4 * (int)T4_LU;     /* Wide screen fix "Line width": view 108 px left */
-    if (t4_pk_run) { sx += (sw - 3454) / 2; sy += (sh - 1943) / 2; sw = 3454; sh = 1943; }   /* v5.10 zoom proof: PREDICTED span, 3840 x 921 / 1024 */
+    {
+        /* v5.10 / v5.13 screen view tests: the PREDICTED span, not a measurement */
+        int zw = sw, zh = sh, ox = 0, oy = 0;
+        if (t4_pk_run == 1) { zw = 3454; zh = 1943; }                      /* 3840 x 921 / 1024 */
+        if (t4_pk_run == 2 || t4_pk_run == 3) { zw = 2685; zh = 1510; }    /* 3840 x 716 / 1024 */
+        if (t4_pk_run == 3) { ox = 384; oy = 216; }
+        if (t4_pk_run == 5) { zw = 4096; zh = 2304; }                      /* S3: all of the developed 4096x2304 */
+        sx += (sw - zw) / 2 + ox; sy += (sh - zh) / 2 + oy; sw = zw; sh = zh;
+    }
     int l = MAX(sx, 0), r = MAX(pw - sw - sx, 0), t = MAX(sy, 0), b = MAX(ph - sh - sy, 0);
     get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
     int w = T4G_W, h = (T4G_W * ph / pw + 1) & ~1;
     int x = (t4_guide == 2 || t4_guide == 4) ? os.x_max - w - 8 : os.x0 + 8;
     int y = t4_guide >= 3 ? os.y0 + 8 : os.y_max - h - 8;
     if (x < 0 || y < 0 || x + w > 720 || y + h > 480) return;
-    uint32_t s = (uint32_t)pw + (uint32_t)ph * 5000u + (uint32_t)(l * 7 + t * 13 + x * 31 + y * 101) * 25000000u;
+    uint32_t s = (uint32_t)pw + (uint32_t)ph * 5000u + (uint32_t)(l * 7 + t * 13 + x * 31 + y * 101 + sw * 3) * 25000000u;
     if (drawn && s == sig && bmp_getpixel(x, y) == COLOR_YELLOW && (rawrec_running() || tick % 16)) return;
     if (drawn && s != sig) bmp_fill(COLOR_EMPTY, gx, gy, gw, gh);
     bmp_fill(COLOR_BLACK, x, y, w, h);
@@ -1495,15 +1644,20 @@ void tall4k_guide_tick(void)
     bmp_draw_rect(COLOR_WHITE, ix, iy, ix1 - ix, iy1 - iy);
     char ln[3][28];
     snprintf(ln[0], sizeof(ln[0]), "%dx%d", pw, ph);
-    if (l == r) snprintf(ln[1], sizeof(ln[1]), "L/R +%d", l); else snprintf(ln[1], sizeof(ln[1]), "L+%d R+%d", l, r);
-    if (t == b) snprintf(ln[2], sizeof(ln[2]), "T/B +%d", t); else snprintf(ln[2], sizeof(ln[2]), "T+%d B+%d", t, b);
+    /* v5.13: sides within 1 px share a line (camera v5.12: "T+243 B+244" was too wide and the line was dropped) */
+    if (ABS(l - r) <= 1) snprintf(ln[1], sizeof(ln[1]), "L/R +%d", MIN(l, r)); else snprintf(ln[1], sizeof(ln[1]), "L%d R%d", l, r);
+    if (ABS(t - b) <= 1) snprintf(ln[2], sizeof(ln[2]), "T/B +%d", MIN(t, b)); else snprintf(ln[2], sizeof(ln[2]), "T%d B%d", t, b);
     const int f = FONT(FONT_MONO_20, COLOR_WHITE, COLOR_BLACK), fh = fontspec_height(f);
+    /* with a test view the white frame can be smaller than the text: fit to the yellow box then, and draw the white
+     * frame again over the text */
+    int tx0 = t4_pk_run ? x + 4 : ix, tx1 = t4_pk_run ? x + w - 4 : ix1, ty0 = t4_pk_run ? y + 4 : iy, ty1 = t4_pk_run ? y + h - 4 : iy1;
     for (int k = 0; k < 3; k++)
     {
         int tw = bmp_string_width(f, ln[k]);
-        if (tw > ix1 - ix - 4 || 3 * fh > iy1 - iy - 4) continue;     /* never draw over the frames */
-        bmp_printf(f, (ix + ix1 - tw) / 2, (iy + iy1 - 3 * fh) / 2 + k * fh, "%s", ln[k]);
+        if (tw > tx1 - tx0 - 4 || 3 * fh > ty1 - ty0 - 4) continue;     /* never draw over the yellow frame */
+        bmp_printf(f, (tx0 + tx1 - tw) / 2, (ty0 + ty1 - 3 * fh) / 2 + k * fh, "%s", ln[k]);
     }
+    if (t4_pk_run) bmp_draw_rect(COLOR_WHITE, ix, iy, ix1 - ix, iy1 - iy);
     gx = x; gy = y; gw = w; gh = h; sig = s; drawn = 1;
 }
 
@@ -1683,12 +1837,12 @@ static struct menu_entry t4_menu[] = {
                 .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
             },
             {
-                .name    = "Screen zoom proof",
+                .name    = "Screen view test",
                 .priv    = &t4_pk,
-                .max     = 1,
-                .choices = CHOICES("OFF", "1.11x (k 103)"),
-                .help    = "v5.10 test: Canon's digital-IS level 1 zoom value in the 4K post-develop table (2 words).",
-                .help2   = "With a 4K frame height on: screen 1.11x closer, recording unchanged. Re-applies at menu close. Not saved.",
+                .max     = 5,
+                .choices = CHOICES("OFF", "1.11x (k 103)", "S1a zoom 1.43x", "S1b zoom+shift", "S2 sizes 1:1", "S3 whole frame"),
+                .help    = "v5.13 whole-frame view stages (desk D4). S1a / S1b: 4K post-develop words only, any 4K frame height.",
+                .help2   = "S2 / S3: height 16:9, 23.98p; can freeze (battery out, card to PC). Applies at menu close. Not saved.",
             },
             {
                 .name    = "Wide screen fix",

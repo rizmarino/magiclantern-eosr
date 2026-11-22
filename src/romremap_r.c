@@ -22,8 +22,11 @@ extern void *_malloc(size_t size);
  * v4.61 taller 4K: SAP/MEM1 size records 0xE0F2E5F8 (same 1 MB section as the silent fps page);
  * v4.83 taller 4K: "valid area" records 0xE12250B8 / 0xE12251C0 (AF data window, 16 MB supersection 0xE1);
  * v5.10 screen zoom proof: MvPostDevelop {k_h, k_v} records 0xE11D3DFC.. (new 1 MB section 0xE1100000; appended, so
- * the earlier pages keep their RAM slots) */
-static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000, 0xE0F2E000, 0xE1225000, 0xE11D3000 };
+ * the earlier pages keep their RAM slots);
+ * v5.13 whole-frame view tests: MvPostDevelop entry 0 (0xE11D411C.., page 0xE11D4000) and the MvDevelop 4K entry +
+ * develop record (0xE123957C, 0xE1239C58, page 0xE1239000). Both sections are already split: 2 pages, no new L2 table */
+static const uint32_t rmp_pages[RR_NPAGES] = { 0xE0F16000, 0xE0B40000, 0xE0B41000, 0xE0B42000, 0xE0F2E000, 0xE1225000, 0xE11D3000,
+                                               0xE11D4000, 0xE1239000 };
 static const uint32_t rmp_sections[] = { 0xE0F00000, 0xE0B00000, 0xE1200000, 0xE1100000 };
 static const uint32_t rmp_supers[] = { 0xE0000000, 0xE1000000 };
 #define RR_NSECT    4

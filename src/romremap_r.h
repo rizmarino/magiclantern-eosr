@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define RR_NPAGES 7
+#define RR_NPAGES 9
 
 int romremap_init(void);                    /* 0, or a negative step number (sticky for this power-on) */
 int romremap_on(void);
