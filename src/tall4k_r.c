@@ -343,6 +343,7 @@ static void t4_apply_all(void)
             {
                 t4s_var[k][0] = T4_WN;
                 if (t4_wlv == 2) t4s_var[k][3] = 272 + 4 * T4_LU;
+                if (t4_wlv == 3) t4s_var[k][3] = (272 + 4 * T4_LU + 15) & ~15u;   /* v5.07 test: x on 16 px (Canon's 4K 272 = 17 * 16) */
             }
             romremap_flush(t4s_var[k], 44);
             if (t4_preview == 2 && t4s_vout[k]) { t4s_vout[k][2] = t4_fit_w(); t4s_vout[k][12] = t4_fit_w() / t4s_vout[k][5]; romremap_flush(t4s_vout[k], 68); }
@@ -603,7 +604,7 @@ static void t4_task(void *unused)
     static uint32_t *rec_ram;
     rec_ram = 0;
     t4_result[0] = 0;
-    t4_log("=== taller 4K v5.06 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.07 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -782,7 +783,7 @@ static void t4_task(void *unused)
     t4_preview = 0;                        /* v4.92: Squeeze / Fit didn't work (see t4_preview) */
 #endif
     if (T4_DCOLS) t4_log("wide screen fix %d: valid area in_w %d -> %d, x 272 -> %d\n", t4_wlv, T4_W, t4_wlv ? (int)T4_WN : T4_W,
-                         t4_wlv == 2 ? 272 + 4 * (int)T4_LU : 272);
+                         t4_wlv == 2 ? 272 + 4 * (int)T4_LU : t4_wlv == 3 ? (int)((272 + 4 * T4_LU + 15) & ~15u) : 272);
     t4_log("preview: %s (valid area y %d h %d, output w %d)\n", t4_preview == 2 ? "fit" : t4_preview ? "squeeze" : "centre",
            t4_preview ? 47 : 47 + 2 * t4_d68, t4_preview ? 2166 + (int)T4_DROWS : 2166, t4_preview == 2 ? (int)t4_fit_w() : 3840);
     t4_log("romremap %d (%s), record RAM %x\n", rc, romremap_stage(), (int)rec_ram);
@@ -1521,10 +1522,10 @@ static struct menu_entry t4_menu[] = {
             {
                 .name    = "Wide screen fix",
                 .priv    = &t4_wlv,
-                .max     = 2,
-                .choices = CHOICES("OFF", "Line width", "Width + centre"),
+                .max     = 3,
+                .choices = CHOICES("OFF", "Line width", "Width + centre", "Width + centre x16"),
                 .help    = "v5.06: live view in the Wide heights. Line width = LV reads 4480-px lines (no bands);",
-                .help2   = "Width + centre = also frames like normal 4K. Applied at the next switch to Wide.",
+                .help2   = "Width + centre: frames like normal 4K (x 380); x16: x 384 (strip test). Re-applies at menu close.",
             },
             MENU_EOL,
         },
