@@ -310,6 +310,35 @@ static volatile uint32_t *t4_live_lv7(void)
     if (p < 0x1000 || p >= 0x80000000 || (p & 3)) return 0;
     return (volatile uint32_t *)(p + 0x1bac + 7 * 0xac);
 }
+/* v5.16 Wide AF test (desk D5, wider-desk.md): Canon's movie AF fails in the Wide heights (camera v5.15: hunts, then
+ * orange / red at once; 16:9 / Tall fine). D5 cause [decomp]: the dual-pixel A window is placed from the AF point with
+ * the 4K window start hard-coded (FUN_e06cc56e: sensor 0x70 = 48 + (cmosStart + 1320) / 4, 1320 = (378 - 48) * 4), and
+ * the A+B pixels are cut from the main line at column 144 + cmosStart. Wide moves the main window start 0x74 from 378
+ * to 351 units, so A and A+B sit 108 px apart. Debug > Taller 4K tests > Wide AF test (not saved):
+ *   V1  4K frame height 16:9 / Tall plus sensor 0x76 = 0 (the Wide region code, Canon's FHD value): AF still fine =
+ *       0x76 is not the AF breaker.
+ *   V2  Wide heights with the window 378..1457 (all 216 extra px on the right) instead of 351..1430: A / A+B line up
+ *       again with Canon's own constants. Screen framing = normal 4K (valid x 272); the recorded picture's optical
+ *       centre moves 108 px left of the frame centre. Centre screen view only.
+ * Always (read-only): the AF readout words are logged at the plan (normal 4K), after the rebuild and on change while
+ * held (capped). */
+static int t4_aft, t4_aft_run;          /* menu: 0 OFF, 1 V1, 2 V2 */
+static void t4_af_log(const char *when)
+{
+    volatile uint32_t *l = t4_live_lv7();
+    int i70 = l ? t4_find(l, 43, 0x70) : -1, i71 = l ? t4_find(l, 43, 0x71) : -1, i74 = l ? t4_find(l, 43, 0x74) : -1;
+    int i75 = l ? t4_find(l, 43, 0x75) : -1, i76 = l ? t4_find(l, 43, 0x76) : -1;
+    t4_log("AF %s: lv7 70 %x 71 %x 74 %x 75 %x 76 %x, cmosStart %d, dafcom %x, type %d, ef74 %x\n", when,
+           i70 >= 0 ? (int)(l[i70] & 0x3fffff) : -1, i71 >= 0 ? (int)(l[i71] & 0x3fffff) : -1, i74 >= 0 ? (int)(l[i74] & 0x3fffff) : -1,
+           i75 >= 0 ? (int)(l[i75] & 0x3fffff) : -1, i76 >= 0 ? (int)(l[i76] & 0x3fffff) : -1,
+           (int)MEM(0x69628), (int)MEM(0x697D0), (int)MEM(0xF1D8), (int)MEM(0xEF74));
+}
+static uint32_t t4_af_sig(void)
+{
+    volatile uint32_t *l = t4_live_lv7();
+    int i70 = l ? t4_find(l, 43, 0x70) : -1;
+    return (i70 >= 0 ? l[i70] : 0) * 31u + MEM(0x69628) * 7u + MEM(0xF1D8);
+}
 
 static uint32_t t4_rowsum(int row)
 {
@@ -399,6 +428,11 @@ static void t4_apply_all(void)
             t4_put(&t4s_lvt[t4s_i76t], (t4s_o76t & ~0x3fffff) | (uint32_t)t4_r76);
         }
     }
+    if (t4_r76 >= 0 && !(T4_DCOLS || T4_DHD) && t4s_i76f >= 0)      /* v5.16 Wide AF test V1: 0x76 alone */
+    {
+        t4_put(&t4s_full[t4s_i76f], (t4s_o76f & ~0x3fffff) | (uint32_t)t4_r76);
+        t4_put(&t4s_lvt[t4s_i76t], (t4s_o76t & ~0x3fffff) | (uint32_t)t4_r76);
+    }
     if (T4_DHD)
     {
         /* v4.96: line time + frame length (all inactive until the magnify exit rebuilds 4K) */
@@ -472,6 +506,7 @@ static void t4_restore_all(void)
         t4_put(&t4s_full[t4s_i60f], t4s_o60f);
         if (t4_r76 >= 0) { t4_put(&t4s_full[t4s_i76f], t4s_o76f); t4_put(&t4s_lvt[t4s_i76t], t4s_o76t); }
     }
+    if (t4_r76 >= 0 && !(T4_DCOLS || T4_DHD) && t4s_i76f >= 0) { t4_put(&t4s_full[t4s_i76f], t4s_o76f); t4_put(&t4s_lvt[t4s_i76t], t4s_o76t); }
     if (T4_DHD)
     {
         t4_put((volatile uint32_t *)(t4s_base + (T4_TG98 - T4_FROM)), 0x5a3);
@@ -565,7 +600,8 @@ static void t4_nomag_why(void)
 }
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
-    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0, mchg = 0;
+    int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0, mchg = 0, afn = 0;
+    uint32_t afsig = 0, aft = 0;            /* v5.16 AF log while held */
     uint32_t t0 = get_ms_clock(), t13 = 0, trq = 0, tstop = 0;
     while (get_ms_clock() - t0 < (uint32_t)timeout_ms)
     {
@@ -576,7 +612,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         {
             /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
              * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
-            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run || t4_view != t4_view_run;   /* v4.89: a preview change re-applies too; v5.10: zoom proof */
+            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run || t4_view != t4_view_run || t4_aft != t4_aft_run;   /* v4.89: a preview change re-applies too; v5.10: zoom proof */
             if (ch != mchg)
             {
                 mchg = ch;
@@ -590,6 +626,11 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             }
         }
         if (t4_end_req) ending = 1;                 /* kept after t4_end_req is cleared at magnify */
+        if (t4_holding && !seen13)
+        {   /* v5.16: AF readout words on change while held (AF-ON moves cmosStart), at most every 100 ms, 60 lines */
+            uint32_t sg = t4_af_sig();
+            if (sg != afsig && afn < 60 && get_ms_clock() - aft >= 100) { afsig = sg; aft = get_ms_clock() | 1; afn++; t4_af_log("held"); }
+        }
         if (t4_holding && !seen13)
         {
             /* v4.79: LV stopped or another sensor mode (photo LV, FHD): the 4K path is not running, so Canon's
@@ -759,7 +800,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.15 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.16 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -903,6 +944,16 @@ static void t4_task(void *unused)
                    T4_DCOLS, T4_W + T4_DCOLS, 0x72a, 0x1d0b, (int)t4_hpos(378 - T4_LU), (int)t4_hpos(1403 + T4_RU),
                    0x10154, 0x10000 | (2 * (167 + T4_DHD / 2 - T4_DCOLS / 8) + 6), 167 + T4_DHD / 2 - T4_DCOLS / 8, (int)T4_NWENG);
         }
+        if (t4_r76 >= 0 && !(T4_DCOLS || T4_DHD))
+        {   /* v5.16 Wide AF test V1 */
+            t4s_i76f = t4_find(full, T4_NFULL, 0x76); t4s_i76t = t4_find(lvt, T4_NLVT, 0x76);
+            t4s_o76f = t4s_i76f >= 0 ? full[t4s_i76f] : 0; t4s_o76t = t4s_i76t >= 0 ? lvt[t4s_i76t] : 0;
+            if (t4s_i76f < 0 || t4s_i76t < 0 || (t4s_o76f & 0x3fffff) != 0xff || (t4s_o76t & 0x3fffff) != 0xff)
+            { ebad++; t4s_i76f = -1; t4_log("  AF test V1: 0x76 unexpected: full %x template %x\n", (int)t4s_o76f, (int)t4s_o76t); }
+            else t4_log("AF test V1: 0x76 0xff -> 0 at 4K width (full[%d], template[%d])\n", t4s_i76f, t4s_i76t);
+        }
+        if (t4_aft_run == 2 && T4_DCOLS) t4_log("AF test V2: window %d..%d (start kept at Canon's 378)\n", 378 - (int)T4_LU, 1403 + (int)T4_RU);
+        t4_af_log("plan (4K)");
         t4_log("engine init values + %d YUV crop entries: %d checked, %d unexpected\n", T4_NYUV, (int)T4_NENG, ebad);
         if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
     }
@@ -962,6 +1013,7 @@ static void t4_task(void *unused)
         else if (MEM(T4_10BIT)) why = "Canon 10-bit on";
         else if (slot != 4) why = "23.98p only";
         else if (T4_DCOLS && t4_wlv_run != 2) why = "Wide screen fix";
+        else if (t4_aft_run == 2 && T4_DCOLS) why = "Wide AF test";
         else if (t4_wf_y < 0 || t4_wf_y + T4_WF_CH > T4_H + (int)T4_DROWS) why = "height too small";
         else if ((t4_wf_x & 3) || t4_wf_x + T4_WF_CW > (int)T4_WN || !(t4_wf_y & 1)) why = "placement";
         t4_log("WF plan: %s; cut %dx%d at %d / %d of %dx%d (raw 14220360 B of 14585844), %d words, %d unexpected, fps slot %d\n",
@@ -1048,6 +1100,7 @@ static void t4_task(void *unused)
     {
         int i74 = t4_find(l7, 43, 0x74), i75 = t4_find(l7, 43, 0x75), i76 = t4_find(l7, 43, 0x76);
         t4_log("after rebuild: live lv7 0x76 %x\n", i76 >= 0 ? (int)l7[i76] : -1);
+        t4_af_log("after rebuild");
         t4_log("after rebuild: live lv7 0x74 %x 0x75 %x; Mem1Path +10 %d +14 %d +18 %d +1c %d; record w %d (RAM %d)\n",
                i74 >= 0 ? (int)l7[i74] : -1, i75 >= 0 ? (int)l7[i75] : -1, (int)MEM(T4_PATH + 0x10), (int)MEM(T4_PATH + 0x14),
                (int)MEM(T4_PATH + 0x18), (int)MEM(T4_PATH + 0x1c), (int)MEM(T4_REC), (int)t4s_rec_ram[0]);
@@ -1545,7 +1598,10 @@ void tall4k_tick(void)
     {   /* v5.03: 4K frame height "Wide 4480x2214" = the camera-verified v5.02 set (desk W4c): sensor window 351..1430
          * (+216 px), MEM1 / receiver 4480, line HD 1500, VD 1390 (23.98p), blank 167, sensor 0x76 0 (whole row) */
         t4_dcols = 224; t4_dhd = 56; t4_lunits = 27; t4_runits = 27; t4_r76 = 0;
+        if (t4_aft == 2) { t4_lunits = 0; t4_runits = 54; }   /* v5.16 Wide AF test V2: window 378..1457 */
     }
+    else if (t4_aft == 1) t4_r76 = 0;                          /* v5.16 Wide AF test V1: 0x76 alone at 4K width */
+    t4_aft_run = t4_aft;
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
     task_create("tall4k", 0x1d, 0x1000, t4_persist_task, 0);
@@ -1587,7 +1643,11 @@ void tall4k_guide_tick(void)
     if (t4_persist_run && t4_pmode_run == 4) ph = 2430;
     int sw = 3840, sh = 2160;
     int sx = (pw - sw) / 2, sy = t4_place ? (ph - sh) / 2 : 0;
-    if (T4_DCOLS && t4_wlv_run == 1) sx -= 4 * (int)T4_LU;     /* Wide screen fix "Line width": view 108 px left */
+    if (T4_DCOLS)
+    {   /* v5.16: screen = MEM1 cols x + 4 .. (valid-area x), picture = MEM1 cols 144.. (Wide AF test V2: x 272 -> 132) */
+        int vx = t4_wlv_run == 2 ? 272 + 4 * (int)T4_LU : t4_wlv_run == 3 ? (int)((272 + 4 * T4_LU + 15) & ~15u) : 272;
+        sx = vx + 4 - 144;
+    }
     if (t4_wf) { sx += (sw - 4096) / 2; sy += (sh - 2304) / 2; sw = 4096; sh = 2304; }   /* v5.14 whole-frame view: 4096x2304 about the same centre */
     int l = MAX(sx, 0), r = MAX(pw - sw - sx, 0), t = MAX(sy, 0), b = MAX(ph - sh - sy, 0);
     get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
@@ -1807,6 +1867,14 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v5.02: window +216 (sensor 351..1430), MEM1 4480, line 30.0 us / 1390 lines (23.98p),",
                 .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
+            },
+            {
+                .name    = "Wide AF test",
+                .priv    = &t4_aft,
+                .max     = 2,
+                .choices = CHOICES("OFF", "V1 0x76 in 16:9", "V2 Wide right"),
+                .help    = "v5.16 (desk D5): V1 = 4K frame height 16:9 + Wide's sensor code 0x76 (AF should still work).",
+                .help2   = "V2 = Wide heights with all extra columns on the right (AF should work again). Not saved.",
             },
             {
                 .name    = "Wide screen fix",
