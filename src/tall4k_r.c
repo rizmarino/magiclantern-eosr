@@ -814,7 +814,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.18 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.20 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -1665,7 +1665,10 @@ void tall4k_guide_tick(void)
     get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
     int w = T4G_W, h = (T4G_W * ph / pw + 1) & ~1;
     int x = (t4_guide == 2 || t4_guide == 4) ? os.x_max - w - 8 : os.x0 + 8;
-    int y = t4_guide >= 3 ? os.y0 + 8 : os.y_max - h - 8;
+    /* v5.19+ (v5.20): keep clear of Canon's movie LV icons (phone photo 2026-11-27, 720x480 layer): bottom bar boxes from
+     * row ~416 (the guide at y_max - 8 overlapped "1/50"), magnify icon at the right rows ~373..411, Q / clock at the top
+     * rows ~10..60. Bottom left ends 40 rows above the picture bottom, bottom right 76, top corners start 32 below. */
+    int y = t4_guide >= 3 ? os.y0 + 32 : os.y_max - h - (t4_guide == 2 ? 76 : 40);
     if (x < 0 || y < 0 || x + w > 720 || y + h > 480) return;
     uint32_t s = (uint32_t)pw + (uint32_t)ph * 5000u + (uint32_t)(l * 7 + t * 13 + x * 31 + y * 101 + sw * 3) * 25000000u;
     if (drawn && s == sig && bmp_getpixel(x, y) == COLOR_YELLOW && (rawrec_running() || tick % 16)) return;
