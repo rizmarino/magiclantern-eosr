@@ -1,3 +1,8 @@
+> **This is an unofficial fork for the Canon EOS R (firmware 1.8.0)** with raw and lossless 4K raw video, taller and
+> wider 4K readouts, silent burst, rack focus, Doom and more. **Start with [docs/eos-r/README.md](docs/eos-r/README.md).**
+> Most of the EOS R code was written by an AI coding assistant and camera-tested by the fork's owner (disclosure in
+> that file). It is not an official Magic Lantern release; please don't report its bugs upstream.
+
 Magic Lantern
 =============
 
