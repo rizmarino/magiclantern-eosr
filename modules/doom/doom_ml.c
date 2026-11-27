@@ -1001,6 +1001,7 @@ static struct menu_entry doom_menu[] =
                 .help    = "Test pattern + key log (ML/DOOM/KEYS.TXT). Border changes on each key.",
                 .help2   = "MENU ends it (or 30 s without keys). No WAD needed.",
             },
+#ifdef DOOM_TESTS   /* release cleanup: audio bring-up tests (camera-verified 2026-11-10/15), research builds only */
             {
                 .name    = "Sound test",
                 .select  = doom_sound_test,
@@ -1013,6 +1014,7 @@ static struct menu_entry doom_menu[] =
                 .help    = "Gapless audio test (movie-play path): 6 s + 4 s continuous tone.",
                 .help2   = "Listen for clicks/gaps. Photo mode, not recording. Log: ML/DOOM/SOUND.TXT.",
             },
+#endif
             MENU_EOL,
         },
     },

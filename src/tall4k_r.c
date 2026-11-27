@@ -612,6 +612,7 @@ static void t4_nomag_why(void)
     snprintf(t4_nomag, sizeof(t4_nomag), "%s", afseq ? (servo ? "Movie Servo AF is on" : "Canon AF is busy")
              : autok == 0 ? "Canon blocks zoom (AutoK)" : "Canon refused zoom");
 }
+extern int rawrec_on(void);             /* v5.23: the frame height only applies while Movie > RAW video (R) is ON */
 static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
 {
     int seen13 = 0, rq5 = 0, rq1 = 0, ending = 0, dlg_warned = 0, mchg = 0, afn = 0;
@@ -626,7 +627,8 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
         {
             /* v4.86: decided when the menu closes, so a value cycled through and back (SET pressed on the entry to
              * "confirm") keeps the frame; v4.85 ended it on the first change and the next clip came out normal 4K */
-            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run || t4_view != t4_view_run || t4_aft != t4_aft_run;   /* v4.89: a preview change re-applies too; v5.10: zoom proof */
+            int ch = t4_pmode != t4_pmode_run || t4_preview != t4_preview_run || t4_wlv != t4_wlv_run || t4_view != t4_view_run || t4_aft != t4_aft_run
+                     || !rawrec_on();   /* v5.23: RAW video switched OFF ends it too (at menu close) */   /* v4.89: a preview change re-applies too; v5.10: zoom proof */
             if (ch != mchg)
             {
                 mchg = ch;
@@ -814,7 +816,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.20 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.23 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -1587,7 +1589,7 @@ void tall4k_tick(void)
     if (get_ms_clock() - t_end < 1000) { idle_since = 0; t4_soon = !t4_holding; return; }
     int slot = (int)MEM(T4_SDRV + 0x70);
     int why = !lv ? 1 : MEM(T4_STATE + 0xc) != 12 ? 2 : (slot != 4 && (slot != 9 || t4_pmode >= 3)) ? 3 : CURRENT_GUI_MODE ? 100 + CURRENT_GUI_MODE
-              : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : 0;
+              : gui_menu_shown() ? 4 : rawrec_running() ? 5 : lv_dispsize != 1 ? 6 : get_global_draw() ? 7 : !rawrec_on() ? 8 : 0;   /* v5.23: 8 = RAW video OFF */
     if (why)
     {
         /* log once per value why it isn't switching (is idle LV GUI mode 0 on the R?) */
@@ -1706,7 +1708,8 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     if (t4_holding && t4_persist_run) MENU_SET_RINFO("ON");
     else if (t4_suspend) MENU_SET_RINFO("paused");
     else MENU_SET_RINFO("waiting");
-    if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
+    if (!rawrec_on()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Only with RAW video (R) ON: Canon video stays normal 4K.");
+    else if (get_global_draw()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Needs Overlay > Global Draw OFF.");
     else if (t4_suspend && t4_nomag[0]) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused: %s. AF method 1-point AF? Then Normal and back.", t4_nomag);
     else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused (%s): set Normal and back to retry.", t4_result[0] ? t4_result : "failed switch");
     else if (is_continuous_af()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Movie Servo AF is on: Canon may refuse the zoom the switch needs. Set Disable.");
