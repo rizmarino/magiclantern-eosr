@@ -971,8 +971,12 @@ static MENU_UPDATE_FUNC(doom_play_update)
     else
     {
         MENU_SET_RINFO("%s", wad_path + 8);
-        /* Canon's audio input runs in movie live view (sound recording on): the stream is not opened then (st_open) */
-        if (actrl_is_active(0x22, 0)) MENU_SET_WARNING(MENU_WARN_ADVICE, "No sound in movie mode: switch to photo mode for sound.");
+        /* Canon's audio input runs in movie live view (sound recording on): the stream is not opened then (st_open).
+         * v5.26: test the mode, not ACTRL: with the ML menu open Canon pauses the input (camera 2026-11-27: no warning
+         * in the menu, then ACTRL 0x22 active at the game start). */
+        extern int lv_movie_select;
+        if (lv_movie_select == 2) MENU_SET_WARNING(MENU_WARN_ADVICE, "No sound in movie mode: switch to photo mode for sound.");
+        else if (doom_spk_vol <= 2) MENU_SET_WARNING(MENU_WARN_INFO, "Speaker volume is %d of 10 (PLAY: options).", doom_spk_vol);
     }
 }
 
