@@ -1,0 +1,35 @@
+name: Test report (works / doesn't work on my camera)
+description: Share results for a mode, lens or card not yet listed in the docs.
+title: "[test] "
+labels: ["test report"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ML version
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card (brand, model, size)
+    validations:
+      required: true
+  - type: input
+    id: lens
+    attributes:
+      label: Lens (if relevant)
+  - type: textarea
+    id: mode
+    attributes:
+      label: Mode tested
+      description: Canon movie size / frame rate and ML settings (Resolution, Bit depth, Compression, 4K frame height ...).
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Frames recorded vs expected (the clip's end message), card MiB/s from Movie > RAW video (R) > Data rate, anything odd.
+    validations:
+      required: true

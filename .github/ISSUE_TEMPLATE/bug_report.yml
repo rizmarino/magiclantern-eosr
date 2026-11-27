@@ -1,0 +1,68 @@
+name: Bug report (EOS R)
+description: Something in this EOS R build doesn't work as the docs say.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is an unofficial, experimental EOS R fork. Support is best effort.
+        **Don't report these bugs to upstream Magic Lantern.** Please check
+        [known limitations](https://github.com/rizmarino/magiclantern-eosr/blob/main/docs/eos-r/known-limitations.md) first.
+  - type: input
+    id: version
+    attributes:
+      label: ML version
+      description: Zip name or the commit shown in ML's Help / Debug tab (e.g. v5.26 3339b30b7).
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Camera firmware
+      description: Must be 1.8.0. Other versions are not supported.
+      placeholder: "1.8.0"
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card (brand, model, size)
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: Canon mode and movie size / frame rate, and the ML settings involved (e.g. RAW video, Resolution, Bit depth, Compression, 4K frame height).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps from power-on.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Attach `CRASHnn.LOG` from the card root (if any) and the files in `ML/LOGS/` and `ML/RECTEST.TXT`.
+        **Never attach `ML/LOGS/ROM0.BIN` / `ROM1.BIN`**: they are Canon's firmware.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I read the known limitations and this isn't one of them.
+          required: true
+        - label: It happens with the current release, not only an older build.
+          required: true

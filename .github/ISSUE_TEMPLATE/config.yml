@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help (Discussions)
+    url: https://github.com/rizmarino/magiclantern-eosr/discussions
+    about: How-to questions, lens/card compatibility, ideas. Please don't open an issue for these.
+  - name: Documentation
+    url: https://github.com/rizmarino/magiclantern-eosr/tree/main/docs/eos-r
+    about: Install steps, tested modes and known limitations. Check these first.
