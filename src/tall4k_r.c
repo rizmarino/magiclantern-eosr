@@ -545,6 +545,18 @@ CONFIG_INT("t4.mode", t4_pmode, 0);       /* 0 OFF, 1 +200 (4256x2414, 16:9 in p
 static int t4_persist_run;              /* the running t4_task was started by the watcher */
 static int t4_pmode_run;
 static int t4_wlv_run;                  /* v5.06 */                /* the mode value the running switch was started for */
+/* v5.18: the recorded picture (MLV active area) of the running 4K frame height, for messages: same names as the menu */
+static const char *t4_picname(void)
+{
+    switch (t4_pmode_run)
+    {
+        case 1: return "4K 16:9 4104x2312";
+        case 2: return "4K Tall 4104x2648";
+        case 3: return "4K Wide 4320x2168";
+        case 4: return "4K Wide 16:9 4320x2430";
+    }
+    return "4K height";
+}
 static int t4_dump = 1;                 /* row dump after the switch (test entries only) */
 static volatile int t4_key_pend;        /* key held back until normal 4K is back, then re-sent */
 static volatile int t4_soon;            /* v4.86: the watcher is counting down to a switch (REC held back) */
@@ -624,7 +636,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             {
                 ending = 1;
                 t4_log("  menu closed: ending for height %d / preview %d\n", t4_pmode, t4_preview);
-                NotifyBox(3000, "4K frame height / preview changed: back to normal 4K first...");
+                NotifyBox(3000, "4K height changed: normal 4K first...");
             }
         }
         if (t4_end_req) ending = 1;                 /* kept after t4_end_req is cleared at magnify */
@@ -655,7 +667,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             {
                 dlg_warned = 1;
                 t4_log("  Canon dialog %d opened while held: ending taller 4K\n", (int)CURRENT_GUI_MODE);
-                NotifyBox(5000, "Taller 4K: close this screen, back to normal 4K first");
+                NotifyBox(5000, "4K height: Canon screen opened, ending");
                 ending = 1;
             }
         }
@@ -731,7 +743,7 @@ static int t4_cycle(int timeout_ms, int *narrowed, int *reflex14)
             {
                 t4_restore_all(); t4_applied = 0; t4_apply_fail = 1;
                 t4_log("  cpu1 does not see the record: restored (still in magnify)\n");
-                NotifyBox(5000, "Taller 4K: cpu1 check failed, exit magnify (normal 4K)");
+                NotifyBox(5000, "4K height: cpu1 check failed");
             }
             else if (!t4_auto) NotifyBox(5000, "Taller 4K +%d: now exit magnify", T4_DROWS);
         }
@@ -802,7 +814,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.17 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.18 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -1079,7 +1091,7 @@ static void t4_task(void *unused)
     }
     t4_applied = 0; t4_apply_fail = 0; t4_pend_apply = 1; t4_nomag[0] = 0;
     t4_trace_ms = t4_tap ? 2000 : 4000;
-    if (t4_auto) NotifyBox(5000, "Taller 4K +%d: switching (auto magnify)...", T4_DROWS);
+    if (t4_auto) NotifyBox(5000, "4K height: switching...");
     else NotifyBox(5000, "Taller 4K +%d: magnify x5, then WAIT for the exit prompt", T4_DROWS);
 
     /* 4. rebuild via magnify in/out */
@@ -1253,15 +1265,14 @@ revert:
                 t4_end_req = 0;
                 if (t4_persist_run) t4_marker(0);
                 if (t4_persist_run && t4_view_run)         /* v5.14: say which view came up (<= ~40 chars) */
-                    NotifyBox(5000, T4_DCOLS ? "Wide 4K %dx%d, %s" : "Taller 4K %dx%d, %s", (int)T4_WN, T4_H + T4_DROWS,
-                              !t4_wf ? "centre view" : wf_bad ? "view BAD" : "whole view");
-                else if (t4_persist_run) NotifyBox(4000, T4_DCOLS ? "Wide 4K %dx%d" : "Taller 4K %dx%d", (int)T4_WN, T4_H + T4_DROWS);
+                    NotifyBox(5000, "%s, %s", t4_picname(), !t4_wf ? "centre view" : wf_bad ? "view BAD" : "whole view");
+                else if (t4_persist_run) NotifyBox(4000, "%s", t4_picname());   /* v5.18: recorded size, as in the menu */
                 else NotifyBox(10000, "Taller 4K %dx%d ON: record now (LL 10-bit). End: Debug > End taller 4K", T4_W, T4_H + T4_DROWS);
             }
             else
             {
                 t4_log("revert deferred until magnify is active\n");
-                if (t4_auto) NotifyBox(5000, "Taller 4K: restoring normal 4K (auto magnify)...");
+                if (t4_auto) NotifyBox(5000, "4K height: back to normal 4K...");
                 else NotifyBox(5000, "Taller 4K: magnify x5 and exit once more (restores normal 4K)");
             }
             t4_trace_ms = 3000;
@@ -1316,7 +1327,7 @@ out:
         if (t4_key_pend) t4_log("key %x ended the taller frame\n", t4_key_pend);
         if (t4_suspend) NotifyBox(8000, "4K height paused: %s", t4_result);   /* v5.12: <= ~40 chars fit the R's screen */
     }
-    else NotifyBox(8000, "Taller 4K: %s", t4_result);
+    else NotifyBox(8000, "4K height: %s", t4_result);
     t4_running = 0;
     if (t4_key_pend)
     {
@@ -1523,17 +1534,17 @@ int tall4k_keys(int k)
 {
     if (gui_menu_shown()) return 1;
     if (t4_running && t4_persist_run && !t4_holding && (k == BGMT_MENU || k == BGMT_PLAY || k == BGMT_PRESS_SET || k == 0x20))
-    { NotifyBox(2000, "Taller 4K: switching, one moment"); return 0; }   /* never open Canon screens mid-switch */
+    { NotifyBox(2000, "4K height: switching, wait"); return 0; }   /* never open Canon screens mid-switch */
     if (k == 0x20 && !t4_running && t4_soon)
-    { NotifyBox(2000, "Taller 4K: switching, one moment"); return 0; }   /* v4.86: REC hit the switch in v4.85 */
+    { NotifyBox(2000, "4K height: switching, wait"); return 0; }   /* v4.86: REC hit the switch in v4.85 */
     if (!t4_holding) return 1;
-    if (k == 0x20 && !rawrec_on()) { NotifyBox(3000, "Taller 4K: record with Movie > RAW video (R)"); return 0; }
+    if (k == 0x20 && !rawrec_on()) { NotifyBox(3000, "REC: turn on Movie > RAW video (R)"); return 0; }
     if (k != BGMT_MENU && k != BGMT_PLAY && k != BGMT_PRESS_SET) return 1;
     if (rawrec_running() || RECORDING) { NotifyBox(2000, "Stop recording first"); return 0; }
     if (!t4_key_pend)
     {
         t4_key_pend = k; t4_end_req = 1;   /* logged by the t4 task (no card writes from the GUI task) */
-        NotifyBox(3000, "Taller 4K: back to normal 4K first...");
+        NotifyBox(3000, "4K height: back to normal 4K...");
     }
     return 0;
 }
@@ -1565,7 +1576,7 @@ void tall4k_tick(void)
             t4_log("=== boot: crash marker found (camera stopped during a switch): Taller 4K mode was %d, now OFF\n", t4_pmode);
             FIO_RemoveFile(T4_PND);
             t4_pmode = 0;
-            NotifyBox(10000, "Taller 4K mode switched OFF: the camera froze while switching last time");
+            NotifyBox(10000, "4K height OFF: froze at last switch");
         }
         last_mode = t4_pmode;
     }
@@ -1639,7 +1650,7 @@ void tall4k_guide_tick(void)
         return;
     }
     /* recorded picture = MLV active area (rectest_r.c); screen = Canon's 3840x2160, centred like the mode places it */
-    int pw = T4_DCOLS ? 4320 : 4112, ph = 2168 + (int)T4_DROWS;
+    int pw = T4_DCOLS ? 4320 : 4104, ph = 2168 + (int)T4_DROWS;   /* v5.18: 4104 = 4112 minus the 8 pad columns */
     if (t4_persist_run && t4_pmode_run == 1) ph = 2312;
     if (t4_persist_run && t4_pmode_run == 4) ph = 2430;
     int sw = 3840, sh = 2160;
@@ -1710,6 +1721,7 @@ MENU_UPDATE_FUNC(tall4k_view_update)
     else if (t4_pmode == 3) MENU_SET_WARNING(MENU_WARN_ADVICE, "Wide 4320x2168 keeps the centre view (too few rows). Use Wide 16:9.");
 }
 
+#ifdef R_TESTS   /* v5.18 release cleanup: Debug > Taller 4K tests only in research builds */
 static int t4_one = 1, t4_zero = 0, t4_two = 2, t4_three = 3, t4_four = 4, t4_five = 5, t4_six = 6, t4_seven = 7, t4_eight = 8, t4_nine = 9;
 static struct menu_entry t4_menu[] = {
     {
@@ -1874,9 +1886,13 @@ static struct menu_entry t4_menu[] = {
     },
 };
 
+#endif /* R_TESTS */
+
 static void t4_init(void *unused)
 {
+#ifdef R_TESTS
     menu_add("Debug", t4_menu, COUNT(t4_menu));
+#endif
 }
 
 INIT_FUNC("tall4k_r", t4_init);

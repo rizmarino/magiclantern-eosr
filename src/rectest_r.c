@@ -134,7 +134,11 @@ static volatile int rr_active, rr_stop;
  * (M<day>-<hhmm>.MLV at the card root). Their test diagnostics (.IDX/.SYN, USB exports, key log, timeline
  * and write lists in the log) are written only with Debug > LV record test > REC diagnostics ON; timed test
  * runs (menu Start, auto-run plans) always write them. */
+#ifdef R_TESTS
 static CONFIG_INT("r.rawrec.diag", rr_diag, 0);
+#else
+static int rr_diag = 0;                 /* v5.18: REC diagnostics are R_TESTS-only; a saved ON from older builds is ignored */
+#endif
 static CONFIG_INT("r.rawrec.card10", rr_card10, 1060);       /* card write speed of the last clip, MiB/s x10 */
 static char rr_base[16];                /* clip name without extension */
 static volatile int rr_full;            /* last clip stopped because the card was nearly full */
@@ -863,6 +867,10 @@ static void rt_mlv_build_hdr(int file_num, uint32_t vframes)
         ay += 28; ay2 = c_ch - 28;
     }
     uint32_t ax2 = c_cw;
+    if (rt_m1_4k(m1_w, m1_h) && m1_w == 4256 && c_cw == 4256 && c_x0 == 0) ax2 = 4248;
+        /* v5.18: 4K Full frame, 16:9 and Tall: the last 8 columns of a 4256 line (4248..4255) are receiver pad with the
+         * Bayer phase shuffled (R/G swapped in 4248-4249, 4252-4255; every clip since v17.1, a magenta line at the right
+         * edge of a render). Active area 144..4247 = 4104 wide. Wide (4480) drops its own 16 below. */
     if (tall4k_active() && c_cw == 4480 && c_x0 == 0)
     {   /* v5.04 4K frame height Wide: the last 16 columns (4464..4479) come out with the Bayer order shuffled (camera
          * M18-1958: R/G phase swapped in 4464-4469, 4472-4473, 4476-4479), like normal 4K's 8 receiver pad columns
@@ -3912,7 +3920,7 @@ static MENU_UPDATE_FUNC(rr_main_update)
     int bpp = rt_fmt_bpp[rt_fmt_sel ? rt_fmt_sel : 1];
     if (rt_crop_sel == RT_CROP_FULL) MENU_SET_VALUE("Full frame, %d-bit", bpp);
     else MENU_SET_VALUE("%dx%d %d-bit", rt_crop_wh[rt_crop_sel][0], rt_crop_wh[rt_crop_sel][1], bpp);
-    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4112x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4320x2168, 10-bit" : t4_pmode == 4 ? "4K wide 16:9 4320x2430, 10-bit" : "4K tall 4256x2694, 10-bit");
+    if (tall4k_active()) MENU_SET_VALUE(t4_pmode == 1 ? "4K 16:9 4104x2312, 10-bit" : t4_pmode == 3 ? "4K wide 4320x2168, 10-bit" : t4_pmode == 4 ? "4K wide 16:9 4320x2430, 10-bit" : "4K tall 4104x2648, 10-bit");
     if (rr_active) MENU_SET_RINFO("REC");
 }
 
@@ -4035,7 +4043,7 @@ static struct menu_entry rr_menu[] = {
         .priv     = &rr_on,
         .max      = 1,
         .update   = rr_main_update,
-        .help     = "ON: the REC button records raw MLV (no audio) instead of Canon video.",
+        .help     = "ON: the REC button records raw MLV instead of Canon video (audio: see Audio below).",
         .help2    = "Movie mode, ML menu closed. Clips: M<day>-<hhmm>.MLV at the card root. Open in MLV App.",
         .children = (struct menu_entry[]) {
             {
@@ -4044,16 +4052,16 @@ static struct menu_entry rr_menu[] = {
                 .max     = 7,
                 .choices = CHOICES("1920x1080", "1920x960", "1920x800", "Full frame", "2560x1080", "2560x1440", "2880x1216", "3840x2160"),
                 .help    = "2560 and 2880 need Canon movie size 4K (1:1 pixels, narrower view). In FHD they shrink",
-                .help2   = "to 2304 wide. Full frame: FHD 2304x1290; 4K 4256x2214 and 3840x2160 need Compression: Lossless.",
+                .help2   = "to 2304 wide. Full frame: FHD 2256x1268, 4K 4104x2168. 4K Full frame and 3840x2160 need Lossless.",
             },
             {
                 .name    = "4K frame height",
                 .priv    = &t4_pmode,
                 .max     = 4,
-                .choices = CHOICES("Normal", "16:9 4112x2312", "Tall 4256x2694", "Wide 4320x2168", "Wide 16:9 4320x2430"),
+                .choices = CHOICES("Normal", "16:9 4104x2312", "Tall 4104x2648", "Wide 4320x2168", "Wide 16:9 4320x2430"),
                 .update  = tall4k_height_update,
-                .help    = "Taller 4K raw (centred): 16:9 = 4256x2414 recorded, shown as 4112x2312; Tall = 3:2-ish.",
-                .help2   = "Wide (23.98p only): 4480x2214 / 4480x2478 recorded -> 4320x2168 / 4320x2430. Global Draw OFF, LL 10-bit.",
+                .help    = "4K raw with more of the sensor (same 1.7x crop): 16:9, Tall (about 3:2) or Wide (+5 pct width).",
+                .help2   = "4K 23.98p, Lossless 10-bit, Global Draw OFF, AF method 1-point. Switches ~2 s after the menu closes.",
             },
             {
                 .name    = "Frame guide",
@@ -4070,7 +4078,7 @@ static struct menu_entry rr_menu[] = {
                 .choices = CHOICES("Centre 1:1", "Whole frame"),
                 .update  = tall4k_view_update,
                 .help    = "4K frame height 16:9 / Tall / Wide 16:9, 23.98p. Whole frame: 4096x2304 of the picture, scaled to the screen.",
-                .help2   = "16:9: all of it. Wide 16:9: 95 pct. Tall: full width, 87 pct of height. AF box up to 7 pct off. Applies at menu close.",
+                .help2   = "16:9: all. Tall: 87 pct of height. Wide 16:9: 95 pct, colour band at right edge (screen only).",
             },
             {
                 .name    = "Bit depth",
@@ -4092,9 +4100,9 @@ static struct menu_entry rr_menu[] = {
                 .name    = "Lossless source",
                 .priv    = &rr_crx_src,
                 .max     = 2,
-                .choices = CHOICES("Copy", "Direct (test)", "Direct+verify"),
-                .help    = "Copy: each frame is copied, then compressed (tested). Direct: the encoder reads Canon's",
-                .help2   = "frame buffer itself (less memory traffic, for 29.97p). +verify: 1 raw frame/s for the PC check.",
+                .choices = CHOICES("Copy", "Direct", "Direct+verify"),
+                .help    = "Copy: each frame is copied, then compressed. Direct (recommended): the encoder reads Canon's",
+                .help2   = "frame buffer itself (less memory traffic, needed for 29.97p). +verify: diagnostic, 1 raw frame/s.",
             },
             {
                 .name    = "Lossless copy-out",
@@ -4261,7 +4269,7 @@ static struct menu_entry rt_menu[] = {
         },
     },
 };
-#else
+#elif 0   /* v5.18 release cleanup: Debug > RAW video diagnostics not in the camera build (REC diagnostics forced off) */
 static struct menu_entry rt_menu[] = {
     {
         .name   = "RAW video diagnostics",
@@ -4532,7 +4540,9 @@ static void rt_init(void *unused)
     task_create("rr_status", 0x1f, 0x1000, rr_status_task, 0);
     task_create("rr_mark", 0x1f, 0x1000, rr_mark_task, 0);
     menu_add("Movie", rr_menu, COUNT(rr_menu));       /* v18: user front end */
+#ifdef R_TESTS
     menu_add("Debug", rt_menu, COUNT(rt_menu));
+#endif
     menu_add("Shoot", sp_menu, COUNT(sp_menu));     /* v20 */
     task_create("sp_watch", 0x1f, 0x1000, sp_watch_task, 0);
 #ifdef R_TESTS

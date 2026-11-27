@@ -19,16 +19,23 @@ CFLAGS_PLATFORM = -mthumb -mlong-calls
 PLATFORM_ARCH = armv7-a
 
 ML_BOOT_OBJ = boot-d678.o
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o $(BUILD_DIR)/test_features.o
-# riz/eosr-dmlog: Debug -> LV log capture (Canon DbgMgr, no ROM patching)
-ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvlog_r.o $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rectest_r.o $(BUILD_DIR)/silenttest_r.o
+# v5.18 release cleanup: research-only Debug tools are built only with `make R_TESTS=y` (and #define R_TESTS in the
+# sources for their test code): test_features.o (Debug > EOS R Test features: Canon highlight toggle, raw temp
+# readouts), lvlog_r.o (Debug > LV log capture, Canon DbgMgr), sensreg_r.o (Debug > Sensor regs log, below)
+ifdef R_TESTS
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/test_features.o $(BUILD_DIR)/lvlog_r.o
+endif
 # v4.80: lvjob_r.o (Debug > LV job dump, v3 research, finished) left out: Canon heap (v4.79 boot Err 70 at 476 KB free)
 # v4.9: RAW histogram / RAW zebras in movie mode (LV raw tap)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rawlv_r.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crxtest_r.o   # v4.17 lossless 4K step 2
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/romremap_r.o   # v4.51 shared ROM remap (silent burst fps patch)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/rackfocus_r.o  # v4.56 Focus > Rack focus (stored points, lens-distance loop)
+ifdef R_TESTS
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/sensreg_r.o    # v4.58 Debug > Sensor regs log (read-only); back in v4.88 for the wider-4K stage
+endif
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/tall4k_r.o     # v4.61 taller 4K: Movie > RAW video (R) > 4K frame height + Debug > Taller 4K tests
 # v4.88: test-only code in crxtest_r / silenttest_r / rectest_r / tall4k_r sits under #ifdef R_TESTS (not built)
 # v4.55: dualiso_r.o (Shoot > Dual ISO (test)) left out: no per-line ISO control found on the R (parked 2026-11-11);
