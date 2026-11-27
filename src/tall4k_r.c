@@ -64,7 +64,8 @@ static uint32_t *t4s_var[2];
  * record into the LTKIDS crop block (0xD041E088.. = (in_h-1) << 16 | (in_w/2 - 1)). Wide left it at 4256 for a 4480 line:
  * each LV row started 224 px late -> sheared, Bayer-flipped horizontal bands. 0 off, 1 in_w only, 2 in_w + window x
  * moved by the extra left columns (frames like normal 4K). */
-CONFIG_INT("t4.wlv", t4_wlv, 2);
+static int t4_wlv = 2;                  /* v5.17: fixed (menu entry gone, config key t4.wlv no longer read): the Wide window
+                                         * keeps Canon's start, so x = 272 + 4 * 0 = normal 4K framing, and 1 / 2 / 3 were identical */
 /* v4.89: per-mode table 0xE1224CC8 (20-byte entries {flag, 0, valid area*, out*, out*}) pairs each valid-area record
  * with a 17-word output record; 4K: 0xE1225288 / 0xE1225354 {4, 3, 3840, 2160, 1, 1, 1, 1, 0x10001, 3840, 0, 0,
  * 3840, 2160, 1, 1, 0} (hypothesis: the LV YUV / display picture the valid area is resized to).
@@ -310,7 +311,8 @@ static volatile uint32_t *t4_live_lv7(void)
     if (p < 0x1000 || p >= 0x80000000 || (p & 3)) return 0;
     return (volatile uint32_t *)(p + 0x1bac + 7 * 0xac);
 }
-/* v5.16 Wide AF test (desk D5, wider-desk.md): Canon's movie AF fails in the Wide heights (camera v5.15: hunts, then
+/* v5.17: V2 below is now the Wide layout (Debug entry removed; V1 code kept, unreachable).
+ * v5.16 Wide AF test (desk D5, wider-desk.md): Canon's movie AF fails in the Wide heights (camera v5.15: hunts, then
  * orange / red at once; 16:9 / Tall fine). D5 cause [decomp]: the dual-pixel A window is placed from the AF point with
  * the 4K window start hard-coded (FUN_e06cc56e: sensor 0x70 = 48 + (cmosStart + 1320) / 4, 1320 = (378 - 48) * 4), and
  * the A+B pixels are cut from the main line at column 144 + cmosStart. Wide moves the main window start 0x74 from 378
@@ -800,7 +802,7 @@ static void t4_task(void *unused)
     t4_result[0] = 0;
     if (!t4_persist_run) t4_view_run = 0;   /* the whole-frame view only rides on the 4K frame height mode */
     t4_wf = 0; t4_wf_why[0] = 0;
-    t4_log("=== taller 4K v5.16 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
+    t4_log("=== taller 4K v5.17 %s at %d ms\n", t4_persist_run ? "mode (auto)" : "test", (int)get_ms_clock());
     for (int k = 0; k < 100 && gui_menu_shown(); k++) msleep(100);
     if (gui_menu_shown() || !lv) { snprintf(t4_result, sizeof(t4_result), "menu open or no LV: not started"); goto out; }
 
@@ -952,7 +954,7 @@ static void t4_task(void *unused)
             { ebad++; t4s_i76f = -1; t4_log("  AF test V1: 0x76 unexpected: full %x template %x\n", (int)t4s_o76f, (int)t4s_o76t); }
             else t4_log("AF test V1: 0x76 0xff -> 0 at 4K width (full[%d], template[%d])\n", t4s_i76f, t4s_i76t);
         }
-        if (t4_aft_run == 2 && T4_DCOLS) t4_log("AF test V2: window %d..%d (start kept at Canon's 378)\n", 378 - (int)T4_LU, 1403 + (int)T4_RU);
+        if (T4_DCOLS) t4_log("Wide window %d..%d (start kept at Canon's 378 for AF)\n", 378 - (int)T4_LU, 1403 + (int)T4_RU);
         t4_af_log("plan (4K)");
         t4_log("engine init values + %d YUV crop entries: %d checked, %d unexpected\n", T4_NYUV, (int)T4_NENG, ebad);
         if (ebad) { snprintf(t4_result, sizeof(t4_result), "engine values unexpected: not touched"); goto out; }
@@ -1004,7 +1006,7 @@ static void t4_task(void *unused)
             }
         if (!t4s_pk || t4s_pk[0] || t4s_pk[1] || t4s_pk[2] != 103 || t4s_pk[3] != 103 || t4s_pk[4] != 308 || MEM(T4_PKPTR) != T4_PK) wbad++;
         if (t4s_var[0] && (t4s_var[0][7] || t4s_var[0][8] || t4s_var[0][9] != 3848 || t4s_var[0][10] != 2166)) wbad++;
-        t4_wf_x = (T4_DCOLS ? 272 + 4 * (int)T4_LU - 128 : 148);
+        t4_wf_x = (T4_DCOLS ? 252 : 148);   /* v5.17: Wide = picture cols 144..4464 -> 144 + (4320 - 4104) / 2, whatever the window start */
         t4_wf_y = 47 + 2 * t4_d68 - (T4_WF_CH - 2166) / 2;
         t4_wf_log("plan");
         t4_wf_pdsize_ok = MEM(T4_PDSTATE + 0xB0) == 3839 && MEM(T4_PDSTATE + 0xB4) == 2159;
@@ -1013,7 +1015,6 @@ static void t4_task(void *unused)
         else if (MEM(T4_10BIT)) why = "Canon 10-bit on";
         else if (slot != 4) why = "23.98p only";
         else if (T4_DCOLS && t4_wlv_run != 2) why = "Wide screen fix";
-        else if (t4_aft_run == 2 && T4_DCOLS) why = "Wide AF test";
         else if (t4_wf_y < 0 || t4_wf_y + T4_WF_CH > T4_H + (int)T4_DROWS) why = "height too small";
         else if ((t4_wf_x & 3) || t4_wf_x + T4_WF_CW > (int)T4_WN || !(t4_wf_y & 1)) why = "placement";
         t4_log("WF plan: %s; cut %dx%d at %d / %d of %dx%d (raw 14220360 B of 14585844), %d words, %d unexpected, fps slot %d\n",
@@ -1597,10 +1598,10 @@ void tall4k_tick(void)
     if (t4_pmode >= 3)
     {   /* v5.03: 4K frame height "Wide 4480x2214" = the camera-verified v5.02 set (desk W4c): sensor window 351..1430
          * (+216 px), MEM1 / receiver 4480, line HD 1500, VD 1390 (23.98p), blank 167, sensor 0x76 0 (whole row) */
-        t4_dcols = 224; t4_dhd = 56; t4_lunits = 27; t4_runits = 27; t4_r76 = 0;
-        if (t4_aft == 2) { t4_lunits = 0; t4_runits = 54; }   /* v5.16 Wide AF test V2: window 378..1457 */
+        t4_dcols = 224; t4_dhd = 56; t4_lunits = 0; t4_runits = 54; t4_r76 = 0;
+        /* v5.17: window 378..1457 (Canon's 4K start kept, all 216 extra px on the right) = v5.16 Wide AF test V2,
+         * camera-verified 2026-11-27 (AF locks; centred 351..1430 broke dual-pixel AF, desk D5) */
     }
-    else if (t4_aft == 1) t4_r76 = 0;                          /* v5.16 Wide AF test V1: 0x76 alone at 4K width */
     t4_aft_run = t4_aft;
     t4_d68 = 0; t4_d69 = t4_drows / 2;
     t4_running = 1;
@@ -1648,7 +1649,7 @@ void tall4k_guide_tick(void)
         int vx = t4_wlv_run == 2 ? 272 + 4 * (int)T4_LU : t4_wlv_run == 3 ? (int)((272 + 4 * T4_LU + 15) & ~15u) : 272;
         sx = vx + 4 - 144;
     }
-    if (t4_wf) { sx += (sw - 4096) / 2; sy += (sh - 2304) / 2; sw = 4096; sh = 2304; }   /* v5.14 whole-frame view: 4096x2304 about the same centre */
+    if (t4_wf) { sx = t4_wf_x + 4 - 144; sy += (sh - 2304) / 2; sw = 4096; sh = 2304; }   /* v5.14 whole-frame view: develop = cut x + 4 (v5.17: from the cut, not the centre view) */
     int l = MAX(sx, 0), r = MAX(pw - sw - sx, 0), t = MAX(sy, 0), b = MAX(ph - sh - sy, 0);
     get_yuv422_vram();                  /* refreshes os (panel / EVF image area) */
     int w = T4G_W, h = (T4G_W * ph / pw + 1) & ~1;
@@ -1695,7 +1696,7 @@ MENU_UPDATE_FUNC(tall4k_height_update)
     else if (t4_suspend && t4_nomag[0]) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused: %s. AF method 1-point AF? Then Normal and back.", t4_nomag);
     else if (t4_suspend) MENU_SET_WARNING(MENU_WARN_ADVICE, "Paused (%s): set Normal and back to retry.", t4_result[0] ? t4_result : "failed switch");
     else if (is_continuous_af()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Movie Servo AF is on: Canon may refuse the zoom the switch needs. Set Disable.");
-    else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. Screen = middle of the 4320 px recorded (Frame guide, Screen view).");
+    else if (t4_pmode >= 3) MENU_SET_WARNING(MENU_WARN_INFO, "Wide: 23.98p only. The extra width is recorded right of the screen (Frame guide).");
     else MENU_SET_WARNING(MENU_WARN_INFO, "Switches by itself ~2 s after idle 4K 23.98p movie LV (zooms in/out once).");
 }
 
@@ -1867,22 +1868,6 @@ static struct menu_entry t4_menu[] = {
                 .update = t4_update,
                 .help   = "v5.02: window +216 (sensor 351..1430), MEM1 4480, line 30.0 us / 1390 lines (23.98p),",
                 .help2  = "0x76 full. Saves ML/LOGS/T4_4480R.BIN. 4K 23.98p, Global Draw OFF, height Normal.",
-            },
-            {
-                .name    = "Wide AF test",
-                .priv    = &t4_aft,
-                .max     = 2,
-                .choices = CHOICES("OFF", "V1 0x76 in 16:9", "V2 Wide right"),
-                .help    = "v5.16 (desk D5): V1 = 4K frame height 16:9 + Wide's sensor code 0x76 (AF should still work).",
-                .help2   = "V2 = Wide heights with all extra columns on the right (AF should work again). Not saved.",
-            },
-            {
-                .name    = "Wide screen fix",
-                .priv    = &t4_wlv,
-                .max     = 3,
-                .choices = CHOICES("OFF", "Line width", "Width + centre", "Width + centre x16"),
-                .help    = "v5.06: live view in the Wide heights. Line width = LV reads 4480-px lines (no bands);",
-                .help2   = "Width + centre: frames like normal 4K (x 380); x16: x 384 (strip test). Re-applies at menu close.",
             },
             MENU_EOL,
         },
