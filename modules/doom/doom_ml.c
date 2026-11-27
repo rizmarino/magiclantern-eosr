@@ -782,7 +782,7 @@ static int st_open(int chunk, int vol, void (*fill)(int16_t *, int), st_logfn lg
     st_submitted = st_mix_us_max = st_mix_n = 0; st_mix_us_sum = 0;
     lg("stream: chunk %d B (%d us), volume %d; ACTRL active 0x22 %d, 0x11 %d, 0x20 %d\n", chunk,
        (int)(chunk * 1000LL / 192), vol, actrl_is_active(0x22, 0), actrl_is_active(0x11, 0), actrl_is_active(0x20, 0));
-    if (actrl_is_active(0x22, 0)) { lg("Canon audio busy (recording): no stream\n"); return 1; }
+    if (actrl_is_active(0x22, 0)) { lg("Canon audio input busy (movie mode or recording): no sound\n"); return 1; }
     st_mem = fio_malloc(ST_SLOTS * chunk);
     if (!st_mem) { lg("stream: no memory\n"); return 1; }
     memset(st_mem, 0, ST_SLOTS * chunk);
@@ -968,7 +968,12 @@ static MENU_UPDATE_FUNC(doom_play_update)
 {
     if (doom_played) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Already played this power-on: restart the camera.");
     else if (!find_wad()) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "No WAD: copy DOOM1.WAD into ML/DOOM on the card.");
-    else MENU_SET_RINFO("%s", wad_path + 8);
+    else
+    {
+        MENU_SET_RINFO("%s", wad_path + 8);
+        /* Canon's audio input runs in movie live view (sound recording on): the stream is not opened then (st_open) */
+        if (actrl_is_active(0x22, 0)) MENU_SET_WARNING(MENU_WARN_ADVICE, "No sound in movie mode: switch to photo mode for sound.");
+    }
 }
 
 static struct menu_entry doom_menu[] =

@@ -31,6 +31,8 @@ Options: **Picture** (640x480 4:3, 640x400 2x, 320x200 1x, 720x480 fill), **Spea
 input test** (no WAD needed).
 
 ## Notes
+- **Sound needs photo mode.** In movie mode Canon keeps its audio input running, and Doom then stays silent so it
+  can't clash with Canon's audio (the Doom menu line says so).
 - 25-34 fps in game on the camera.
 - **One game per power-on** (the engine can't be reset): restart the camera to play again.
 - Saves: `ML/DOOM/SAVES/`. Config: `ML/DOOM/default.cfg`, `extra.cfg`.
