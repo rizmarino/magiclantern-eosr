@@ -205,6 +205,11 @@ static void tskmon_stack_checker(struct task *next_task)
             return; // uses 264 of 512, 248 free
         #endif
 
+        #if defined(CONFIG_R)
+        if (streq(task_name, "Touch read") && free > 192)
+            return; // Canon's touch task: uses 264 of 512, 248 free (EOS R 1.8.0, seen on every touch)
+        #endif
+
         bmp_printf(FONT(FONT_MED, free < 128 ? COLOR_RED : COLOR_WHITE, COLOR_BLACK), 0, 0, 
             "[%d] %s: stack %s: free=%d used=%d ",
             id, task_name,
