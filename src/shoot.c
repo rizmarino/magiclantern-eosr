@@ -360,6 +360,10 @@ static void do_this_every_second() // called every second
     #ifdef CONFIG_TSKMON
     if (!RECORDING_RAW)
     {
+        #if defined(CONFIG_R)
+        extern void tskmon_stack_warn_show(void);
+        tskmon_stack_warn_show();   /* v5.21: warnings found in the task-switch hook are drawn here */
+        #endif
         tskmon_stack_check_all();
     }
     #endif

@@ -157,6 +157,20 @@ static void tskmon_update_runtime(struct task *task, uint32_t active_time)
     }
 }
 
+#if defined(CONFIG_R)
+static volatile int tskmon_warn_pending, tskmon_warn_id, tskmon_warn_free, tskmon_warn_used;
+static const char * volatile tskmon_warn_name;
+void tskmon_stack_warn_show(void)
+{
+    if (!tskmon_warn_pending) return;
+    int id = tskmon_warn_id, free = tskmon_warn_free, used = tskmon_warn_used;
+    const char *name = tskmon_warn_name;
+    tskmon_warn_pending = 0;
+    bmp_printf(FONT(FONT_MED, free < 128 ? COLOR_RED : COLOR_WHITE, COLOR_BLACK), 0, 0,
+        "[%d] %s: stack %s: free=%d used=%d ", id, name ? name : "?", free < 128 ? "overflow" : "warning", free, used);
+}
+#endif
+
 static void tskmon_stack_checker(struct task *next_task)
 {
     uint32_t id = (next_task->taskId) & (TSKMON_MAX_TASKS-1);
@@ -206,16 +220,27 @@ static void tskmon_stack_checker(struct task *next_task)
         #endif
 
         #if defined(CONFIG_R)
-        if (streq(task_name, "Touch read") && free > 192)
-            return; // Canon's touch task: uses 264 of 512, 248 free (EOS R 1.8.0, seen on every touch)
+        if (streq(task_name, "TouchRead") && free >= 128)
+            return; // Canon's touch task "TouchRead", 512 B stack: seen 264, 352, 368 used (EOS R 1.8.0, on touch)
         #endif
 
+        #if defined(CONFIG_R)
+        /* EOS R: this runs inside the DryOS task-switch hook; drawing text from here (~400 B of stack for bmp_printf
+         * and Canon's vsnprintf) may land on a small Canon task stack. Keep the worst case and draw it from the 1 Hz
+         * clock task instead (tskmon_stack_warn_show, shoot.c). */
+        if (!tskmon_warn_pending || (int)free < tskmon_warn_free)
+        {
+            tskmon_warn_id = id; tskmon_warn_name = task_name; tskmon_warn_free = free;
+            tskmon_warn_used = next_task->stackSize - free; tskmon_warn_pending = 1;
+        }
+        #else
         bmp_printf(FONT(FONT_MED, free < 128 ? COLOR_RED : COLOR_WHITE, COLOR_BLACK), 0, 0, 
             "[%d] %s: stack %s: free=%d used=%d ",
             id, task_name,
             free < 128 ? "overflow" : "warning",
             free, next_task->stackSize - free
         );
+        #endif
     }
 }
 
